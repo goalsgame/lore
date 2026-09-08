@@ -14,6 +14,7 @@ use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
+use crate::protocol::storage::messages::ConnectionAuthorization;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -98,23 +99,33 @@ impl Message for Connect {
                         .check_repository_access(Some(&verified_token), self.repository, None)
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-                    context.insert(authorization.clone());
+                    if let Some(span) = context.get::<tracing::Span>() {
+                        span.record(USER_ID, get_user_id_from_token(Some(authorization.clone())));
+                    }
                     // `Copy` (protocol/storage/copy.rs) checks the *source*
                     // repository per fragment, which may differ from the
                     // repository this connection authorized against, so it
-                    // needs its own authorization check. Stashing the
-                    // authorizer here — rather than only the token — lets it
-                    // reuse the same legacy-aware reachability logic instead
-                    // of duplicating it.
-                    context.insert(reachability_authorizer);
-                    if let Some(span) = context.get::<tracing::Span>() {
-                        span.record(USER_ID, get_user_id_from_token(Some(authorization)));
-                    }
+                    // needs its own authorization check. Bundling the token
+                    // and the authorizer into one `ConnectionAuthorization`
+                    // entry (rather than two independent ones) lets it reuse
+                    // the same legacy-aware reachability logic and makes
+                    // "one present without the other" impossible.
+                    context.insert(ConnectionAuthorization::Verified {
+                        token: Box::new(authorization),
+                        reachability_authorizer,
+                    });
                 }
                 None => {
                     return Err(MessageHandleError::MissingToken);
                 }
             }
+        } else {
+            // No verifier configured for this deployment: `Copy` must still
+            // see an explicit marker rather than infer "no auth" from
+            // absence, so a message handled before `Connect` (or a future
+            // transport that forgets to call it) is denied instead of
+            // silently treated the same way.
+            context.insert(ConnectionAuthorization::Open);
         }
 
         if let Some(id) = context.get::<RepositoryId>() {
