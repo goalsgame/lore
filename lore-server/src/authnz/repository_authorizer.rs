@@ -86,9 +86,14 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
 /// the pre-existing behavior, kept unchanged for deployments still running
 /// their own `UrcAuthApi` implementation.
 ///
-/// `action` is ignored: `CheckUserPermissionRequest` has no field for one,
-/// and every existing caller of this authorizer only ever asked the plain
-/// reachability question, so there is no established meaning to preserve.
+/// `CheckUserPermissionRequest` has no field to name a specific action, but
+/// its response already carries the caller's granted permission strings for
+/// the resource (`ResourcePermission.permission`) — the same shape the
+/// legacy `resources` JWT claim used. A `Some(action)` call is checked
+/// against that list rather than silently degrading to the plain
+/// reachability question `action: None` asks: doing the latter would grant
+/// e.g. `push-protected` or `obliterate` to anyone who can merely reach the
+/// repository, a privilege escalation versus what the caller actually holds.
 pub struct AuthClientAuthorizer {
     auth_url: String,
 }
@@ -105,7 +110,7 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         &self,
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-        _action: Option<&str>,
+        action: Option<&str>,
     ) -> Result<(), Status> {
         let mut client = grpc_get_auth_client(self.auth_url.clone()).await?;
         let resource_id = format!("urc-{repository_id}");
@@ -129,17 +134,27 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
                 Status::internal(format!("Failed to call auth check_user_permission: {err}"))
             })?;
 
-        if permissions
+        let matched = permissions
             .into_inner()
             .allowed_resource_permission
-            .first()
-            .ok_or(Status::internal("No permissions for resource"))?
-            .resource_id
-            == resource_id
-        {
-            Ok(())
-        } else {
-            Err(Status::internal("Unexpected resource_id"))
+            .into_iter()
+            .find(|permission| permission.resource_id == resource_id)
+            .ok_or(Status::internal("No permissions for resource"))?;
+
+        match action {
+            // Plain reachability: being listed among the allowed resources
+            // at all is enough, matching every pre-existing caller of this
+            // authorizer (which only ever asked this question).
+            None => Ok(()),
+            Some(action) => {
+                if matched.permission.iter().any(|held| held == action) {
+                    Ok(())
+                } else {
+                    Err(Status::permission_denied(format!(
+                        "caller does not hold the '{action}' action"
+                    )))
+                }
+            }
         }
     }
 }
