@@ -336,7 +336,13 @@ mod storage_copy_on_write_tests {
                     Default::default(),
                     None,
                 )
-                .with_jwt_verifier(None)
+                .with_jwt_verifier(
+                    None,
+                    lore_server::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                        None, None,
+                    )
+                    .expect("no config never fails to construct"),
+                )
                 .unwrap()
                 .serve_with_listener(listener, signal)
                 .await;
