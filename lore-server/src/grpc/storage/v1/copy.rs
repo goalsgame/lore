@@ -32,7 +32,7 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
@@ -63,6 +63,7 @@ async fn copy_item(
     request: Result<storage_v1::CopyRequest, Status>,
     destination_repository: RepositoryId,
     auth_token: Option<crate::auth::jwt::AuthorizationToken>,
+    reachability_authorizer: &ReachabilityAuthorizer,
     correlation_id: String,
     user_id: String,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
@@ -80,7 +81,9 @@ async fn copy_item(
     let source_repository: RepositoryId = request.source_repository_id.clone().into();
 
     let outcome = if let Some(token) = auth_token.as_ref()
-        && let Err(err) = verify_authorization(token, source_repository)
+        && let Err(err) = reachability_authorizer
+            .check_reachability(token, source_repository)
+            .await
     {
         Err(Status::new(Code::PermissionDenied, err.to_string()))
     } else {
@@ -131,6 +134,7 @@ async fn copy_item(
 pub async fn handler(
     request: Request<Streaming<storage_v1::CopyRequest>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    reachability_authorizer: ReachabilityAuthorizer,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<CopyResponseStream>, Status> {
     let destination_repository = get_repository(request.metadata())?;
@@ -164,6 +168,7 @@ pub async fn handler(
                     let correlation_id = correlation_id.clone();
                     let user_id = user_id.clone();
                     let auth_token = auth_token.clone();
+                    let reachability_authorizer = reachability_authorizer.clone();
                     let histogram = histogram.clone();
 
                     let fragment_span = info_span!(
@@ -186,6 +191,7 @@ pub async fn handler(
                                 req,
                                 destination_repository,
                                 auth_token,
+                                &reachability_authorizer,
                                 correlation_id,
                                 user_id,
                                 immutable_store,

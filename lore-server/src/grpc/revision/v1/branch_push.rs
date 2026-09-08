@@ -25,12 +25,16 @@ use tracing::debug;
 use tracing::info;
 use tracing::span;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::branch_push::PUSH_PROTECTED_ACTION;
 use crate::grpc::handlers::branch_push::PushResult;
 use crate::grpc::handlers::branch_push::dispatch_response_message;
 use crate::grpc::handlers::branch_push::extract_client_ip;
@@ -67,6 +71,7 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let user_info = get_authorization(request.extensions());
@@ -74,13 +79,27 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
 
-    // Service accounts bypass branch-protection (mirroring path).
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    // Replaces the `is_service_account` bypass (LEP
+    // 2026-08-20-oidc-oauth2-authentication, D4) with an explicit
+    // `push-protected` action check — see `grpc::handlers::branch_push` for
+    // the shared rationale. An unauthenticated caller never bypasses
+    // protection, matching the previous shape exactly.
+    let authorization = extract_authorization_header(&request);
+    let bypass_protection = match user_info.as_ref() {
+        Ok(claims) => {
+            let raw = authorization.as_deref().unwrap_or_default();
+            let verified_token = VerifiedToken::new(raw, claims);
+            repository_authorizer
+                .check_repository_access(
+                    Some(&verified_token),
+                    repository_id,
+                    Some(PUSH_PROTECTED_ACTION),
+                )
+                .await
+                .is_ok()
+        }
+        Err(_) => false,
+    };
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
     let req = request.into_inner();
@@ -434,7 +453,12 @@ mod test {
         request
     }
 
-    fn make_service_account_request(
+    /// A request carrying a verified token with no `push-protected` role,
+    /// for the tests that need *some* token present (so a configured
+    /// authorizer is actually consulted) without granting anything special.
+    /// `is_service_account` is no longer read anywhere in the decision path
+    /// (LEP 2026-08-20-oidc-oauth2-authentication, D4).
+    fn make_authenticated_request(
         repository: RepositoryId,
         branch: BranchId,
         revision: Hash,
@@ -443,11 +467,50 @@ mod test {
         request
             .extensions_mut()
             .insert(crate::auth::jwt::AuthorizationToken {
-                user_id: "service-bot".into(),
-                is_service_account: Some(true),
+                user_id: "ci-bot".into(),
                 ..crate::auth::jwt::AuthorizationToken::default()
             });
         request
+    }
+
+    /// A request whose token's `roles` claim names `push-protected`, for
+    /// use with `push_protected_authorizer` — the Tier 1 replacement for
+    /// the old `is_service_account` bypass.
+    fn make_push_protected_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+    ) -> Request<BranchPushRequest> {
+        let mut request = make_request(repository, branch, revision, false, false);
+        let serde_json::Value::Object(extra) = serde_json::json!({ "roles": ["push-protected"] })
+        else {
+            unreachable!()
+        };
+        request
+            .extensions_mut()
+            .insert(crate::auth::jwt::AuthorizationToken {
+                user_id: "ci-bot".into(),
+                extra,
+                ..crate::auth::jwt::AuthorizationToken::default()
+            });
+        request
+    }
+
+    /// `AllowAllRepositoryAuthorizer`: the "no `[server.auth]` configured"
+    /// shape, which ignores the action entirely.
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer)
+    }
+
+    /// A Tier 1 `GlobalGrantsAuthorizer` reading a `roles` claim, granting
+    /// `push-protected` to a caller whose token names it — the mechanism
+    /// that replaced the `is_service_account` bypass.
+    fn push_protected_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(
+            crate::authnz::repository_authorizer::GlobalGrantsAuthorizer::new(Some(
+                "roles".to_string(),
+            )),
+        )
     }
 
     #[tokio::test]
@@ -481,6 +544,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -520,6 +584,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -561,6 +626,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -577,6 +643,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -618,6 +685,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -632,6 +700,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -666,7 +735,7 @@ mod test {
                 repository,
             ));
             let main = create_root_branch(&repository_context, "main").await;
-            // Protect the branch — non-service-account pushes must be denied.
+            // Protect the branch — an unauthenticated push must be denied.
             branch::protect(repository_context.clone(), main)
                 .await
                 .expect("should protect");
@@ -682,10 +751,57 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
             .expect_err("protected push should fail");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    /// An authenticated caller whose token does not hold `push-protected`
+    /// stays subject to branch protection, even though the configured
+    /// authorizer is consulted this time (`make_request` alone carries no
+    /// token, so the previous test exercises the "not even authenticated"
+    /// path — this one exercises "authenticated but lacking the action").
+    #[tokio::test]
+    async fn authenticated_caller_without_push_protected_stays_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            branch::protect(repository_context.clone(), main)
+                .await
+                .expect("should protect");
+
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                make_authenticated_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("a token with no push-protected role stays protected");
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
         }))
         .await;
@@ -727,6 +843,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -741,6 +858,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -774,6 +892,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -784,7 +903,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn service_account_bypasses_protection() {
+    async fn caller_holding_push_protected_bypasses_protection() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -810,17 +929,18 @@ mod test {
 
             let hook_dispatcher = HookDispatcher::empty();
             let response = handler(
-                make_service_account_request(repository, main, revision),
+                make_push_protected_request(repository, main, revision),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
                 &instrument_provider,
             )
             .await
-            .expect("service account should bypass protection");
+            .expect("a caller holding push-protected should bypass protection");
             assert_eq!(
                 response.into_inner().revision_signature,
                 bytes::Bytes::from(revision)
@@ -861,6 +981,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -892,6 +1013,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -938,6 +1060,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -961,6 +1084,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await
@@ -1006,6 +1130,7 @@ mod test {
                     &hook_dispatcher,
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
+                    allow_all_authorizer(),
                     &instrument_provider,
                 )
                 .await
@@ -1027,6 +1152,7 @@ mod test {
                 &hook_dispatcher,
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
+                allow_all_authorizer(),
                 &instrument_provider,
             )
             .await

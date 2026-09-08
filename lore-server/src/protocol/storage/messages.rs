@@ -15,9 +15,41 @@ use lore_storage::StoreError;
 use thiserror::Error;
 use tracing::warn;
 
+use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
+
+/// The connection's authorization state, established once by `Connect`
+/// (`protocol/storage/connect.rs`) and read per-fragment by `Copy`
+/// (`protocol/storage/copy.rs`), which needs its own check because a copy's
+/// source repository may differ from the one this connection authorized
+/// against.
+///
+/// A successful `Connect` always inserts this into the connection's
+/// `AttributeMap` — `Open` when no verifier is configured, `Verified`
+/// otherwise — as a single entry, so its absence on an established
+/// connection is always a wiring bug (a message handled before `Connect`, a
+/// future transport, or a refactor that forgets to call it), never a
+/// legitimate "no auth configured" state. Bundling the token and the
+/// authorizer into one entry, rather than two independent, individually
+/// optional ones, also makes "one present without the other" impossible by
+/// construction instead of merely unlikely.
+#[derive(Clone)]
+pub enum ConnectionAuthorization {
+    /// No verifier is configured for this deployment: matches
+    /// `AllowAllRepositoryAuthorizer`'s semantics everywhere else.
+    Open,
+    /// A caller was verified at connect time. `token` is boxed because
+    /// `AuthorizationToken` is much larger than `Open`'s no-data variant
+    /// (clippy::large_enum_variant); this is inserted once per connection,
+    /// not once per fragment, so the extra indirection is not a hot path.
+    Verified {
+        token: Box<AuthorizationToken>,
+        reachability_authorizer: ReachabilityAuthorizer,
+    },
+}
 
 #[derive(Debug, Error, PartialEq)]
 pub enum MessageParseError {
@@ -117,6 +149,7 @@ pub trait Message: Debug + Send + Sync {
         &self,
         _context: Arc<AttributeMap>,
         _jwt_verifier: Arc<Option<JwtVerifier>>,
+        _reachability_authorizer: ReachabilityAuthorizer,
     ) -> Result<LoreResponse, MessageHandleError> {
         Err(MessageHandleError::NotImplemented)
     }

@@ -12,11 +12,10 @@ use lore_revision::lore::RepositoryId;
 use lore_storage::ImmutableStore;
 use tracing::warn;
 
-use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::verify_authorization;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
+use crate::protocol::storage::messages::ConnectionAuthorization;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -139,9 +138,31 @@ impl Message for Copy {
         let destination_repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
 
-        if let Some(token) = context.get::<AuthorizationToken>() {
-            verify_authorization(&token, self.source_repository)
-                .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+        // `Connect` (protocol/storage/connect.rs) always inserts exactly one
+        // `ConnectionAuthorization` — `Open` or `Verified` — as a single
+        // entry, so its absence here is always a wiring bug (a message
+        // handled before `Connect`, or a future transport/refactor that
+        // forgets to call it), never a legitimate "no auth configured"
+        // state: deny rather than silently treat an unestablished
+        // connection as authorized to copy. The check below is against
+        // `self.source_repository`, not `destination_repository`: a copy
+        // may cross partitions, and the connection's own authorization
+        // (checked at connect time) says nothing about the source.
+        let connection_authorization = context
+            .get_or::<ConnectionAuthorization, MessageHandleError>(
+                MessageHandleError::MissingToken,
+            )?;
+        match connection_authorization.as_ref() {
+            ConnectionAuthorization::Open => {}
+            ConnectionAuthorization::Verified {
+                token,
+                reachability_authorizer,
+            } => {
+                reachability_authorizer
+                    .check_reachability(token, self.source_repository)
+                    .await
+                    .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+            }
         }
 
         let user_id = get_user_id_from_context(&context);
@@ -156,7 +177,7 @@ impl Message for Copy {
             self.target_context,
             correlation_id.to_string(),
             user_id,
-            None, // urc/0.2 path: no SessionMap, auth check done above via AuthorizationToken
+            None, // urc/0.2 path: no SessionMap, auth check done above via ConnectionAuthorization
             immutable_store,
         )
         .await
@@ -188,8 +209,24 @@ mod tests {
     use rand::random;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
     use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::store::test_store_create;
+
+    /// A legacy `UrcAuthApi` deployment: reachability is answered from the
+    /// token's own embedded `resources` claim rather than an online call
+    /// (see `ReachabilityAuthorizer`), which is what these tests exercise.
+    fn legacy_reachability() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(Some("http://127.0.0.1:0".to_string()), None)
+            .expect("a legacy auth_url always constructs")
+    }
+
+    /// No `[server.auth]` configured at all: matches what `Connect` inserts
+    /// when no verifier is configured (`ConnectionAuthorization::Open`).
+    fn open_connection() -> ConnectionAuthorization {
+        ConnectionAuthorization::Open
+    }
 
     /// A mock `ImmutableStore` whose `copy` method returns an `AddressNotFound` error.
     struct MockCopyFailStore;
@@ -475,7 +512,13 @@ mod tests {
             }]),
             ..Default::default()
         };
-        context_map.insert(token);
+        // A legacy deployment reads the embedded `resources` claim locally
+        // (see `ReachabilityAuthorizer`), which is the check this test means
+        // to exercise: the claim above does not name `source_repository`.
+        context_map.insert(ConnectionAuthorization::Verified {
+            token: Box::new(token),
+            reachability_authorizer: legacy_reachability(),
+        });
 
         let (immutable_store, _mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -491,6 +534,36 @@ mod tests {
             .await;
     }
 
+    /// Fail-closed behavior: a `ConnectionAuthorization` entry always
+    /// present on a real connection (see `Connect::handle_auth`) but
+    /// missing here — a message handled before `Connect`, or a future
+    /// transport/refactor that forgets to call it. Before this fix, `Copy`
+    /// inferred "no auth configured" from two independently optional map
+    /// entries both being absent, so this same gap would have silently
+    /// allowed the copy instead of denying it.
+    #[tokio::test]
+    async fn test_handle_denies_when_connection_authorization_missing() {
+        let message = make_copy_message();
+
+        let destination_repository = random::<RepositoryId>();
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(destination_repository);
+        // Deliberately no `ConnectionAuthorization` inserted.
+
+        let (immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                match message.handle(context_map, immutable_store).await {
+                    Err(MessageHandleError::MissingToken) => (),
+                    Err(e) => panic!("Expected MissingToken error, got {e:?}"),
+                    Ok(_) => panic!("Expected MissingToken error, got Ok"),
+                }
+            })
+            .await;
+    }
+
     #[tokio::test]
     async fn test_handle_fragment_not_found() {
         let message = make_copy_message();
@@ -498,6 +571,7 @@ mod tests {
         let destination_repository = random::<RepositoryId>();
         let context_map = Arc::new(AttributeMap::default());
         context_map.insert(destination_repository);
+        context_map.insert(open_connection());
 
         let store: Arc<dyn ImmutableStore> = Arc::new(MockCopyFailStore);
 
@@ -522,6 +596,7 @@ mod tests {
         let destination_repository = random::<RepositoryId>();
         let context_map = Arc::new(AttributeMap::default());
         context_map.insert(destination_repository);
+        context_map.insert(open_connection());
 
         let store: Arc<dyn ImmutableStore> = Arc::new(MockCopySuccessStore);
 
@@ -603,6 +678,7 @@ mod tests {
                 // Build a context map connected to repo B (the destination)
                 let context_map = Arc::new(AttributeMap::default());
                 context_map.insert(repo_b);
+                context_map.insert(open_connection());
 
                 let copy_message = Copy {
                     source_repository: repo_a,
@@ -701,6 +777,7 @@ mod tests {
 
                 let context_map = Arc::new(AttributeMap::default());
                 context_map.insert(repo_b);
+                context_map.insert(open_connection());
 
                 let copy_message = Copy {
                     source_repository: repo_a,
@@ -758,6 +835,7 @@ mod tests {
 
                 let context_map = Arc::new(AttributeMap::default());
                 context_map.insert(repo_b);
+                context_map.insert(open_connection());
 
                 let copy_message = Copy {
                     source_repository: repo_a,
@@ -825,6 +903,7 @@ mod tests {
 
                 let context_map = Arc::new(AttributeMap::default());
                 context_map.insert(repo_b);
+                context_map.insert(open_connection());
 
                 // Item 1: valid → expect success
                 let msg1 = Copy {

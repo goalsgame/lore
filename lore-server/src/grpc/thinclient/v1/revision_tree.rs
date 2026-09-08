@@ -28,6 +28,7 @@ use tracing::warn;
 
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
@@ -50,6 +51,7 @@ type RevisionTreeStream =
 #[tracing::instrument(name = "RevisionTree::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionTreeRequest>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     history_step_size: u64,
@@ -80,7 +82,7 @@ pub async fn handler(
         mutable_store,
         repository_id,
     ));
-    let can_read = link_read_authorizer(authorization);
+    let can_read = link_read_authorizer(reachability_authorizer, authorization);
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -212,6 +214,25 @@ mod test {
     use crate::grpc::handlers::branch_push;
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
+
+    /// Most of these tests populate no `AuthorizationToken` extension, so
+    /// `link_read_authorizer` never consults this value (it takes the
+    /// `None`-token / `allow_all_repositories` branch) — any authorizer
+    /// works there. The tests that *do* carry a token
+    /// (`token_authorized_for`) need `legacy_reachability_authorizer`
+    /// instead, so the embedded `resources` claim is actually enforced.
+    fn no_auth_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
+
+    /// A legacy `UrcAuthApi`-shaped authorizer: reachability is answered
+    /// from the token's own embedded `resources` claim (see
+    /// `ReachabilityAuthorizer`), which is what `token_authorized_for`
+    /// tokens carry.
+    fn legacy_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(Some("http://127.0.0.1:0".to_string()), None)
+            .expect("a legacy auth_url always constructs")
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -515,6 +536,7 @@ mod test {
             );
             let err = match handler(
                 request,
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -547,6 +569,7 @@ mod test {
 
             let response = handler(
                 make_request(repository, Query::Signature(signature.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -617,6 +640,7 @@ mod test {
                     None,
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -656,6 +680,7 @@ mod test {
 
             let response = handler(
                 make_request(repository, Query::Signature(signature.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -685,6 +710,7 @@ mod test {
             let bogus = Hash::from(random::<[u8; 32]>());
             let err = match handler(
                 make_request(repository, Query::Signature(bogus.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -714,6 +740,7 @@ mod test {
                     None,
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -753,6 +780,7 @@ mod test {
                     Some("file.txt".into()),
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -794,6 +822,7 @@ mod test {
                     Some("missing".into()),
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -845,6 +874,7 @@ mod test {
                     None,
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -890,6 +920,7 @@ mod test {
                     Some("subdir".into()),
                     None,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -945,6 +976,7 @@ mod test {
                     None,
                     Some(1),
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1008,6 +1040,7 @@ mod test {
 
             let response = handler(
                 make_request(repository, Query::Signature(signature.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1087,6 +1120,7 @@ mod test {
 
             let response = handler(
                 make_request(originating, Query::Signature(signature.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1157,6 +1191,7 @@ mod test {
 
         let response = handler(
             make_request(repository, Query::Signature(signature.into()), None, None),
+            no_auth_reachability_authorizer(),
             immutable_store,
             mutable_store,
             DEFAULT_HISTORY_STEP_SIZE,
@@ -1295,6 +1330,7 @@ mod test {
 
             let response = handler(
                 request,
+                legacy_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1363,6 +1399,7 @@ mod test {
 
             let response = handler(
                 make_request(a, Query::Signature(a_sig.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1500,6 +1537,7 @@ mod test {
 
             let response = handler(
                 make_request(a, Query::Signature(a_sig.into()), None, None),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
@@ -1584,6 +1622,7 @@ mod test {
 
             let response = handler(
                 request,
+                legacy_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,

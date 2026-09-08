@@ -43,6 +43,16 @@ use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
+/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
+/// anywhere in its path. Creation is a baseline capability, not an action
+/// gated behind an existing grant on the (not yet existing) partition —
+/// nothing in LEP 2026-08-20-oidc-oauth2-authentication's D4 (`is_service_account`
+/// migration table) or D9 (every enforcement point) lists this handler, and
+/// D8 does not name an action for it either. `auth_url`, when a legacy
+/// deployment configures one, is used only to *register* the newly created
+/// resource with the auth service (`repository_create_auth_resource` below)
+/// so later permission checks on it have something to check against — that
+/// is bookkeeping, not a permission check on this request.
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
@@ -177,8 +187,9 @@ async fn repository_create(
     if let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
-        None, /* auth url */
-        None, /* authorization */
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        None, /* token */
+        None, /* raw_token */
     )
     .await
     .filter_slow_down()?
@@ -193,8 +204,9 @@ async fn repository_create(
             if repository_query_name(
                 repository.clone(),
                 name,
-                None, /* auth url */
-                None, /* authorization */
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+                None, /* token */
+                None, /* raw_token */
             )
             .await
             .filter_slow_down()?
@@ -225,8 +237,9 @@ async fn repository_create(
         repository_query_name(
             repository.clone(),
             name,
-            None, /* auth url */
-            None, /* authorization */
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            None, /* token */
+            None, /* raw_token */
         )
         .await,
         |err| err.is_address_not_found() || err.is_repository_not_found(),

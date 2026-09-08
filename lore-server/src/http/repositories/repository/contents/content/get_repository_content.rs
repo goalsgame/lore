@@ -202,6 +202,11 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer:
+                        crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                            None, None,
+                        )
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };
@@ -228,6 +233,11 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer:
+                        crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                            None, None,
+                        )
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };
@@ -255,6 +265,8 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer: crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(None, None)
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };
@@ -299,6 +311,11 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer:
+                        crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                            None, None,
+                        )
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };
@@ -342,6 +359,11 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer:
+                        crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                            None, None,
+                        )
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };
@@ -402,6 +424,11 @@ mod tests {
                     immutable_store,
                     mutable_store,
                     jwt_verifier: None,
+                    reachability_authorizer:
+                        crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                            None, None,
+                        )
+                        .expect("no config never fails to construct"),
                     max_file_size: 100,
                     presign_config: None,
                 };

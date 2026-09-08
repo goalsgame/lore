@@ -78,6 +78,7 @@ mod tests {
     use rand::random;
     use zerocopy::IntoBytes;
 
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::grpc::storage::v1::test_utils::make_request_with_metadata;
     use crate::grpc::storage_service::LoreStorageService;
     use crate::store::test_store_create;
@@ -91,8 +92,13 @@ mod tests {
         let key = random::<Hash>();
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
-            let service =
-                LoreStorageService::new(immutable_store.clone(), immutable_store, mutable_store);
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                ReachabilityAuthorizer::new(None, None)
+                    .expect("no config never fails to construct"),
+            );
 
             let load_request = storage_v1::MutableLoadRequest {
                 key: bytes::Bytes::copy_from_slice(key.as_bytes()),

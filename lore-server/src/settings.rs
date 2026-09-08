@@ -176,6 +176,15 @@ impl Settings {
 /// Missing `jwt_issuer` / `jwt_audience` under `[server.auth]` already fails
 /// deserialization. This catches the empty list, which would parse but reject
 /// every token, and is never what was configured on purpose.
+///
+/// It also rejects `resource_claim` up front for any deployment that is not
+/// a legacy `UrcAuthApi` one: `resource_claim` selects Tier 2
+/// (`ResourceGrantsAuthorizer`), which is not implemented in this build. See
+/// [`crate::authnz::repository_authorizer::RepositoryAuthorizerError`] for
+/// the same check made again where the authorizer is actually constructed —
+/// this is the fail-loudly-at-startup half of that defense in depth, so an
+/// operator sees the problem before the server accepts a single request
+/// rather than on whichever request first reaches an authorizer.
 fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> {
     let Some(auth) = settings.server.auth.as_ref() else {
         return Ok(());
@@ -190,6 +199,26 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             "server.auth.jwt_audience must not be empty".to_string(),
         ));
     }
+
+    let legacy_auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone());
+    if legacy_auth_url.is_none() && auth.resource_claim.is_some() {
+        return Err(config::ConfigError::Message(
+            "server.auth.resource_claim is set, which selects the Tier 2 \
+             ResourceGrantsAuthorizer (per-partition resource grants via RFC 8693 token \
+             exchange). That authorizer is not implemented in this build, so the server \
+             refuses to start rather than silently falling back to Tier 1 or failing on the \
+             first request that needs it. Unset server.auth.resource_claim to run Tier 1 \
+             (GlobalGrantsAuthorizer, global per-action grants read from \
+             server.auth.permission_claim), or implement ResourceGrantsAuthorizer before \
+             enabling Tier 2."
+                .to_string(),
+        ));
+    }
+
     Ok(())
 }
 
@@ -842,6 +871,56 @@ mod tests {
         )
         .expect("a complete [server.auth] must parse");
         validate_auth_config(&settings).expect("a complete [server.auth] must validate");
+    }
+
+    /// Tier 2 (`ResourceGrantsAuthorizer`) is not implemented, so a
+    /// deployment that is not legacy `UrcAuthApi` but sets `resource_claim`
+    /// must fail to start rather than silently running as Tier 1.
+    #[test]
+    fn resource_claim_without_a_legacy_auth_url_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            resource_claim = "resources"
+        "#,
+        )
+        .expect("[server.auth] with resource_claim still parses");
+        let error = validate_auth_config(&settings)
+            .expect_err("resource_claim with no legacy auth_url must fail validation");
+        assert!(
+            error.to_string().contains("resource_claim"),
+            "the error must name the offending setting: {error}"
+        );
+    }
+
+    /// A legacy `UrcAuthApi` deployment selects `AuthClientAuthorizer`
+    /// regardless of `resource_claim`, so it is exempt from the Tier 2
+    /// startup rejection.
+    #[test]
+    fn resource_claim_with_a_legacy_auth_url_passes_validation() {
+        let config = r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [environment.endpoint]
+            auth_url = "https://legacy-auth.example.com"
+
+            [server.auth]
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+            resource_claim = "resources"
+        "#;
+        let settings: Settings =
+            toml::from_str(Box::leak(config.to_string().into_boxed_str())).unwrap();
+        validate_auth_config(&settings)
+            .expect("a legacy auth_url exempts resource_claim from the Tier 2 rejection");
     }
 
     /// No `[server.auth]` at all keeps starting: verification stays off and

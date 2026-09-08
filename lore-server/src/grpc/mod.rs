@@ -68,7 +68,8 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -210,13 +211,49 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Builds the `VerifiedToken` a `RepositoryAuthorizer::check_repository_access`
+/// call needs from the decoded claims and the matching raw bearer token, both
+/// already extracted by the caller (typically `get_authorization(..).ok()`
+/// and `extract_authorization_header(..)`). `None` claims means no verifier
+/// is configured (or the caller is unauthenticated), which correctly yields
+/// no `VerifiedToken` regardless of `raw`.
+///
+/// Centralizes a construction that was previously duplicated verbatim at
+/// each action-check call site (`obliterate`, `AdminLock`, ...) — the same
+/// "token and its raw form built independently at each call site" shape
+/// that caused the fail-open bug fixed in `protocol/storage/copy.rs`
+/// (see `ConnectionAuthorization`).
+pub fn verified_token<'a>(
+    claims: &'a Option<AuthorizationToken>,
+    raw: &'a Option<String>,
+) -> Option<VerifiedToken<'a>> {
+    claims
+        .as_ref()
+        .map(|claims| VerifiedToken::new(raw.as_deref().unwrap_or_default(), claims))
+}
+
+/// Gates cross-partition link reads during revision-graph traversal, which
+/// may call the returned closure many times per request (LEP
+/// 2026-08-20-oidc-oauth2-authentication, D9), so it must answer without
+/// awaiting anything. `ReachabilityAuthorizer::check_reachability_sync`
+/// does exactly that for every configured authorizer, legacy
+/// `AuthClientAuthorizer` included (see its docs for why that one reads the
+/// token's own embedded claim here rather than making an online call).
+///
+/// `None` mirrors the previous behavior: it means no token was ever
+/// inserted into the request, i.e. no verifier is configured at all, so
+/// every partition is reachable — the same shape
+/// `AllowAllRepositoryAuthorizer` answers elsewhere.
 pub fn link_read_authorizer(
+    reachability_authorizer: ReachabilityAuthorizer,
     authorization: Option<AuthorizationToken>,
 ) -> lore_revision::state::CanReadRepository {
     match authorization {
-        Some(token) => {
-            Arc::new(move |repository_id| verify_authorization(&token, repository_id).is_ok())
-        }
+        Some(token) => Arc::new(move |repository_id| {
+            reachability_authorizer
+                .check_reachability_sync(&token, repository_id)
+                .is_ok()
+        }),
         None => lore_revision::state::allow_all_repositories(),
     }
 }
@@ -290,20 +327,6 @@ pub(crate) fn log_server_error(status: &Status) {
             "GRPC handler server error response",
         );
     }
-}
-
-pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
-}
-
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
-}
-
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
 }
 
 pub fn get_matching_permissions(
@@ -748,8 +771,17 @@ mod tests {
         ));
     }
 
+    // `can_admin_lock` (formerly here, reading this same `resources` claim
+    // locally) was removed: it denied every caller under Tier 1, which never
+    // carries a `resources` claim, and its only call site
+    // (`LoreLockService::handle_admin_lock`) now checks the `migrate` action
+    // through the configured `RepositoryAuthorizer` instead (LEP
+    // 2026-08-20-oidc-oauth2-authentication, D4/D8/D9). `has_required_permission`
+    // itself is still exercised directly below, including its wildcard
+    // matching, since it remains a general primitive over the legacy
+    // `resources` claim shape.
     #[test]
-    fn can_admin_lock_with_direct_permission_claim() {
+    fn has_required_permission_with_direct_permission_claim() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -772,18 +804,23 @@ mod tests {
                 .unwrap()
                 .into();
 
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
-
-        // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
-        assert!(!can_admin_lock(
+        // as user has "migrate" permission for a given repo, they hold it there
+        assert!(has_required_permission(
             &extensions,
-            test_unrelated_repository_context
+            test_repository_context,
+            "migrate"
+        ));
+
+        // as user doesn't have "migrate" permission for an unrelated repo, they don't hold it there
+        assert!(!has_required_permission(
+            &extensions,
+            test_unrelated_repository_context,
+            "migrate"
         ));
     }
 
     #[test]
-    fn can_admin_lock_with_wildcard_permission_claim() {
+    fn has_required_permission_with_wildcard_permission_claim() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -817,14 +854,20 @@ mod tests {
                 .unwrap()
                 .into();
 
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
+        // as user has "migrate" permission for a given repo, they hold it there
+        assert!(has_required_permission(
+            &extensions,
+            test_repository_context,
+            "migrate"
+        ));
 
         // user doesn't have direct "migrate" permission for an unrelated repo
-        // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
-        assert!(can_admin_lock(
+        // but they have a wildcard token with "migrate", so they hold it for
+        // arbitrary repos too
+        assert!(has_required_permission(
             &extensions,
-            test_unrelated_repository_context
+            test_unrelated_repository_context,
+            "migrate"
         ));
     }
 

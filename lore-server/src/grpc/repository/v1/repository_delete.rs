@@ -22,12 +22,16 @@ use tracing::info;
 
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
+use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::repository_delete::DELETE_ACTIONS;
 use crate::grpc::handlers::repository_delete::repository_delete_auth_resource;
 use crate::util::setup_execution;
 
@@ -41,6 +45,7 @@ use crate::util::setup_execution;
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
     auth_url: Option<String>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
@@ -50,15 +55,6 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
-
-    // TODO(mjansson): Once the authz model has read/write/admin, replace
-    // the service-account bypass with a proper permission check.
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
 
     let id: RepositoryId = Context::from(req.id).into();
     let execution = setup_execution(module_path!(), correlation_id, user_id);
@@ -70,20 +66,61 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let (metadata, metadata_hash) = repository_load_id(repository.clone(), id, None, None)
-                .await
-                .filter_slow_down()?
-                .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
+            // The internal lookup is not the access decision — the checks
+            // below are — so it must not itself be denied by whichever
+            // authorizer the deployment configures for external callers.
+            let (metadata, metadata_hash) = repository_load_id(
+                repository.clone(),
+                id,
+                Arc::new(AllowAllRepositoryAuthorizer),
+                None, /* token */
+                None, /* raw_token */
+            )
+            .await
+            .filter_slow_down()?
+            .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
 
             let user_id = execution_context().user_id().await;
             if let Some(auth_url) = auth_url {
                 repository_delete_auth_resource(auth_url, authorization, id).await?;
-            } else if metadata.creator != user_id && !bypass_protection {
-                info!(
-                    "Repository delete refused, user {user_id} is not creator {}",
-                    metadata.creator
-                );
-                return Err(Status::permission_denied("Not repository owner"));
+            } else {
+                // Replaces the `is_service_account` bypass of the creator
+                // check (LEP 2026-08-20-oidc-oauth2-authentication, D4):
+                // deletion is allowed for the creator, as before, or for a
+                // caller who explicitly holds `owner` or `admin` through the
+                // configured authorizer.
+                let is_creator = metadata.creator == user_id;
+                let holds_delete_action = match user_info.as_ref() {
+                    Ok(claims) => {
+                        let raw = authorization.as_deref().unwrap_or_default();
+                        let verified_token = VerifiedToken::new(raw, claims);
+                        let mut holds_any = false;
+                        for action in DELETE_ACTIONS {
+                            if repository_authorizer
+                                .check_repository_access(
+                                    Some(&verified_token),
+                                    id,
+                                    Some(action),
+                                )
+                                .await
+                                .is_ok()
+                            {
+                                holds_any = true;
+                                break;
+                            }
+                        }
+                        holds_any
+                    }
+                    Err(_) => false,
+                };
+
+                if !is_creator && !holds_delete_action {
+                    info!(
+                        "Repository delete refused, user {user_id} is not creator {} and holds neither owner nor admin",
+                        metadata.creator
+                    );
+                    return Err(Status::permission_denied("Not repository owner"));
+                }
             }
 
             repository::store_name_to_id(

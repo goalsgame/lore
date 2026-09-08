@@ -32,6 +32,16 @@ use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
 
+/// Deliberately does not go through `RepositoryAuthorizer`. Enumeration
+/// ("which partitions may I see") is a different question from
+/// `check_repository_access`'s per-partition one, and LEP
+/// 2026-08-20-oidc-oauth2-authentication assigns it to its own trait,
+/// `RepositoryDirectory` (D7) — not yet implemented in this build — steered
+/// by `[server.auth].baseline_access`, which "gates no access decision" (D8):
+/// it only changes what a caller with no custom `RepositoryDirectory` sees
+/// listed, never what they are permitted to do to a listed partition. A
+/// legacy `auth_url` deployment keeps behaving exactly as it does today, via
+/// `LookupUserPermissions` below.
 #[tracing::instrument(name = "RepositoryList::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryListRequest>,

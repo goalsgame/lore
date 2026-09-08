@@ -10,9 +10,11 @@ use tracing::debug;
 use tracing::warn;
 
 use crate::auth::jwt::JwtVerifier;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
+use crate::protocol::storage::messages::ConnectionAuthorization;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -58,6 +60,7 @@ impl Message for Connect {
         &self,
         context: Arc<AttributeMap>,
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        reachability_authorizer: ReachabilityAuthorizer,
     ) -> Result<LoreResponse, MessageHandleError> {
         // Make sure a correlation ID exists
         if context.get::<CorrelationId>().is_none() {
@@ -84,17 +87,45 @@ impl Message for Connect {
                         .verify_token(auth_token)
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-                    verify_authorization(&authorization, self.repository)
+                    // Once per connection, so — unlike the per-fragment `Copy`
+                    // check that reuses this same authorizer below — this can
+                    // afford to go through the configured authorizer
+                    // unconditionally, `AuthClientAuthorizer`'s online check
+                    // included, at the granularity that authorizer was built
+                    // for.
+                    let verified_token = VerifiedToken::new(auth_token, &authorization);
+                    reachability_authorizer
+                        .authorizer
+                        .check_repository_access(Some(&verified_token), self.repository, None)
+                        .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
-                    context.insert(authorization.clone());
                     if let Some(span) = context.get::<tracing::Span>() {
-                        span.record(USER_ID, get_user_id_from_token(Some(authorization)));
+                        span.record(USER_ID, get_user_id_from_token(Some(authorization.clone())));
                     }
+                    // `Copy` (protocol/storage/copy.rs) checks the *source*
+                    // repository per fragment, which may differ from the
+                    // repository this connection authorized against, so it
+                    // needs its own authorization check. Bundling the token
+                    // and the authorizer into one `ConnectionAuthorization`
+                    // entry (rather than two independent ones) lets it reuse
+                    // the same legacy-aware reachability logic and makes
+                    // "one present without the other" impossible.
+                    context.insert(ConnectionAuthorization::Verified {
+                        token: Box::new(authorization),
+                        reachability_authorizer,
+                    });
                 }
                 None => {
                     return Err(MessageHandleError::MissingToken);
                 }
             }
+        } else {
+            // No verifier configured for this deployment: `Copy` must still
+            // see an explicit marker rather than infer "no auth" from
+            // absence, so a message handled before `Connect` (or a future
+            // transport that forgets to call it) is denied instead of
+            // silently treated the same way.
+            context.insert(ConnectionAuthorization::Open);
         }
 
         if let Some(id) = context.get::<RepositoryId>() {
@@ -127,6 +158,13 @@ mod tests {
 
     use super::*;
 
+    /// No `[server.auth]` configured: `AllowAllRepositoryAuthorizer`, the
+    /// same "auth disabled" shape these tests already exercise via
+    /// `Arc::new(None)` for `jwt_verifier`.
+    fn no_auth_reachability() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
+
     #[test]
     fn test_parse() {
         let repository = random::<RepositoryId>();
@@ -158,7 +196,7 @@ mod tests {
         assert_eq!(
             LoreResponse::Connect(ConnectResponse::default()),
             message
-                .handle_auth(context.clone(), Arc::new(None))
+                .handle_auth(context.clone(), Arc::new(None), no_auth_reachability())
                 .await
                 .unwrap()
         );
@@ -186,7 +224,7 @@ mod tests {
 
         assert!(matches!(
             message
-                .handle_auth(context, Arc::new(None))
+                .handle_auth(context, Arc::new(None), no_auth_reachability())
                 .await
                 .expect_err("expected error"),
             MessageHandleError::AlreadyConnected,
@@ -207,7 +245,10 @@ mod tests {
 
         assert_eq!(
             LoreResponse::Connect(ConnectResponse::default()),
-            message.handle_auth(context, Arc::new(None)).await.unwrap()
+            message
+                .handle_auth(context, Arc::new(None), no_auth_reachability())
+                .await
+                .unwrap()
         );
     }
 }

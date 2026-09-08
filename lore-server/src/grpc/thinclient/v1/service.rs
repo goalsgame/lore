@@ -22,6 +22,7 @@ use tonic::codegen::tokio_stream::Stream;
 use super::revision_diff;
 use super::revision_info;
 use super::revision_tree;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::timeout_grpc;
 
 type ContentDiffStream =
@@ -55,11 +56,13 @@ pub struct LoreThinClientV1Service {
     revision_diff_config: revision_diff::RevisionDiffConfig,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    reachability_authorizer: ReachabilityAuthorizer,
     #[allow(dead_code)]
     instrument_provider: ThinClientServiceInstrumentProvider,
 }
 
 impl LoreThinClientV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -67,6 +70,7 @@ impl LoreThinClientV1Service {
         revision_diff_config: revision_diff::RevisionDiffConfig,
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
+        reachability_authorizer: ReachabilityAuthorizer,
     ) -> Self {
         Self {
             immutable_store,
@@ -75,6 +79,7 @@ impl LoreThinClientV1Service {
             revision_diff_config,
             history_step_size,
             acceleration,
+            reachability_authorizer,
             instrument_provider: ThinClientServiceInstrumentProvider,
         }
     }
@@ -126,6 +131,7 @@ impl ThinClientService for LoreThinClientV1Service {
     ) -> Result<Response<Self::RevisionDiffStream>, Status> {
         revision_diff::handler(
             request,
+            self.reachability_authorizer.clone(),
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             self.revision_diff_config,
@@ -143,6 +149,7 @@ impl ThinClientService for LoreThinClientV1Service {
     ) -> Result<Response<Self::RevisionTreeStream>, Status> {
         revision_tree::handler(
             request,
+            self.reachability_authorizer.clone(),
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             self.history_step_size,

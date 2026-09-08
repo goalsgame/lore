@@ -106,6 +106,9 @@ mod presign_tests {
             immutable_store,
             mutable_store,
             jwt_verifier: None,
+            reachability_authorizer:
+                lore_server::authnz::repository_authorizer::ReachabilityAuthorizer::new(None, None)
+                    .expect("no config never fails to construct"),
             max_file_size: 10 * 1024 * 1024,
             presign_config: Some(test_presign_config()),
         };

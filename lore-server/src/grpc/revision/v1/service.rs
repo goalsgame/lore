@@ -37,6 +37,7 @@ use super::branch_metadata_get;
 use super::branch_metadata_set;
 use super::branch_push;
 use super::revision_list;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -76,6 +77,7 @@ pub struct LoreRevisionV1Service {
     acceleration: crate::grpc::server::RevisionListAcceleration,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
@@ -91,6 +93,7 @@ impl LoreRevisionV1Service {
         acceleration: crate::grpc::server::RevisionListAcceleration,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider;
         let seconds_in_one_day = 86400f64;
@@ -122,6 +125,7 @@ impl LoreRevisionV1Service {
             acceleration,
             forwarded_requests,
             rpc_timeout,
+            repository_authorizer,
             instrument_provider,
             revision_list_instruments,
         }
@@ -233,6 +237,7 @@ impl RevisionService for LoreRevisionV1Service {
                 &self.hook_dispatcher,
                 self.history_step_size,
                 self.acceleration,
+                self.repository_authorizer.clone(),
                 &self.instrument_provider,
             ),
         )

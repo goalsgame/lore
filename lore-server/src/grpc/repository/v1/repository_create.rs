@@ -49,6 +49,12 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRepositoryService`
+///
+/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
+/// anywhere in its path — see the v0 handler's doc comment
+/// (`grpc/handlers/repository_create.rs`) for why: creation is a baseline
+/// capability per LEP 2026-08-20-oidc-oauth2-authentication, not an action
+/// gated behind an existing grant on the partition being created.
 #[tracing::instrument(
     name = "RepositoryCreate::v1::handle",
     skip_all,
@@ -245,10 +251,15 @@ async fn repository_create_inner(
         return Err(Status::invalid_argument("Invalid repository name"));
     }
 
-    if let Ok((metadata, metadata_hash)) =
-        repository_load_id(repository.clone(), repository.id, None, None)
-            .await
-            .filter_slow_down()?
+    if let Ok((metadata, metadata_hash)) = repository_load_id(
+        repository.clone(),
+        repository.id,
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        None,
+        None,
+    )
+    .await
+    .filter_slow_down()?
     {
         return if metadata.name == name {
             info!(
@@ -256,10 +267,16 @@ async fn repository_create_inner(
                 repository.id, metadata.name
             );
 
-            if repository_load_name(repository.clone(), name, None, None)
-                .await
-                .filter_slow_down()?
-                .is_err()
+            if repository_load_name(
+                repository.clone(),
+                name,
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+                None,
+                None,
+            )
+            .await
+            .filter_slow_down()?
+            .is_err()
             {
                 info!(
                     "Recreating repository name {} -> ID {} mapping",
@@ -283,7 +300,14 @@ async fn repository_create_inner(
     // Name-collision guard: its absent path lets the create below rebind the
     // name, so an unreadable answer must not be read as absence.
     if let Some((id, metadata, metadata_hash)) = none_or_status(
-        repository_load_name(repository.clone(), name, None, None).await,
+        repository_load_name(
+            repository.clone(),
+            name,
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            None,
+            None,
+        )
+        .await,
         |err| err.is_address_not_found() || err.is_repository_not_found(),
     )? {
         return if id == repository.id {
