@@ -46,6 +46,7 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::get_user_id;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -73,6 +74,7 @@ pub struct LoreStorageService {
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     local_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    reachability_authorizer: ReachabilityAuthorizer,
 }
 
 impl LoreStorageService {
@@ -80,11 +82,13 @@ impl LoreStorageService {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         local_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
+        reachability_authorizer: ReachabilityAuthorizer,
     ) -> Self {
         Self {
             immutable_store,
             local_store,
             mutable_store,
+            reachability_authorizer,
         }
     }
 
@@ -98,6 +102,10 @@ impl LoreStorageService {
 
     pub fn mutable_store(&self) -> &Arc<dyn lore_storage::MutableStore> {
         &self.mutable_store
+    }
+
+    pub fn reachability_authorizer(&self) -> &ReachabilityAuthorizer {
+        &self.reachability_authorizer
     }
 }
 
@@ -461,6 +469,10 @@ impl StorageService for LoreStorageService {
             request.metadata(),
             request.extensions(),
         )?);
+        // `Copy::handle` (protocol/storage/copy.rs) reads this to check the
+        // *source* repository, which may differ from the destination this
+        // connection's metadata names.
+        attrs.insert(self.reachability_authorizer.clone());
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 

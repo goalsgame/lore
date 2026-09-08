@@ -262,6 +262,10 @@ pub mod tests {
                         contexts.lock().push(context.clone());
                         let storage_protocol = StorageService::new(
                             Arc::new(None),
+                            crate::authnz::repository_authorizer::ReachabilityAuthorizer::new(
+                                None, None,
+                            )
+                            .expect("no config never fails to construct"),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),
@@ -289,6 +293,9 @@ pub mod tests {
                         contexts.lock().push(context.clone());
                         let v4_service = StorageServiceV4::new(
                             Arc::new(None),
+                            Arc::new(
+                                crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer,
+                            ),
                             immutable_store.clone(),
                             immutable_store.clone(),
                             mutable_store.clone(),

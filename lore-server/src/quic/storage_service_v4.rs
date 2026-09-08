@@ -19,6 +19,8 @@ use tracing::Span;
 use tracing::debug;
 
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -89,6 +91,13 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    /// Answers the session-start reachability question directly (LEP
+    /// 2026-08-20-oidc-oauth2-authentication, D9): "once per session rather
+    /// than per operation", so — unlike the gRPC interceptor's per-request
+    /// check — going through the configured authorizer unconditionally,
+    /// `AuthClientAuthorizer`'s online check included, costs no more than
+    /// one check per connection, which is the granularity it was built for.
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -99,6 +108,7 @@ pub struct StorageServiceV4 {
 impl StorageServiceV4 {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
@@ -106,6 +116,7 @@ impl StorageServiceV4 {
     ) -> Self {
         Self {
             jwt_verifier,
+            repository_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -202,7 +213,10 @@ impl QuicService for StorageServiceV4 {
                         .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
-                    crate::auth::jwt::verify_authorization(&authorization, repository)
+                    let verified_token = VerifiedToken::new(&token_str, &authorization);
+                    self.repository_authorizer
+                        .check_repository_access(Some(&verified_token), repository, None)
+                        .await
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
@@ -510,6 +524,7 @@ mod tests {
     ) -> StorageServiceV4 {
         StorageServiceV4::new(
             Arc::new(None),
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
             immutable_store.clone(),
             immutable_store.clone(),
             mutable_store,

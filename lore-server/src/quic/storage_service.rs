@@ -30,6 +30,7 @@ use tracing::info_span;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
@@ -439,6 +440,7 @@ pub fn is_internal_error(error: &MessageHandleError) -> bool {
 
 pub struct StorageService {
     jwt_verifier: Arc<Option<JwtVerifier>>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
     mutable_store: Arc<dyn MutableStore>,
@@ -447,12 +449,14 @@ pub struct StorageService {
 impl StorageService {
     pub fn new(
         jwt_verifier: Arc<Option<JwtVerifier>>,
+        reachability_authorizer: ReachabilityAuthorizer,
         immutable_store: Arc<dyn ImmutableStore>,
         local_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
         Self {
             jwt_verifier,
+            reachability_authorizer,
             immutable_store,
             local_store,
             mutable_store,
@@ -486,7 +490,11 @@ impl QuicService for StorageService {
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
-                    .handle_auth(context, self.jwt_verifier.clone())
+                    .handle_auth(
+                        context,
+                        self.jwt_verifier.clone(),
+                        self.reachability_authorizer.clone(),
+                    )
                     .await
             }
             ParsedStorageRequest::MutableLoad(_)

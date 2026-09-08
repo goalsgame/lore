@@ -13,7 +13,7 @@ use lore_storage::ImmutableStore;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -139,8 +139,19 @@ impl Message for Copy {
         let destination_repository = *context
             .get_or::<RepositoryId, MessageHandleError>(MessageHandleError::NotConnected)?;
 
-        if let Some(token) = context.get::<AuthorizationToken>() {
-            verify_authorization(&token, self.source_repository)
+        // `Connect` (protocol/storage/connect.rs) inserts a token and a
+        // reachability authorizer together, or neither — see its
+        // `handle_auth` — so finding one without the other cannot happen on
+        // a connection that went through it. The check is against
+        // `self.source_repository`, not `destination_repository`: a copy
+        // may cross partitions, and the connection's own authorization
+        // (checked at connect time) says nothing about the source.
+        if let Some(token) = context.get::<AuthorizationToken>()
+            && let Some(reachability) = context.get::<ReachabilityAuthorizer>()
+        {
+            reachability
+                .check_reachability(&token, self.source_repository)
+                .await
                 .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
         }
 
@@ -190,6 +201,14 @@ mod tests {
     use super::*;
     use crate::auth::jwt::ResourcePermission;
     use crate::store::test_store_create;
+
+    /// A legacy `UrcAuthApi` deployment: reachability is answered from the
+    /// token's own embedded `resources` claim rather than an online call
+    /// (see `ReachabilityAuthorizer`), which is what these tests exercise.
+    fn legacy_reachability() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(Some("http://127.0.0.1:0".to_string()), None)
+            .expect("a legacy auth_url always constructs")
+    }
 
     /// A mock `ImmutableStore` whose `copy` method returns an `AddressNotFound` error.
     struct MockCopyFailStore;
@@ -476,6 +495,10 @@ mod tests {
             ..Default::default()
         };
         context_map.insert(token);
+        // A legacy deployment reads the embedded `resources` claim locally
+        // (see `ReachabilityAuthorizer`), which is the check this test means
+        // to exercise: the claim above does not name `source_repository`.
+        context_map.insert(legacy_reachability());
 
         let (immutable_store, _mutable_store, execution) =
             test_store_create().await.expect("Failed to create stores");
