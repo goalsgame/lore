@@ -43,6 +43,16 @@ use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
+/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
+/// anywhere in its path. Creation is a baseline capability, not an action
+/// gated behind an existing grant on the (not yet existing) partition —
+/// nothing in LEP 2026-08-20-oidc-oauth2-authentication's D4 (`is_service_account`
+/// migration table) or D9 (every enforcement point) lists this handler, and
+/// D8 does not name an action for it either. `auth_url`, when a legacy
+/// deployment configures one, is used only to *register* the newly created
+/// resource with the auth service (`repository_create_auth_resource` below)
+/// so later permission checks on it have something to check against — that
+/// is bookkeeping, not a permission check on this request.
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,

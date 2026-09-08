@@ -44,6 +44,11 @@ type ListStream =
 ///
 /// `RepositoryListRequest.creator`, when set, filters the stream to
 /// repositories whose `creator` exactly matches.
+///
+/// Deliberately does not go through `RepositoryAuthorizer` — see the v0
+/// handler's doc comment (`grpc/handlers/repository_list.rs`) for why:
+/// enumeration is answered by the separate `RepositoryDirectory` trait (LEP
+/// 2026-08-20-oidc-oauth2-authentication, D7), not `check_repository_access`.
 #[tracing::instrument(name = "RepositoryList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryListRequest>,

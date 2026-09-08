@@ -49,6 +49,12 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRepositoryService`
+///
+/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
+/// anywhere in its path — see the v0 handler's doc comment
+/// (`grpc/handlers/repository_create.rs`) for why: creation is a baseline
+/// capability per LEP 2026-08-20-oidc-oauth2-authentication, not an action
+/// gated behind an existing grant on the partition being created.
 #[tracing::instrument(
     name = "RepositoryCreate::v1::handle",
     skip_all,
