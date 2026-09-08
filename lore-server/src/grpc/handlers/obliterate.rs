@@ -19,7 +19,6 @@ use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
@@ -84,9 +83,7 @@ pub async fn handler(
         .scope(execution, async move {
             if jwt_verifier.is_some() {
                 let claims = get_authorization(&extensions).ok();
-                let verified_token = claims.as_ref().map(|claims| {
-                    VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims)
-                });
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
                 repository_authorizer
                     .check_repository_access(verified_token.as_ref(), repository, Some(OBLITERATE_ACTION))
                     .await

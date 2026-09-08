@@ -69,6 +69,7 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -210,6 +211,27 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Builds the `VerifiedToken` a `RepositoryAuthorizer::check_repository_access`
+/// call needs from the decoded claims and the matching raw bearer token, both
+/// already extracted by the caller (typically `get_authorization(..).ok()`
+/// and `extract_authorization_header(..)`). `None` claims means no verifier
+/// is configured (or the caller is unauthenticated), which correctly yields
+/// no `VerifiedToken` regardless of `raw`.
+///
+/// Centralizes a construction that was previously duplicated verbatim at
+/// each action-check call site (`obliterate`, `AdminLock`, ...) — the same
+/// "token and its raw form built independently at each call site" shape
+/// that caused the fail-open bug fixed in `protocol/storage/copy.rs`
+/// (see `ConnectionAuthorization`).
+pub fn verified_token<'a>(
+    claims: &'a Option<AuthorizationToken>,
+    raw: &'a Option<String>,
+) -> Option<VerifiedToken<'a>> {
+    claims
+        .as_ref()
+        .map(|claims| VerifiedToken::new(raw.as_deref().unwrap_or_default(), claims))
+}
+
 /// Gates cross-partition link reads during revision-graph traversal, which
 /// may call the returned closure many times per request (LEP
 /// 2026-08-20-oidc-oauth2-authentication, D9), so it must answer without
@@ -305,12 +327,6 @@ pub(crate) fn log_server_error(status: &Status) {
             "GRPC handler server error response",
         );
     }
-}
-
-pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> bool {
-    let user_permissions = user_permissions(extensions, repository);
-    user_permissions.contains(&"owner".to_string())
-        || user_permissions.contains(&"admin".to_string())
 }
 
 pub fn get_matching_permissions(

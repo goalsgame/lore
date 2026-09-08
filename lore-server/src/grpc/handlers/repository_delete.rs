@@ -43,8 +43,10 @@ use crate::util::setup_execution;
 /// deleted by someone who did not create it when they explicitly hold
 /// either action, globally under Tier 1 or on the deleted partition under
 /// Tier 2, rather than when their token happens to carry a legacy
-/// service-account claim. Matches `is_owner_or_admin`'s existing reading of
-/// "owner or admin" as the ownership question.
+/// service-account claim. Matches the legacy `is_owner_or_admin` reader's
+/// choice of "owner or admin" as the ownership question — also reused by
+/// `LoreLockService::handle_unlock`'s admin/owner force-unlock override
+/// (`grpc/lock_service.rs`), which replaced that same reader.
 pub(crate) const DELETE_ACTIONS: [&str; 2] = ["owner", "admin"];
 
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]

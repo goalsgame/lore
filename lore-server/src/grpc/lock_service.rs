@@ -35,10 +35,9 @@ use super::extract_correlation_id;
 use super::get_authorization;
 use super::get_repository;
 use super::get_user_id;
-use super::is_owner_or_admin;
 use super::timeout_grpc;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::grpc::handlers::repository_delete::DELETE_ACTIONS;
 use crate::util::setup_execution;
 
 const STATUS_MAX_RESOURCE_LEN: usize = 100;
@@ -305,7 +304,8 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
-        let validate_user = !is_owner_or_admin(request.extensions(), repository);
+        let raw_token = extract_authorization_header(&request);
+        let claims = get_authorization(request.extensions()).ok();
         let unlock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -326,6 +326,31 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
+                // Replaces the `is_owner_or_admin` reader (LEP
+                // 2026-08-20-oidc-oauth2-authentication, D4/D8/D9): that
+                // helper read the legacy `resources` claim directly, which
+                // Tier 1 tokens never carry, so the admin/owner force-unlock
+                // override (skipping the ordinary ownership check below) was
+                // unusable in that configuration — though ordinary
+                // self-unlock (`validate_user = true`) kept working, since
+                // it never depended on this reader. Checks the same `owner`
+                // or `admin` actions `repository_delete` already does for
+                // the equivalent question.
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                let mut holds_owner_or_admin = false;
+                for action in DELETE_ACTIONS {
+                    if self
+                        .repository_authorizer
+                        .check_repository_access(verified_token.as_ref(), repository, Some(action))
+                        .await
+                        .is_ok()
+                    {
+                        holds_owner_or_admin = true;
+                        break;
+                    }
+                }
+                let validate_user = !holds_owner_or_admin;
+
                 let resources = self
                     .lock_store
                     .unlock_resources(user_id.as_str(), validate_user, repository, &resources)
@@ -377,9 +402,7 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
-                let verified_token = claims.as_ref().map(|claims| {
-                    VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims)
-                });
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
                 self.repository_authorizer
                     .check_repository_access(verified_token.as_ref(), repository, Some(ADMIN_LOCK_ACTION))
                     .await
@@ -846,6 +869,99 @@ mod test {
                 .expect_err("Unlock did not return error status");
 
             assert_eq!(error_status.code(), Code::FailedPrecondition);
+        }
+
+        /// A Tier 1 token (LEP 2026-08-20-oidc-oauth2-authentication, D8)
+        /// that holds neither `owner` nor `admin`: `unlock_resources` must
+        /// still be called with `validate_user = true`, the ordinary
+        /// self-unlock path. Before this fix, the legacy `is_owner_or_admin`
+        /// reader looked at a `resources` claim this token never carries —
+        /// which happened to also produce `validate_user = true` here, so
+        /// this specific case was not itself broken, only the override
+        /// below was.
+        #[tokio::test]
+        async fn unlock_validates_user_when_caller_lacks_owner_or_admin_action() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store
+                .expect_unlock_resources()
+                .withf(|_owner_id, validate_user, _repository, _resources| *validate_user)
+                .return_once(|_, _, _, _| Ok(vec![]));
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(UnlockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            let _ = lock_service
+                .unlock(request)
+                .await
+                .expect("Unlock did not return ok status");
+        }
+
+        /// A Tier 1 token that holds the `admin` action: `unlock_resources`
+        /// must be called with `validate_user = false`, letting an admin
+        /// force-clear another user's stuck lock. Before this fix,
+        /// `is_owner_or_admin` always returned `false` under Tier 1 (its
+        /// `resources` claim read never matches a Tier 1 token), so this
+        /// override was completely unusable regardless of what the caller
+        /// actually held.
+        #[tokio::test]
+        async fn unlock_skips_validation_when_caller_holds_admin_action() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store
+                .expect_unlock_resources()
+                .withf(|_owner_id, validate_user, _repository, _resources| !*validate_user)
+                .return_once(|_, _, _, _| Ok(vec![]));
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(UnlockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["admin".to_string()]),
+                ..Default::default()
+            });
+
+            let _ = lock_service
+                .unlock(request)
+                .await
+                .expect("Unlock did not return ok status");
         }
     }
 }
