@@ -48,6 +48,60 @@ the [MinIO client](https://min.io/docs/minio/linux/reference/minio-mc.html) (`mc
 $ MC_HOST_local=http://lorelocal:lorelocal@localhost:9000 mc rb --force --insecure local/lore-immutable-store-test
 ```
 
+## GCP Store Tests
+
+`gcp_store_test.rs` exercises `lore-gcp` against a Firestore emulator and the
+[Google Cloud Storage testbench][testbench] (chosen over the more common `fake-gcs-server`
+because `google-cloud-storage`'s control-plane client speaks gRPC, which `fake-gcs-server` does
+not implement). Unlike the AWS tests above, running these locally needs one more piece: neither
+client library treats an emulator as a reason to skip Application Default Credential resolution,
+so a fake GCE metadata server (`gcp_fake_metadata_server.py`) stands in for real credentials — see
+that script's module doc for why, and `.github/workflows/pr-validate.yml`'s `gcp-integration` job
+for the exact sequence this section summarizes.
+
+From the root of the repo:
+
+```shell
+$ docker compose --file lore-integration-tests/compose.yaml up \
+    firestore-emulator gcs-testbench gcp-fake-metadata
+```
+
+The fake metadata server binds host port 80, because both client libraries query their configured
+metadata host on port 80 unconditionally. Route `metadata.google.internal` there so neither needs
+a `GCE_METADATA_HOST` override:
+
+```shell
+$ echo "127.0.0.1 metadata.google.internal" | sudo tee -a /etc/hosts
+```
+
+The testbench needs its gRPC control-plane surface started explicitly, and the bucket the tests
+write to needs creating once:
+
+```shell
+$ curl "http://127.0.0.1:9010/start_grpc?port=8888"
+$ curl -X POST -H 'Content-Type: application/json' \
+    -d '{"name":"lore-gcp-ci-bucket"}' \
+    'http://127.0.0.1:9010/storage/v1/b?project=lore-gcp-test'
+```
+
+Then run the tests (no `GOOGLE_APPLICATION_CREDENTIALS` — that would skip the fake metadata
+server entirely and hit real Google endpoints instead):
+
+```shell
+$ LORE_GCP_TEST_PROJECT=lore-gcp-test \
+  LORE_GCP_TEST_BUCKET=lore-gcp-ci-bucket \
+  LORE_GCP_TEST_GCS_ENDPOINT=http://127.0.0.1:9010 \
+  LORE_GCP_TEST_GCS_CONTROL_ENDPOINT=http://127.0.0.1:8888 \
+  FIRESTORE_EMULATOR_HOST=127.0.0.1:8080 \
+  cargo test --package lore-integration-tests --features integration_tests gcp_store_tests
+```
+
+Without that environment set, `gcp_store_test.rs`'s tests skip (reporting why) rather than fail —
+the same behavior `cargo test --package lore-integration-tests --features integration_tests`
+already has for them today.
+
+[testbench]: https://github.com/googleapis/storage-testbench
+
 ## gRPC Integration Tests
 
 There is a suite of integration tests for gRPC Services. These are gated behind a separate feature:

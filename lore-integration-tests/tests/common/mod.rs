@@ -565,6 +565,23 @@ pub(crate) mod gcp_common {
     //! - `LORE_GCP_TEST_PROJECT` - the GCP project id (used for both GCS quota and Firestore).
     //! - `LORE_GCP_TEST_BUCKET` - an existing GCS bucket the test may read and write freely.
     //! - `LORE_GCP_TEST_FIRESTORE_DATABASE` - optional; Firestore database id, default `"(default)"`.
+    //! - `LORE_GCP_TEST_GCS_ENDPOINT` / `LORE_GCP_TEST_GCS_CONTROL_ENDPOINT` - optional overrides
+    //!   for the GCS data-plane (`Storage`) and control-plane (`StorageControl`) clients
+    //!   respectively. Production never needs these (both point at the real service), but the
+    //!   [Google Cloud Storage testbench][testbench] — the test double this crate's CI job runs —
+    //!   serves its HTTP/JSON data-plane surface and its gRPC control-plane surface on two
+    //!   different ports, so the two need separate overrides. `FIRESTORE_EMULATOR_HOST` (read
+    //!   directly by the `firestore` crate, not by this module) is the Firestore equivalent.
+    //!
+    //! Application Default Credentials still have to resolve to *something* against an emulator:
+    //! neither `google-cloud-auth` nor `gcloud-sdk`'s token sources special-case an emulator host
+    //! by skipping authentication, so a syntactically valid (but otherwise fake) service account
+    //! key is enough — the emulators never validate the signature. See
+    //! `.github/workflows/pr-validate.yml`'s GCP job for how CI generates one on the fly, rather
+    //! than committing a checked-in key that would (rightly) trip the `detect-private-key`
+    //! pre-commit hook.
+    //!
+    //! [testbench]: https://github.com/googleapis/storage-testbench
 
     use std::error::Error;
 
@@ -578,6 +595,8 @@ pub(crate) mod gcp_common {
         pub(crate) project: String,
         pub(crate) bucket: String,
         pub(crate) database: Option<String>,
+        pub(crate) gcs_endpoint: Option<String>,
+        pub(crate) gcs_control_endpoint: Option<String>,
     }
 
     /// `None` when the environment is not configured for a live GCP run — the signal every test
@@ -587,6 +606,8 @@ pub(crate) mod gcp_common {
             project: std::env::var("LORE_GCP_TEST_PROJECT").ok()?,
             bucket: std::env::var("LORE_GCP_TEST_BUCKET").ok()?,
             database: std::env::var("LORE_GCP_TEST_FIRESTORE_DATABASE").ok(),
+            gcs_endpoint: std::env::var("LORE_GCP_TEST_GCS_ENDPOINT").ok(),
+            gcs_control_endpoint: std::env::var("LORE_GCP_TEST_GCS_CONTROL_ENDPOINT").ok(),
         })
     }
 
@@ -601,7 +622,11 @@ pub(crate) mod gcp_common {
     pub(crate) async fn clients(
         env: &GcpTestEnv,
     ) -> Result<(Storage, StorageControl, FirestoreDb), Box<dyn Error + 'static>> {
-        let (storage, control) = clients::build_storage_clients(None).await?;
+        let (storage, control) = clients::build_storage_clients(
+            env.gcs_endpoint.as_deref(),
+            env.gcs_control_endpoint.as_deref(),
+        )
+        .await?;
         let db = clients::build_firestore_db(&env.project, env.database.as_deref()).await?;
         Ok((storage, control, db))
     }

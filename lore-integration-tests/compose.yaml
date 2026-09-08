@@ -39,3 +39,43 @@ services:
     volumes:
       - ./consul-data:/consul/data
     command: agent -data-dir=/consul/node-1/data -node=consul-node-1 -retry-join=consul-server
+
+  # The following three services back lore-gcp's integration tests (gcp_store_test.rs). Unlike
+  # the AWS services above, they are opt-in: `docker compose up` starts them along with
+  # everything else, but the tests they back skip gracefully (see
+  # lore-integration-tests/tests/common/mod.rs's gcp_common module) unless LORE_GCP_TEST_PROJECT
+  # and LORE_GCP_TEST_BUCKET are also set. See .github/workflows/pr-validate.yml's
+  # gcp-integration job for the full environment these tests need, including why
+  # GOOGLE_APPLICATION_CREDENTIALS must stay unset here.
+  firestore-emulator:
+    image: google/cloud-sdk:emulators
+    ports:
+      - "8080:8080"
+    command: gcloud emulators firestore start --host-port=0.0.0.0:8080 --database-mode=firestore-native
+
+  # The Google Cloud Storage testbench (https://github.com/googleapis/storage-testbench). Chosen
+  # over the more commonly used fake-gcs-server because google-cloud-storage's StorageControl
+  # client (bucket/object metadata operations) speaks gRPC, which fake-gcs-server does not
+  # implement; the testbench serves both that gRPC control-plane surface and the JSON/HTTP
+  # data-plane surface write_object/read_object use, once start_grpc is called (see the
+  # gcp-integration CI job).
+  gcs-testbench:
+    image: gcr.io/cloud-devrel-public-resources/storage-testbench:latest
+    ports:
+      - "9010:9000"
+      - "8888:8888"
+
+  # A fake GCE metadata server (see gcp_fake_metadata_server.py for why one is needed): both
+  # Firestore's and GCS's Rust clients resolve Application Default Credentials the normal way even
+  # against a local emulator, and this is the one credential path that works without either a
+  # live Google account or the aws-lc-rs backend this workspace's deny.toml forbids. Binds host
+  # port 80 because both client libraries hit their configured metadata host on port 80
+  # unconditionally; pair this with an /etc/hosts entry mapping metadata.google.internal to
+  # 127.0.0.1 (see the gcp-integration CI job) so no GCE_METADATA_HOST override is needed either.
+  gcp-fake-metadata:
+    image: python:3-alpine
+    ports:
+      - "80:80"
+    volumes:
+      - ./gcp_fake_metadata_server.py:/gcp_fake_metadata_server.py:ro
+    command: python3 /gcp_fake_metadata_server.py lore-gcp-test

@@ -100,7 +100,9 @@ jobs:
           key: integration
 
       - name: Start backing services (MinIO, DynamoDB Local, Consul)
-        run: docker compose --file lore-integration-tests/compose.yaml up --detach
+        run: >
+          docker compose --file lore-integration-tests/compose.yaml up --detach
+          minio dynamodb consul-server consul-node-1
 
       - name: Wait for services to be ready
         run: |
@@ -125,6 +127,113 @@ jobs:
         run: >
           cargo test --package lore-integration-tests
           --features integration_tests --verbose
+
+      - name: Dump service logs on failure
+        if: failure()
+        run: docker compose --file lore-integration-tests/compose.yaml logs
+
+      - name: Stop services
+        if: always()
+        run: docker compose --file lore-integration-tests/compose.yaml down --volumes
+
+  # Runs lore-gcp's integration tests (gcp_store_test.rs) against the Firestore emulator and the
+  # Google Cloud Storage testbench. Deliberately excluded from pr-validate's `needs:` below, so a
+  # failure here does not block a PR — see the comment on that job for why.
+  #
+  # Unlike the AWS integration job, this one also needs credentials, because neither client
+  # library treats an emulator/test-double endpoint as a reason to skip Application Default
+  # Credential resolution. Real credentials are not an option in a public-CI PR-validation
+  # workflow that runs with no secrets (see this file's header comment), so instead this job runs
+  # a fake GCE metadata server (gcp_fake_metadata_server.py) that both `firestore`/`gcloud-sdk`
+  # and `google-cloud-storage`/`google-cloud-auth` fall back to when no other credential source is
+  # configured, exactly as they would on a real GCE/GKE/Cloud Run instance. Neither the emulator
+  # nor the testbench verifies the resulting token's signature. See that script's module doc for
+  # why this is the only credential path that works here without either a live Google account or
+  # the aws-lc-rs backend this workspace's deny.toml forbids (which is what firestore's own
+  # service-account-key credential path would otherwise need, on the gcloud-sdk version pinned to
+  # stay deny.toml-compliant).
+  #
+  # Known-failing today: the mutable-store tests (Firestore only) pass; the immutable-store tests
+  # (which write to GCS) do not, because of a confirmed bug in the GCS testbench itself, not in
+  # lore-gcp — see `lore_gcp::store::immutable_store`'s module docs ("A test-double bug, not a
+  # `lore-gcp` bug") for the full, hand-verified root cause. This job still runs on every PR
+  # (rather than being removed) because the Firestore side is real, valuable coverage on its own,
+  # and because a future testbench release or `google-cloud-storage` fix could make the rest of it
+  # pass with no changes needed here.
+  gcp-integration:
+    name: gcp-integration (linux-x86_64)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read # Check out the PR head to test it
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      # Build on /mnt. See the unit job for the reason.
+      - name: Build on the larger /mnt volume
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+          df -h / /mnt
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: gcp-integration
+
+      # Both gcloud-sdk and google-cloud-auth query their configured metadata host on port 80
+      # unconditionally, and default that host to metadata.google.internal. Routing that name to
+      # gcp-fake-metadata's published port 80 here means the test step below needs no
+      # GCE_METADATA_HOST override, matching how a real GCE instance needs none either.
+      - name: Route metadata.google.internal to the fake metadata server
+        run: echo "127.0.0.1 metadata.google.internal" | sudo tee -a /etc/hosts
+
+      - name: Start backing services (Firestore emulator, GCS testbench, fake metadata server)
+        run: >
+          docker compose --file lore-integration-tests/compose.yaml up --detach
+          firestore-emulator gcs-testbench gcp-fake-metadata
+
+      - name: Wait for services to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if curl -sf -o /dev/null http://127.0.0.1:8080 \
+               && curl -sf -o /dev/null http://127.0.0.1:9010 \
+               && curl -sf -o /dev/null http://metadata.google.internal/; then
+              echo "services ready"
+              exit 0
+            fi
+            echo "waiting for services (attempt $i)..."
+            sleep 2
+          done
+          echo "services did not become ready in time"
+          exit 1
+
+      # The testbench serves its gRPC control-plane surface (bucket/object metadata operations)
+      # only once asked to; its JSON/HTTP data-plane surface (object upload/download) is up from
+      # the start. See the gcs-testbench service's comment in compose.yaml.
+      - name: Start the GCS testbench's gRPC control-plane server
+        run: curl -sf "http://127.0.0.1:9010/start_grpc?port=8888"
+
+      - name: Create the GCS testbench bucket lore-gcp's tests write to
+        run: >
+          curl -sf -X POST -H 'Content-Type: application/json'
+          -d '{"name":"lore-gcp-ci-bucket"}'
+          'http://127.0.0.1:9010/storage/v1/b?project=lore-gcp-test'
+
+      - name: cargo test (gcp-integration)
+        env:
+          # Deliberately no GOOGLE_APPLICATION_CREDENTIALS: see this job's header comment.
+          LORE_GCP_TEST_PROJECT: lore-gcp-test
+          LORE_GCP_TEST_BUCKET: lore-gcp-ci-bucket
+          LORE_GCP_TEST_GCS_ENDPOINT: http://127.0.0.1:9010
+          LORE_GCP_TEST_GCS_CONTROL_ENDPOINT: http://127.0.0.1:8888
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8080
+        run: >
+          cargo test --package lore-integration-tests --test integration
+          --features integration_tests --verbose gcp_store_tests
 
       - name: Dump service logs on failure
         if: failure()
@@ -217,6 +326,16 @@ jobs:
 
   # Reports one result for the jobs above so branch protection can require a
   # single check.
+  #
+  # gcp-integration is deliberately not in needs: below, for two independent reasons: (1) its
+  # immutable-store tests currently fail against a confirmed bug in the GCS testbench itself, not
+  # in lore-gcp (see that job's own comment), so requiring it would block every PR on a third
+  # party's bug with no lore-gcp-side fix available; (2) even its passing half depends on a
+  # credential path (a fake GCE metadata server) that is new and has not yet had a run on a real
+  # PR, so a GH-Actions-specific surprise there (sudo/etc-hosts or port-80 publishing behaving
+  # differently than expected) should not be able to block every PR from the first run either.
+  # Revisit once the testbench (or google-cloud-storage) fixes the bug and the credential path has
+  # proven reliable in practice.
   pr-validate:
     name: PR Validate
     if: ${{ always() }}
