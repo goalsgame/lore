@@ -9,6 +9,7 @@ members = [
     "lore-credential",
     "lore-error-set",
     "lore-error-set-macro",
+    "lore-gcp",
     "lore-hashicorp",
     "lore-integration-tests",
     "lore-io",
@@ -32,6 +33,7 @@ lore-base = { path = "lore-base" }
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
 lore-error-set-macro = { path = "lore-error-set-macro" }
+lore-gcp = { path = "lore-gcp" }
 lore-hashicorp = { path = "lore-hashicorp" }
 lore-integration-tests = { path = "lore-integration-tests" }
 lore-io = { path = "lore-io" }
