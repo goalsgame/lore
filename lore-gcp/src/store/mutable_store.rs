@@ -67,9 +67,9 @@
 //! # Every remote call is bounded and classified
 //!
 //! See the equivalent section in `store::immutable_store`'s module docs — the same
-//! [`crate::clients::bounded`] timeout/slow-threshold wrapper and the same retryable-error
-//! classification (here, [`is_firestore_retryable`]) apply to every Firestore call this module
-//! makes.
+//! [`crate::clients::bounded`] timeout/slow-threshold wrapper and the same
+//! [`crate::clients::is_firestore_retryable`] retryable-error classification apply to every
+//! Firestore call this module makes.
 
 use std::future::Future;
 use std::sync::Arc;
@@ -161,22 +161,9 @@ fn parse_hash(value: &str) -> Result<Hash, GcpError> {
     Ok(Hash::from(bytes))
 }
 
-/// Whether a Firestore failure means "retry me". See
-/// `store::immutable_store::is_firestore_retryable` for the full rationale; kept as a separate
-/// copy here (rather than a shared `pub(crate)` helper) only because the two modules' `to_store_error`
-/// wrap different context strings — the classification logic itself is identical.
-fn is_firestore_retryable(error: &firestore::errors::FirestoreError) -> bool {
-    use firestore::errors::FirestoreError;
-    match error {
-        FirestoreError::DatabaseError(e) => e.retry_possible,
-        FirestoreError::NetworkError(_) => true,
-        _ => false,
-    }
-}
-
 fn to_store_error(error: GcpError) -> StoreError {
     if let GcpError::Firestore(inner) = &error
-        && is_firestore_retryable(inner)
+        && crate::clients::is_firestore_retryable(inner)
     {
         return StoreError::from(SlowDown);
     }
@@ -210,7 +197,7 @@ impl FirestoreMutableStore {
 
     /// Run a Firestore future, bounded by this store's configured timeout/slow threshold, and
     /// classify its error as a `StoreError` (retryable failures become
-    /// [`StoreError::SlowDown`]; see [`is_firestore_retryable`]).
+    /// [`StoreError::SlowDown`]; see [`crate::clients::is_firestore_retryable`]).
     async fn firestore_op<T>(
         &self,
         op: &'static str,

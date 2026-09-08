@@ -42,10 +42,14 @@
 //! operation exceeds the configured slow-operation threshold — the same two knobs
 //! `[plugins.gcp]`'s `timeout_millis`/`*_slow_operation_threshold_millis` control for `lore_aws`,
 //! at the same granularity (per underlying SDK call, not per `ImmutableStore` trait method).
-//! [`is_gcs_retryable`]/[`is_firestore_retryable`] then classify the failure itself: a throttle,
-//! `UNAVAILABLE`, or `DEADLINE_EXCEEDED` also becomes `StoreError::SlowDown` rather than a hard
-//! internal error, mirroring `lore_aws::store::immutable_store::is_dynamodb_overloaded` — so a
-//! client retries a transient failure instead of surfacing it as permanent.
+//! [`is_gcs_retryable`]/[`crate::clients::is_firestore_retryable`] then classify the failure
+//! itself: a throttle, `UNAVAILABLE`, or `DEADLINE_EXCEEDED` also becomes `StoreError::SlowDown`
+//! rather than a hard internal error, mirroring
+//! `lore_aws::store::immutable_store::is_dynamodb_overloaded` — so a client retries a transient
+//! failure instead of surfacing it as permanent. (`is_firestore_retryable` lives in `clients.rs`,
+//! not here, because it is shared verbatim with `store::mutable_store` — see its doc comment for
+//! why `DEADLINE_EXCEEDED` needs its own check rather than trusting the `firestore` crate's own
+//! `retry_possible` flag alone.)
 //!
 //! # A test-double bug, not a `lore-gcp` bug: the GCS testbench rejects this store's writes
 //!
@@ -178,20 +182,6 @@ fn is_gcs_retryable(error: &google_cloud_storage::Error) -> bool {
     }
 }
 
-/// Whether a Firestore failure means "retry me". `FirestoreDatabaseError::retry_possible` is the
-/// `firestore` crate's own classification of the gRPC status it wrapped (throttling,
-/// `UNAVAILABLE`, `DEADLINE_EXCEEDED`, ...), which is exactly the distinction
-/// [`is_gcs_retryable`] draws by hand for GCS; `NetworkError` covers the transport-level failures
-/// below the gRPC status layer (connection refused, DNS, ...), which are retryable by nature.
-fn is_firestore_retryable(error: &firestore::errors::FirestoreError) -> bool {
-    use firestore::errors::FirestoreError;
-    match error {
-        FirestoreError::DatabaseError(e) => e.retry_possible,
-        FirestoreError::NetworkError(_) => true,
-        _ => false,
-    }
-}
-
 fn to_store_error_gcs(error: google_cloud_storage::Error, context: &'static str) -> StoreError {
     if is_gcs_retryable(&error) {
         StoreError::from(SlowDown)
@@ -202,7 +192,7 @@ fn to_store_error_gcs(error: google_cloud_storage::Error, context: &'static str)
 
 fn to_store_error(error: GcpError) -> StoreError {
     if let GcpError::Firestore(inner) = &error
-        && is_firestore_retryable(inner)
+        && crate::clients::is_firestore_retryable(inner)
     {
         return StoreError::from(SlowDown);
     }
@@ -427,7 +417,7 @@ impl GcpImmutableStore {
 
     /// Run a Firestore future, bounded by this store's configured Firestore timeout/slow
     /// threshold, and classify its error as a `StoreError` (retryable failures become
-    /// [`StoreError::SlowDown`]; see [`is_firestore_retryable`]).
+    /// [`StoreError::SlowDown`]; see [`crate::clients::is_firestore_retryable`]).
     async fn firestore_op<T>(
         &self,
         op: &'static str,

@@ -195,6 +195,38 @@ pub async fn bounded<T>(
     })
 }
 
+/// Whether a Firestore failure means "retry me". Shared by `store::immutable_store` and
+/// `store::mutable_store` (previously two byte-identical copies, one per module — consolidated
+/// here the same way the config-default functions were consolidated into `plugins::gcp`, since
+/// nothing about this classification is specific to either store).
+///
+/// Delegates to the `firestore` crate's own `retry_possible` flag for the common cases
+/// (`Aborted`/`Cancelled`/`Unavailable`/`ResourceExhausted`, plus a handful of transport-level
+/// conditions `firestore` recognizes from the underlying `hyper` error), but does not trust it
+/// alone: `firestore-0.47.1`'s `errors.rs` `impl From<gcloud_sdk::tonic::Status> for
+/// FirestoreError` sets `retry_possible: false` for every gRPC status code outside that short
+/// list — including `DEADLINE_EXCEEDED`, a server reporting that *it* hit its own deadline, which
+/// is exactly as transient/retryable as `UNAVAILABLE` is. That status code is not lost, though:
+/// every branch of that `From` impl (including the catch-all one `DEADLINE_EXCEEDED` falls into)
+/// stamps `public.code` with `format!("{:?}", status.code())` — `tonic::Code`'s plain derived
+/// `Debug`, so a `DEADLINE_EXCEEDED` status leaves `public.code == "DeadlineExceeded"` — which is
+/// the one place that code survives on `FirestoreDatabaseError` for a caller to check, since the
+/// struct does not otherwise expose the original `tonic::Code`. This is what the second half of
+/// this function's condition checks, independent of `retry_possible`.
+///
+/// (This is distinct from — and layered on top of, not a replacement for — the client-side
+/// timeout `bounded` in this module enforces on every call: this classifies a failure the
+/// *server* already returned, including one where the server gave up on its own deadline;
+/// `bounded` instead bounds calls that never returned at all.)
+pub(crate) fn is_firestore_retryable(error: &firestore::errors::FirestoreError) -> bool {
+    use firestore::errors::FirestoreError;
+    match error {
+        FirestoreError::DatabaseError(e) => e.retry_possible || e.public.code == "DeadlineExceeded",
+        FirestoreError::NetworkError(_) => true,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,5 +238,38 @@ mod tests {
         ensure_crypto_provider();
         ensure_crypto_provider();
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
+    }
+
+    /// Regression test for the exact gap the code review caught: a server-side
+    /// `DEADLINE_EXCEEDED` status is `firestore::errors::FirestoreDatabaseError`'s `retry_possible
+    /// = false` catch-all case, but must still be treated as retryable here.
+    #[test]
+    fn deadline_exceeded_is_retryable_even_though_the_firestore_crate_marks_it_permanent() {
+        use firestore::errors::FirestoreDatabaseError;
+        use firestore::errors::FirestoreError;
+        use firestore::errors::FirestoreErrorPublicGenericDetails;
+
+        let error = FirestoreError::DatabaseError(FirestoreDatabaseError::new(
+            FirestoreErrorPublicGenericDetails::new("DeadlineExceeded".to_string()),
+            "Status { code: DeadlineExceeded, message: \"\" }".to_string(),
+            false,
+        ));
+
+        assert!(is_firestore_retryable(&error));
+    }
+
+    #[test]
+    fn other_permanent_database_errors_stay_non_retryable() {
+        use firestore::errors::FirestoreDatabaseError;
+        use firestore::errors::FirestoreError;
+        use firestore::errors::FirestoreErrorPublicGenericDetails;
+
+        let error = FirestoreError::DatabaseError(FirestoreDatabaseError::new(
+            FirestoreErrorPublicGenericDetails::new("InvalidArgument".to_string()),
+            "Status { code: InvalidArgument, message: \"\" }".to_string(),
+            false,
+        ));
+
+        assert!(!is_firestore_retryable(&error));
     }
 }
