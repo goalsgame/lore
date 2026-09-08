@@ -40,6 +40,7 @@ use super::helpers::identifier_for_signature;
 use super::helpers::link_pin_change_to_diff_change;
 use super::helpers::node_change_to_diff_change;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -110,6 +111,7 @@ impl Default for RevisionDiffConfig {
 #[tracing::instrument(name = "RevisionDiff::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionDiffRequest>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     config: RevisionDiffConfig,
@@ -137,7 +139,7 @@ pub async fn handler(
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(link_read_authorizer(reachability_authorizer, authorization)),
     );
 
     LORE_CONTEXT
@@ -787,6 +789,14 @@ mod test {
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
 
+    /// None of these tests populate an `AuthorizationToken` extension, so
+    /// `link_read_authorizer` never actually consults this value (it takes
+    /// the `None`-token / `allow_all_repositories` branch) — any authorizer
+    /// works here.
+    fn no_auth_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
+
     fn make_request(
         repository: RepositoryId,
         from: QueryFrom,
@@ -919,6 +929,7 @@ mod test {
             );
             let err = match handler(
                 request,
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -964,6 +975,7 @@ mod test {
                     QueryTo::SignatureTo(rev.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1028,6 +1040,7 @@ mod test {
                     QueryTo::SignatureTo(rev2.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1123,6 +1136,7 @@ mod test {
                     QueryTo::SignatureTo(feature_rev.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1219,6 +1233,7 @@ mod test {
                     QueryTo::SignatureTo(b_rev.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1279,6 +1294,7 @@ mod test {
                     QueryTo::SignatureTo(real.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1327,6 +1343,7 @@ mod test {
                     QueryTo::SignatureTo(rev1.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1399,6 +1416,7 @@ mod test {
                     QueryTo::SignatureTo(Hash::default().into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1457,6 +1475,7 @@ mod test {
             );
             let err = match handler(
                 request,
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1518,6 +1537,7 @@ mod test {
                     }),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),
@@ -1616,6 +1636,7 @@ mod test {
                     QueryTo::SignatureTo(b_rev.into()),
                     false,
                 ),
+                no_auth_reachability_authorizer(),
                 immutable_store,
                 mutable_store,
                 RevisionDiffConfig::default(),

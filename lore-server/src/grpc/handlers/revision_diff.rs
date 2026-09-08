@@ -19,6 +19,7 @@ use tracing::warn;
 
 use super::path_diff::link_pin_path_diffs;
 use super::path_diff::map_to_path_diff;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -30,6 +31,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RevisionDiff::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionDiffRequest>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RevisionDiffResponse>, Status> {
@@ -49,7 +51,7 @@ pub async fn handler(
 
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(link_read_authorizer(reachability_authorizer, authorization)),
     );
 
     LORE_CONTEXT

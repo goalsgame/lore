@@ -26,6 +26,7 @@ use super::handlers::revision_describe;
 use super::handlers::revision_diff;
 use super::handlers::revision_state_history;
 use super::handlers::revision_tree;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::handlers::revision_list;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -56,12 +57,14 @@ pub struct LoreRevisionService {
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     rpc_timeout: Duration,
+    reachability_authorizer: ReachabilityAuthorizer,
 
     instrument_provider: RevisionServiceInstrumentProvider,
     revision_list_instruments: RevisionListInstruments,
 }
 
 impl LoreRevisionService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -70,6 +73,7 @@ impl LoreRevisionService {
         history_step_size: u64,
         acceleration: crate::grpc::server::RevisionListAcceleration,
         rpc_timeout: Duration,
+        reachability_authorizer: ReachabilityAuthorizer,
     ) -> Self {
         let instrument_provider = RevisionServiceInstrumentProvider {};
         let seconds_in_one_day = 86400f64;
@@ -100,6 +104,7 @@ impl LoreRevisionService {
             history_step_size,
             acceleration,
             rpc_timeout,
+            reachability_authorizer,
             instrument_provider,
             revision_list_instruments,
         }
@@ -203,6 +208,7 @@ impl RevisionService for LoreRevisionService {
                 &self.hook_dispatcher,
                 self.history_step_size,
                 self.acceleration,
+                self.reachability_authorizer.authorizer.clone(),
                 &self.instrument_provider,
             ),
         )
@@ -232,6 +238,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             revision_diff::handler(
                 request,
+                self.reachability_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -247,6 +254,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             revision_tree::handler(
                 request,
+                self.reachability_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -277,6 +285,7 @@ impl RevisionService for LoreRevisionService {
             self.rpc_timeout,
             branch_diff::handler(
                 request,
+                self.reachability_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

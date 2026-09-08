@@ -21,6 +21,7 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
@@ -35,6 +36,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "BranchDiff::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDiffRequest>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<BranchDiffResponse>, Status> {
@@ -57,7 +59,7 @@ pub async fn handler(
 
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(authorization)),
+            .with_link_read(link_read_authorizer(reachability_authorizer, authorization)),
     );
     LORE_CONTEXT
         .scope(execution, async move {
@@ -212,6 +214,13 @@ mod test {
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    /// None of these tests populate an `AuthorizationToken` extension, so
+    /// `link_read_authorizer` never consults this value — any authorizer
+    /// works here.
+    fn no_auth_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
 
     async fn commit_revision_on_branch(
         repository_context: Arc<RepositoryContext>,
@@ -468,7 +477,13 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let response = handler(request, immutable_store, mutable_store).await;
+            let response = handler(
+                request,
+                no_auth_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+            )
+            .await;
             let expected = BranchDiffResponse {
                 diffs: vec![],
                 conflicts: vec![],
@@ -721,7 +736,13 @@ mod test {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
-            let response = handler(request, immutable_store, mutable_store).await;
+            let response = handler(
+                request,
+                no_auth_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+            )
+            .await;
             let expected = BranchDiffResponse {
                 diffs: vec![],
                 conflicts: vec![],
@@ -836,7 +857,14 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            handler(request, immutable_store, mutable_store).await.err()
+            handler(
+                request,
+                no_auth_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .err()
         }))
         .await;
 
@@ -961,10 +989,15 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
 
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("Branch diff must resolve a base for histories that share no revision")
-                .into_inner();
+            let response = handler(
+                request,
+                no_auth_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+            )
+            .await
+            .expect("Branch diff must resolve a base for histories that share no revision")
+            .into_inner();
 
             (Hash::from(response.revision_base), main_latest_revision)
         }))

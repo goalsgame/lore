@@ -17,6 +17,7 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_correlation_id;
@@ -29,6 +30,7 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RevisionTree::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionTreeRequest>,
+    reachability_authorizer: ReachabilityAuthorizer,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RevisionTreeResponse>, Status> {
@@ -57,7 +59,7 @@ pub async fn handler(
         mutable_store,
         repository,
     ));
-    let can_read = link_read_authorizer(authorization);
+    let can_read = link_read_authorizer(reachability_authorizer, authorization);
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -117,6 +119,13 @@ mod tests {
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    /// None of these tests populate an `AuthorizationToken` extension, so
+    /// `link_read_authorizer` never consults this value — any authorizer
+    /// works here.
+    fn no_auth_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
 
     #[tokio::test]
     async fn tree_on_file_returns_invalid_argument() {
@@ -190,9 +199,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let err = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect_err("Expected error for tree on non-directory path");
+                let err = handler(
+                    request,
+                    no_auth_reachability_authorizer(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("Expected error for tree on non-directory path");
                 assert_eq!(err.code(), tonic::Code::InvalidArgument);
                 assert_eq!(
                     err.message(),
@@ -265,9 +279,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let err = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect_err("Expected NotFound for non-existent path");
+                let err = handler(
+                    request,
+                    no_auth_reachability_authorizer(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect_err("Expected NotFound for non-existent path");
                 assert_eq!(err.code(), tonic::Code::NotFound);
                 assert_eq!(err.message(), "A node in the tree could not be found");
             })
@@ -355,9 +374,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect("handler ok");
+                let response = handler(
+                    request,
+                    no_auth_reachability_authorizer(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                )
+                .await
+                .expect("handler ok");
                 let paths = response.into_inner().paths;
 
                 assert_eq!(
@@ -471,9 +495,14 @@ mod tests {
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
         );
-        let response = handler(request, immutable_store, mutable_store)
-            .await
-            .expect("handler ok");
+        let response = handler(
+            request,
+            no_auth_reachability_authorizer(),
+            immutable_store,
+            mutable_store,
+        )
+        .await
+        .expect("handler ok");
         let mut paths = response.into_inner().paths;
         assert_eq!(paths.len(), 1, "expected exactly the link entry");
         let link_path = paths.pop().expect("one path");

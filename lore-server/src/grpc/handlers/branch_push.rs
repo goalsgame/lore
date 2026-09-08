@@ -43,9 +43,12 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::cache::revision::store_history_step;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
@@ -57,6 +60,15 @@ use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
+
+/// The action that replaces the `is_service_account` bypass of branch
+/// protection (LEP 2026-08-20-oidc-oauth2-authentication, D4): a push to a
+/// `PROTECT`-ed branch succeeds when the caller holds this action, globally
+/// under Tier 1 or on the pushed-to partition under Tier 2, rather than when
+/// the caller's token happens to carry a legacy service-account claim.
+/// Shared with the v1 handler (`grpc/revision/v1/branch_push.rs`), which
+/// applies the identical check.
+pub(crate) const PUSH_PROTECTED_ACTION: &str = "push-protected";
 
 pub(crate) fn extract_client_ip<T>(request: &Request<T>) -> Option<IpAddr> {
     // try to get the LAST entry from XFF metadata header (injected by ALB)
@@ -85,6 +97,7 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<BranchPushResponse>, Status> {
     let user_info = get_authorization(request.extensions());
@@ -92,15 +105,30 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
 
-    // TODO(mjansson): Once we have authz permission model with read/write/admin
-    // this should be upgraded to check for the correct permission rather than
-    // hardwired to service accounts. For now used to protect while allowing mirroring
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
+    // Replaces the `is_service_account` bypass (LEP
+    // 2026-08-20-oidc-oauth2-authentication, D4): a push to a protected
+    // branch now succeeds only when the caller explicitly holds
+    // `push-protected`, checked through whichever `RepositoryAuthorizer` the
+    // deployment configures, rather than when the token happens to carry a
+    // legacy service-account claim. Preserves the existing shape exactly:
+    // an unauthenticated caller (`user_info` absent, meaning no verifier is
+    // configured at all) never bypasses protection, the same as today.
+    let authorization = extract_authorization_header(&request);
+    let bypass_protection = match user_info.as_ref() {
+        Ok(claims) => {
+            let raw = authorization.as_deref().unwrap_or_default();
+            let verified_token = VerifiedToken::new(raw, claims);
+            repository_authorizer
+                .check_repository_access(
+                    Some(&verified_token),
+                    repository,
+                    Some(PUSH_PROTECTED_ACTION),
+                )
+                .await
+                .is_ok()
+        }
+        Err(_) => false,
+    };
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
     let req = request.into_inner();
