@@ -85,7 +85,11 @@ fn encode(fragment: &Fragment) -> String {
 pub fn from_object_metadata(
     metadata: &HashMap<String, String>,
 ) -> Result<Fragment, ObjectMetadataError> {
-    decode(metadata.get(KEY_FRAGMENT).ok_or(ObjectMetadataError::Absent)?)
+    decode(
+        metadata
+            .get(KEY_FRAGMENT)
+            .ok_or(ObjectMetadataError::Absent)?,
+    )
 }
 
 fn decode(value: &str) -> Result<Fragment, ObjectMetadataError> {

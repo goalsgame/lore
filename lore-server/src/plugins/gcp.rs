@@ -209,16 +209,15 @@ impl ImmutableStorePluginFactory for GcpImmutableStorePluginFactory {
         #[allow(clippy::disallowed_methods)]
         let (storage, control, db) = tokio::task::block_in_place(|| {
             runtime().block_on(async {
-                let (storage, control) = clients::build_storage_clients(
-                    plugin_config.gcs_endpoint_url.as_deref(),
-                )
-                .await
-                .map_err(|e| {
-                    PluginError::from(PluginInitError {
-                        plugin_name: plugin_name.to_string(),
-                        message: format!("Failed to create GCS clients: {e}"),
-                    })
-                })?;
+                let (storage, control) =
+                    clients::build_storage_clients(plugin_config.gcs_endpoint_url.as_deref())
+                        .await
+                        .map_err(|e| {
+                            PluginError::from(PluginInitError {
+                                plugin_name: plugin_name.to_string(),
+                                message: format!("Failed to create GCS clients: {e}"),
+                            })
+                        })?;
 
                 clients::ensure_bucket_exists(&control, &plugin_config.gcs_bucket)
                     .await

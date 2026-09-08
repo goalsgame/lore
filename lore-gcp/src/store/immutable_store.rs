@@ -158,7 +158,9 @@ struct FragmentStateEntry {
 
 impl FragmentStateEntry {
     fn new(state: FragmentState) -> Self {
-        Self { state: state.bits() }
+        Self {
+            state: state.bits(),
+        }
     }
 
     fn state(&self) -> FragmentState {
@@ -287,7 +289,8 @@ impl GcpImmutableStore {
         settings: &GcpImmutableStoreSettings,
     ) -> Self {
         let provider = GcpImmutableStoreInstrumentProvider;
-        let latency_histogram = provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
+        let latency_histogram =
+            provider.latency_histogram_ms(METRICS_OPERATION_LATENCY_METRIC_NAME);
         let labels_get = provider.get_labels_for_operation_context("get");
         let labels_put = provider.get_labels_for_operation_context("put");
         let labels_obliterate = provider.get_labels_for_operation_context("obliterate");
@@ -526,7 +529,10 @@ impl GcpImmutableStore {
             return Ok(HashMap::new());
         }
 
-        let ids: Vec<(Hash, String)> = distinct.iter().map(|hash| (*hash, hex_hash(*hash))).collect();
+        let ids: Vec<(Hash, String)> = distinct
+            .iter()
+            .map(|hash| (*hash, hex_hash(*hash)))
+            .collect();
         let id_strings: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
 
         let mut stream = self
@@ -605,7 +611,7 @@ impl GcpImmutableStore {
             .fluent()
             .delete()
             .from(self.fragment_state_collection.as_ref())
-            .document_id(&hex_hash(hash))
+            .document_id(hex_hash(hash))
             .execute()
             .await
             .map_err(GcpError::firestore)
@@ -741,11 +747,7 @@ impl GcpImmutableStore {
                 .write_object(&self.bucket_resource, object_name.clone(), payload)
                 .set_metadata(to_object_metadata(&fragment))
                 .send_unbuffered(),
-            || {
-                google_cloud_storage::Error::io(std::io::Error::other(
-                    "GCS write_object timed out",
-                ))
-            },
+            || google_cloud_storage::Error::io(std::io::Error::other("GCS write_object timed out")),
         )
         .await
         .map(|_| ())
@@ -976,7 +978,7 @@ impl GcpImmutableStore {
     pub(crate) async fn load(&self, hash: Hash) -> Result<(Fragment, Bytes), StoreError> {
         let contents = self.get_gcs_object_contents(hash).await?;
 
-        let fragment = contents.fragment.clone().map_err(|e| {
+        let fragment = contents.fragment.map_err(|e| {
             warn!(%hash, "Stored object carries unusable or absent fragment metadata: {e}");
             StoreError::internal_with_context(e, "GCS object carries no usable fragment metadata")
         })?;
@@ -1302,7 +1304,11 @@ impl ImmutableStoreTrait for GcpImmutableStore {
         timed!(self.latency_histogram, &self.labels_obliterate, {
             let span = tracing::Span::current();
 
-            let Some(state) = self.load_state(address.hash).instrument(span.clone()).await? else {
+            let Some(state) = self
+                .load_state(address.hash)
+                .instrument(span.clone())
+                .await?
+            else {
                 info!("No fragment state for {address}, nothing to obliterate");
                 return Ok(());
             };

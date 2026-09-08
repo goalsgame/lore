@@ -39,8 +39,7 @@ mod gcp_store_tests {
     type TestResult = Result<(), Box<dyn Error>>;
 
     /// Env var names surfaced in every skip message, so a developer sees exactly what to set.
-    const SKIP_HINT: &str =
-        "set LORE_GCP_TEST_PROJECT and LORE_GCP_TEST_BUCKET (and optionally \
+    const SKIP_HINT: &str = "set LORE_GCP_TEST_PROJECT and LORE_GCP_TEST_BUCKET (and optionally \
          LORE_GCP_TEST_FIRESTORE_DATABASE) to run against a real GCP project";
 
     /// Builds a fresh [`GcpImmutableStore`] scoped to Firestore collections unique to this test
@@ -171,8 +170,7 @@ mod gcp_store_tests {
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await?
-                else {
+                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await? else {
                     eprintln!("skipping put_then_get_roundtrips_the_payload: {SKIP_HINT}");
                     return Ok(());
                 };
@@ -203,8 +201,7 @@ mod gcp_store_tests {
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await?
-                else {
+                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await? else {
                     eprintln!("skipping query_reports_full_match_after_put: {SKIP_HINT}");
                     return Ok(());
                 };
@@ -232,8 +229,7 @@ mod gcp_store_tests {
         let execution = setup_execution("test".to_string());
         LORE_CONTEXT
             .scope(execution, async move {
-                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await?
-                else {
+                let Some(store) = build_immutable_store(&gcp_common::unique_suffix()).await? else {
                     eprintln!("skipping obliterate_removes_the_association: {SKIP_HINT}");
                     return Ok(());
                 };

@@ -275,8 +275,7 @@ impl FirestoreMutableStore {
                         .map_err(BackoffError::Permanent)?;
 
                     let current_value = match current {
-                        Some(entry) => parse_hash(&entry.value)
-                            .map_err(BackoffError::Permanent)?,
+                        Some(entry) => parse_hash(&entry.value).map_err(BackoffError::Permanent)?,
                         None => Hash::default(),
                     };
 
@@ -372,7 +371,7 @@ impl FirestoreMutableStore {
                     let (key, value) = match (parse_hash(&entry.key), parse_hash(&entry.value)) {
                         (Ok(key), Ok(value)) => (key, value),
                         _ => {
-                            warn!(?entry, "Firestore mutable store row has unparseable hex");
+                            warn!(?entry, "Firestore mutable store row has unparsable hex");
                             continue;
                         }
                     };
