@@ -674,6 +674,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let mut admin_svc = self.0.admin_svc;
         admin_svc.set_jwt_verifier(jwt_verifier.clone());
         admin_svc.set_rpc_timeout(rpc_timeout);
+        admin_svc.set_repository_authorizer(repository_authorizer.clone());
 
         let storage_svc = LoreStorageService::new(
             self.0.immutable_store.clone(),
@@ -723,7 +724,12 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
         let environment_v1_svc = LoreEnvironmentV1Service::new(self.0.environment);
         let lock_svc = self.0.lock_store.map(|lock_store| {
-            LoreLockService::new(lock_store, self.0.notification_sender.clone(), rpc_timeout)
+            LoreLockService::new(
+                lock_store,
+                self.0.notification_sender.clone(),
+                rpc_timeout,
+                repository_authorizer.clone(),
+            )
         });
 
         let authenticated = jwt_verifier.is_some();

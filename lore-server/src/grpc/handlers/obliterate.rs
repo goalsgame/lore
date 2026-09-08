@@ -18,9 +18,12 @@ use tracing::warn;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::extract_bearer_token;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
-use crate::grpc::can_obliterate;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::hook_error_to_status;
@@ -29,6 +32,14 @@ use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
+
+/// The action that replaces the legacy `can_obliterate` reader (LEP
+/// 2026-08-20-oidc-oauth2-authentication, D4/D8). `can_obliterate` read the
+/// `resources` claim directly (`crate::grpc::user_permissions`), which Tier 1
+/// tokens never carry, so it denied every caller regardless of what they
+/// actually held — `obliterate` is one of `GlobalGrantsAuthorizer`'s own
+/// example Tier 1 actions.
+pub(crate) const OBLITERATE_ACTION: &str = "obliterate";
 
 async fn authenticate_request(
     metadata: &MetadataMap,
@@ -52,6 +63,7 @@ pub async fn handler(
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     jwt_verifier: &Arc<Option<JwtVerifier>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<ObliterateResponse>, Status> {
     if let Some(verifier) = &**jwt_verifier {
         let authorization = authenticate_request(request.metadata(), verifier).await?;
@@ -59,6 +71,7 @@ pub async fn handler(
     }
 
     let repository = get_repository(request.metadata())?;
+    let raw_token = extract_authorization_header(&request);
     let extensions = request.extensions().clone();
     let user_id = get_user_id(&extensions);
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
@@ -69,9 +82,18 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            if jwt_verifier.is_some() && !can_obliterate(&extensions, repository) {
-                warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
-                return Err(Status::permission_denied("Permission denied"));
+            if jwt_verifier.is_some() {
+                let claims = get_authorization(&extensions).ok();
+                let verified_token = claims.as_ref().map(|claims| {
+                    VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims)
+                });
+                repository_authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(OBLITERATE_ACTION))
+                    .await
+                    .map_err(|_err| {
+                        warn!("Attempt to obliterate {address} in repository, but user does not have the correct permissions");
+                        Status::permission_denied("Permission denied")
+                    })?;
             }
 
             let hook_ctx = HookContext::builder()
@@ -157,10 +179,21 @@ mod tests {
     use super::*;
     use crate::auth::jwk::JWKService;
     use crate::auth::jwk::JWKServiceError;
-    use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
+
+    /// `groups` is an ordinary named `AuthorizationToken` field (the Dex
+    /// convention), so a `GlobalGrantsAuthorizer` configured with
+    /// `permission_claim = "groups"` reads it directly — no `resources`
+    /// claim involved, matching a real Tier 1 (FoxIDs/OIDC) token.
+    const GROUPS_CLAIM: &str = "groups";
+
+    fn tier1_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(GlobalGrantsAuthorizer::new(Some(GROUPS_CLAIM.to_string())))
+    }
 
     const ALGORITHM: Algorithm = Algorithm::HS256;
     const SIGNING_SECRET: &str = "obliterate-test-secret";
@@ -197,7 +230,7 @@ mod tests {
         }
     }
 
-    fn make_jwt(resources: Option<Vec<ResourcePermission>>) -> String {
+    fn make_jwt(groups: Option<Vec<String>>) -> String {
         let claims = AuthorizationToken {
             user_id: "test-user".to_string(),
             issuer: "test-issuer".to_string(),
@@ -212,8 +245,8 @@ mod tests {
             name: Some("test".to_string()),
             preferred_username: Some("test".to_string()),
             client_id: None,
-            resources,
-            groups: None,
+            resources: None,
+            groups,
             is_service_account: Some(false),
             idp: Some("test".to_string()),
             extra: Default::default(),
@@ -273,6 +306,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &None.into(),
+            Arc::new(AllowAllRepositoryAuthorizer),
         )
         .await
         .unwrap_err();
@@ -296,6 +330,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            tier1_authorizer(),
         )
         .await
         .unwrap_err();
@@ -318,6 +353,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            tier1_authorizer(),
         )
         .await
         .unwrap_err();
@@ -325,6 +361,12 @@ mod tests {
         assert_eq!(err.code(), Code::Unauthenticated);
     }
 
+    /// A Tier 1 token (LEP 2026-08-20-oidc-oauth2-authentication, D8): the
+    /// caller is authenticated and carries a `groups` claim, but not the
+    /// `obliterate` action, so `GlobalGrantsAuthorizer` denies it. Before
+    /// this fix, the legacy `can_obliterate` reader looked at a `resources`
+    /// claim this token never carries, and denied every caller identically
+    /// — this test would have passed for the wrong reason.
     #[tokio::test]
     async fn returns_permission_denied_when_user_lacks_obliterate_permission() {
         let repository = random::<RepositoryId>();
@@ -332,19 +374,17 @@ mod tests {
         let notification = Arc::new(MockNotificationSender::new());
         let hook_dispatcher = HookDispatcher::empty();
         let verifier = make_verifier(good_key_service());
-        // Token has resources for this repository but without the 'obliterate' permission
-        let resources = vec![ResourcePermission {
-            resource_id: format!("urc-{repository}"),
-            permission: vec!["read".to_string(), "write".to_string()],
-        }];
+        // Token carries a `groups` claim, but not the `obliterate` action.
+        let groups = vec!["read".to_string(), "write".to_string()];
 
         let err = handler(
-            make_request(repository, Some(make_jwt(Some(resources)))),
+            make_request(repository, Some(make_jwt(Some(groups)))),
             immutable_store,
             mutable_store,
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            tier1_authorizer(),
         )
         .await
         .unwrap_err();
@@ -352,6 +392,9 @@ mod tests {
         assert_eq!(err.code(), Code::PermissionDenied);
     }
 
+    /// A Tier 1 token that does hold the `obliterate` action, via the
+    /// `groups` claim `GlobalGrantsAuthorizer` was configured to read
+    /// (LEP 2026-08-20-oidc-oauth2-authentication, D8).
     #[tokio::test]
     async fn returns_not_found_when_authorized_and_address_absent() {
         let repository = random::<RepositoryId>();
@@ -362,18 +405,16 @@ mod tests {
         let notification = Arc::new(notification);
         let hook_dispatcher = HookDispatcher::empty();
         let verifier = make_verifier(good_key_service());
-        let resources = vec![ResourcePermission {
-            resource_id: format!("urc-{repository}"),
-            permission: vec!["obliterate".to_string()],
-        }];
+        let groups = vec!["obliterate".to_string()];
 
         let err = handler(
-            make_request(repository, Some(make_jwt(Some(resources)))),
+            make_request(repository, Some(make_jwt(Some(groups)))),
             immutable_store,
             mutable_store,
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            tier1_authorizer(),
         )
         .await
         .unwrap_err();
@@ -423,10 +464,7 @@ mod tests {
         let notification = Arc::new(notification);
         let hook_dispatcher = HookDispatcher::empty();
         let verifier = make_verifier(good_key_service());
-        let resources = vec![ResourcePermission {
-            resource_id: format!("urc-{repository}"),
-            permission: vec!["obliterate".to_string()],
-        }];
+        let groups = vec!["obliterate".to_string()];
 
         let mut request = Request::new(ObliterateRequest {
             address: Some(address.into()),
@@ -436,7 +474,7 @@ mod tests {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
         let value: MetadataValue<tonic::metadata::Ascii> =
-            format!("Bearer {}", make_jwt(Some(resources)))
+            format!("Bearer {}", make_jwt(Some(groups)))
                 .parse()
                 .unwrap();
         request.metadata_mut().insert("authorization", value);
@@ -448,6 +486,7 @@ mod tests {
             notification,
             &hook_dispatcher,
             &Some(verifier).into(),
+            tier1_authorizer(),
         )
         .await
         .expect("handler should succeed");

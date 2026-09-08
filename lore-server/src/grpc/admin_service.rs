@@ -23,6 +23,8 @@ use tracing::warn;
 use super::handlers::obliterate;
 use super::timeout_grpc;
 use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::hooks::HookDispatcher;
 
 pub struct LoreAdminService {
@@ -33,6 +35,11 @@ pub struct LoreAdminService {
     notification: Arc<dyn NotificationSender>,
     hook_dispatcher: Arc<HookDispatcher>,
     rpc_timeout: Duration,
+    /// Checks the `obliterate` action (LEP 2026-08-20-oidc-oauth2-authentication,
+    /// D4/D8). Defaults to [`AllowAllRepositoryAuthorizer`] until
+    /// [`Self::set_repository_authorizer`] runs, matching this service's
+    /// existing "unauthenticated until `set_jwt_verifier` runs" shape.
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl LoreAdminService {
@@ -85,6 +92,7 @@ impl LoreAdminService {
             notification,
             hook_dispatcher,
             rpc_timeout: Duration::from_secs(60),
+            repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
         }
     }
 
@@ -95,6 +103,13 @@ impl LoreAdminService {
             );
         }
         self.jwt_verifier = Arc::new(jwt_verifier);
+    }
+
+    pub fn set_repository_authorizer(
+        &mut self,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) {
+        self.repository_authorizer = repository_authorizer;
     }
 
     pub fn set_rpc_timeout(&mut self, rpc_timeout: Duration) {
@@ -127,6 +142,7 @@ impl AdminService for LoreAdminService {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.jwt_verifier,
+                self.repository_authorizer.clone(),
             ),
         )
         .await

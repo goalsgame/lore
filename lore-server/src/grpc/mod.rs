@@ -313,14 +313,6 @@ pub fn is_owner_or_admin(extensions: &Extensions, repository: RepositoryId) -> b
         || user_permissions.contains(&"admin".to_string())
 }
 
-pub fn can_obliterate(extensions: &Extensions, repository: RepositoryId) -> bool {
-    user_permissions(extensions, repository).contains(&"obliterate".to_string())
-}
-
-pub fn can_admin_lock(extensions: &Extensions, repository: RepositoryId) -> bool {
-    has_required_permission(extensions, repository, "migrate")
-}
-
 pub fn get_matching_permissions(
     extensions: &Extensions,
     repository: RepositoryId,
@@ -763,8 +755,17 @@ mod tests {
         ));
     }
 
+    // `can_admin_lock` (formerly here, reading this same `resources` claim
+    // locally) was removed: it denied every caller under Tier 1, which never
+    // carries a `resources` claim, and its only call site
+    // (`LoreLockService::handle_admin_lock`) now checks the `migrate` action
+    // through the configured `RepositoryAuthorizer` instead (LEP
+    // 2026-08-20-oidc-oauth2-authentication, D4/D8/D9). `has_required_permission`
+    // itself is still exercised directly below, including its wildcard
+    // matching, since it remains a general primitive over the legacy
+    // `resources` claim shape.
     #[test]
-    fn can_admin_lock_with_direct_permission_claim() {
+    fn has_required_permission_with_direct_permission_claim() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -787,18 +788,23 @@ mod tests {
                 .unwrap()
                 .into();
 
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
-
-        // as user doesn't have "migrate" permission for an unrelated repo, they CAN'T admin lock that repo
-        assert!(!can_admin_lock(
+        // as user has "migrate" permission for a given repo, they hold it there
+        assert!(has_required_permission(
             &extensions,
-            test_unrelated_repository_context
+            test_repository_context,
+            "migrate"
+        ));
+
+        // as user doesn't have "migrate" permission for an unrelated repo, they don't hold it there
+        assert!(!has_required_permission(
+            &extensions,
+            test_unrelated_repository_context,
+            "migrate"
         ));
     }
 
     #[test]
-    fn can_admin_lock_with_wildcard_permission_claim() {
+    fn has_required_permission_with_wildcard_permission_claim() {
         let mut extensions = Extensions::new();
         let test_repository_id = "urc-0194b726b34e72b0b45550b88a967076".to_string();
         let unrelated_repository_id = "urc-0192ae48ccf17060bc1ba9d04f6acb2f".to_string();
@@ -832,14 +838,20 @@ mod tests {
                 .unwrap()
                 .into();
 
-        // as user has "migrate" permission for a given repo, they CAN admin lock that repo
-        assert!(can_admin_lock(&extensions, test_repository_context));
+        // as user has "migrate" permission for a given repo, they hold it there
+        assert!(has_required_permission(
+            &extensions,
+            test_repository_context,
+            "migrate"
+        ));
 
         // user doesn't have direct "migrate" permission for an unrelated repo
-        // but they have a wildcard token with "migrate", so they should be able to admin lock arbitrary repo
-        assert!(can_admin_lock(
+        // but they have a wildcard token with "migrate", so they hold it for
+        // arbitrary repos too
+        assert!(has_required_permission(
             &extensions,
-            test_unrelated_repository_context
+            test_unrelated_repository_context,
+            "migrate"
         ));
     }
 
