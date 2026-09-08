@@ -9,7 +9,7 @@ use std::sync::RwLock;
 use lore_revision::lore::RepositoryId;
 use tracing::warn;
 
-use crate::auth::jwt::AuthorizationToken;
+use crate::protocol::storage::messages::ConnectionAuthorization;
 use crate::util::get_user_id_from_token;
 
 type AnyMap = HashMap<TypeId, Arc<dyn Any + Send + Sync>>;
@@ -96,11 +96,20 @@ impl AttributeMap {
     }
 }
 
+/// Resolves the connection's user id for attribution (audit logs,
+/// notifications, hooks). Reads `ConnectionAuthorization` — not a bare
+/// `AuthorizationToken` — because `Connect::handle_auth`
+/// (`protocol/storage/connect.rs`) inserts the verified token only as part
+/// of that single combined entry (see its docs for why); a direct
+/// `context.get::<AuthorizationToken>()` here would always return `None`
+/// and silently attribute every authenticated request to `"<unknown>"`.
 pub fn get_user_id_from_context(context: &Arc<AttributeMap>) -> String {
     let token = context
-        .get::<AuthorizationToken>()
-        .as_ref()
-        .map(|token| (**token).clone());
+        .get::<ConnectionAuthorization>()
+        .and_then(|auth| match auth.as_ref() {
+            ConnectionAuthorization::Verified { token, .. } => Some((**token).clone()),
+            ConnectionAuthorization::Open => None,
+        });
     get_user_id_from_token(token)
 }
 
@@ -115,6 +124,45 @@ mod tests {
     use lore_base::lore_spawn;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+
+    /// Regression coverage for the user-attribution bug fix #4 introduced:
+    /// `Connect::handle_auth` stopped inserting a bare `AuthorizationToken`
+    /// once it consolidated to a single `ConnectionAuthorization` entry, so
+    /// `get_user_id_from_context` must read the token out of
+    /// `ConnectionAuthorization::Verified` rather than looking for the type
+    /// that is no longer inserted — otherwise every authenticated request
+    /// silently attributes to `"<unknown>"`.
+    #[test]
+    fn get_user_id_from_context_returns_real_user_id_when_verified() {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(ConnectionAuthorization::Verified {
+            token: Box::new(AuthorizationToken {
+                user_id: "alice".to_string(),
+                ..Default::default()
+            }),
+            reachability_authorizer: ReachabilityAuthorizer::new(None, None)
+                .expect("no config never fails to construct"),
+        });
+
+        assert_eq!(get_user_id_from_context(&context), "alice");
+    }
+
+    #[test]
+    fn get_user_id_from_context_returns_unknown_when_open() {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(ConnectionAuthorization::Open);
+
+        assert_eq!(get_user_id_from_context(&context), "<unknown>");
+    }
+
+    #[test]
+    fn get_user_id_from_context_returns_unknown_when_absent() {
+        let context = Arc::new(AttributeMap::default());
+
+        assert_eq!(get_user_id_from_context(&context), "<unknown>");
+    }
 
     #[derive(Clone, Debug, Eq, PartialEq)]
     struct TestData {
