@@ -177,8 +177,9 @@ async fn repository_create(
     if let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
-        None, /* auth url */
-        None, /* authorization */
+        Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+        None, /* token */
+        None, /* raw_token */
     )
     .await
     .filter_slow_down()?
@@ -193,8 +194,9 @@ async fn repository_create(
             if repository_query_name(
                 repository.clone(),
                 name,
-                None, /* auth url */
-                None, /* authorization */
+                Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+                None, /* token */
+                None, /* raw_token */
             )
             .await
             .filter_slow_down()?
@@ -225,8 +227,9 @@ async fn repository_create(
         repository_query_name(
             repository.clone(),
             name,
-            None, /* auth url */
-            None, /* authorization */
+            Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
+            None, /* token */
+            None, /* raw_token */
         )
         .await,
         |err| err.is_address_not_found() || err.is_repository_not_found(),

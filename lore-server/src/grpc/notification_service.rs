@@ -19,16 +19,27 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
+use crate::grpc::no_repository_access_status;
 
 #[derive(Clone)]
 pub struct NotificationService {
     sender: Arc<crate::notification::local::NotificationSender>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl NotificationService {
-    pub fn new(sender: Arc<crate::notification::local::NotificationSender>) -> Self {
-        Self { sender }
+    pub fn new(
+        sender: Arc<crate::notification::local::NotificationSender>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    ) -> Self {
+        Self {
+            sender,
+            repository_authorizer,
+        }
     }
 }
 
@@ -45,11 +56,27 @@ impl lore_notification::NotificationService for NotificationService {
         request: Request<lore_proto::lore::notification::SubscribeRequest>,
     ) -> Result<Response<Self::SubscribeStream>, Status> {
         let user_id = get_user_id(request.extensions());
+
+        // The interceptor authorizes `get_repository(request.metadata())`, a
+        // different field, so it cannot answer for this RPC: the partition
+        // subscribed to comes from the request *body*
+        // (LEP 2026-08-20-oidc-oauth2-authentication, D9). The check
+        // belongs here instead.
+        let token = get_authorization(request.extensions()).ok();
+        let raw_token = crate::auth::jwt_interceptor::extract_bearer_token(request.metadata());
         let repository: RepositoryId = Context::from(request.into_inner().repository).into();
 
         if repository.is_zero() {
             return Err(Status::failed_precondition("invalid stream"));
         }
+
+        let verified_token = token
+            .as_ref()
+            .map(|claims| VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims));
+        self.repository_authorizer
+            .check_repository_access(verified_token.as_ref(), repository, None)
+            .await
+            .map_err(|_err| no_repository_access_status())?;
 
         let rx = self.sender.register(repository);
 

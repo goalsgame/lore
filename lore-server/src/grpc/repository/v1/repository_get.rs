@@ -24,12 +24,15 @@ use tracing::info;
 use tracing::warn;
 
 use super::record::build_repository;
+use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::grpc::handlers::repository_query::check_repository_query_authorization;
 use crate::util::setup_execution;
@@ -46,11 +49,12 @@ use crate::util::setup_execution;
 #[tracing::instrument(name = "RepositoryGet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryGetRequest>,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
+    let token = get_authorization(request.extensions()).ok();
     let caller_context = CallerContext {
         repository_id: RepositoryId::default(), // the queried repository is named by the request
         user_id: get_user_id(request.extensions()),
@@ -67,7 +71,8 @@ pub async fn handler(
         repository_get_implementation(
             req,
             caller_context,
-            auth_url,
+            authorizer,
+            token,
             immutable_store,
             mutable_store,
         )
@@ -99,7 +104,8 @@ async fn forward_repository_get(
 pub async fn repository_get_implementation(
     req: RepositoryGetRequest,
     caller_context: CallerContext,
-    auth_url: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    token: Option<AuthorizationToken>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
@@ -109,7 +115,7 @@ pub async fn repository_get_implementation(
         ));
     };
 
-    let authorization = caller_context.authorization;
+    let raw_token = caller_context.authorization;
     let execution = setup_execution(
         module_path!(),
         caller_context.correlation_id,
@@ -128,13 +134,16 @@ pub async fn repository_get_implementation(
                 Query::Id(id) => {
                     let id: RepositoryId = Context::from(id).into();
                     debug!(%id, "Get repository by id");
-                    let (metadata, metadata_hash) =
-                        repository_load_id(repository.clone(), id, auth_url, authorization)
-                            .await
-                            .filter_slow_down()?
-                            .map_err(|_err| {
-                                Status::not_found(format!("Repository {id} not found"))
-                            })?;
+                    let (metadata, metadata_hash) = repository_load_id(
+                        repository.clone(),
+                        id,
+                        authorizer,
+                        token.as_ref(),
+                        raw_token.as_deref(),
+                    )
+                    .await
+                    .filter_slow_down()?
+                    .map_err(|_err| Status::not_found(format!("Repository {id} not found")))?;
                     (id, metadata, metadata_hash)
                 }
                 Query::Name(name) => {
@@ -142,8 +151,9 @@ pub async fn repository_get_implementation(
                     let (id, metadata, metadata_hash) = repository_load_name(
                         repository.clone(),
                         name.as_str(),
-                        auth_url,
-                        authorization,
+                        authorizer,
+                        token.as_ref(),
+                        raw_token.as_deref(),
                     )
                     .await
                     .filter_slow_down()?
@@ -166,19 +176,18 @@ pub async fn repository_get_implementation(
 pub(super) async fn repository_load_id(
     repository: Arc<RepositoryContext>,
     id: RepositoryId,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    token: Option<&AuthorizationToken>,
+    raw_token: Option<&str>,
 ) -> Result<(RepositoryMetadata, Hash), RepositoryError> {
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: id.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(&authorizer, token, raw_token, id)
+        .await
+        .map_err(|status| {
+            debug!(%id, "User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: id.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())
@@ -226,28 +235,27 @@ pub(super) async fn repository_load_id(
 pub(super) async fn repository_load_name(
     repository: Arc<RepositoryContext>,
     name: &str,
-    auth_url: Option<String>,
-    authorization: Option<String>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    token: Option<&AuthorizationToken>,
+    raw_token: Option<&str>,
 ) -> Result<(RepositoryId, RepositoryMetadata, Hash), RepositoryError> {
     if let Ok(id) = RepositoryId::from_str(name) {
         let (metadata, metadata_hash) =
-            repository_load_id(repository, id, auth_url, authorization).await?;
+            repository_load_id(repository, id, authorizer, token, raw_token).await?;
         return Ok((id, metadata, metadata_hash));
     }
 
     let name_repository = Arc::new(repository.to_server_context(RepositoryId::default()));
     let id = repository::id_from_name(name_repository, name).await?;
 
-    if let Some(auth_url) = auth_url {
-        check_repository_query_authorization(auth_url, authorization, id)
-            .await
-            .map_err(|status| {
-                debug!(%id, "User authorization failed: {status}");
-                RepositoryError::from(RepositoryNotFound {
-                    repository: name.to_string(),
-                })
-            })?;
-    }
+    check_repository_query_authorization(&authorizer, token, raw_token, id)
+        .await
+        .map_err(|status| {
+            debug!(%id, "User authorization failed: {status}");
+            RepositoryError::from(RepositoryNotFound {
+                repository: name.to_string(),
+            })
+        })?;
 
     let repository = Arc::new(repository.to_server_context(id));
     let metadata_hash = repository::metadata_hash(repository.clone())
@@ -425,7 +433,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let response = handler(
                     make_request("test-repo"),
-                    None, /* no auth */
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -455,7 +463,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let err = handler(
                     make_request("test-repo"),
-                    None,
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -482,7 +490,7 @@ mod tests {
             Box::pin(LORE_CONTEXT.scope(execution, async move {
                 let err = handler(
                     make_request("test-repo"),
-                    None,
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -519,7 +527,7 @@ mod tests {
 
                 let response = handler(
                     make_request("my-repo"),
-                    None, /* no auth */
+                    Arc::new(crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),

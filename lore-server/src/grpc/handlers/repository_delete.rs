@@ -27,6 +27,9 @@ use super::repository_query::repository_query_id;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -35,10 +38,20 @@ use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
 
+/// The actions that replace the `is_service_account` creator-check bypass
+/// (LEP 2026-08-20-oidc-oauth2-authentication, D4): a repository may be
+/// deleted by someone who did not create it when they explicitly hold
+/// either action, globally under Tier 1 or on the deleted partition under
+/// Tier 2, rather than when their token happens to carry a legacy
+/// service-account claim. Matches `is_owner_or_admin`'s existing reading of
+/// "owner or admin" as the ownership question.
+pub(crate) const DELETE_ACTIONS: [&str; 2] = ["owner", "admin"];
+
 #[tracing::instrument(name = "RepositoryDelete::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryDeleteRequest>,
     auth_url: Option<String>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     instrument_provider: &impl InstrumentProvider,
@@ -48,16 +61,6 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
-
-    // TODO(mjansson): Once we have authz permission model with read/write/admin
-    // this should be upgraded to check for the correct permission rather than
-    // hardwired to service accounts. For now used to protect while allowing mirroring
-    let mut bypass_protection = false;
-    if let Ok(user_info) = user_info
-        && user_info.is_service_account.unwrap_or_default()
-    {
-        bypass_protection = true;
-    }
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
@@ -70,9 +73,15 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            repository_delete(repository, bypass_protection, auth_url, authorization)
-                .await
-                .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
+            repository_delete(
+                repository,
+                auth_url,
+                repository_authorizer,
+                user_info.ok(),
+                authorization,
+            )
+            .await
+            .inspect_err(|err| warn!("Repository delete failed: {err}"))?;
 
             let num_repositories_deleted = instrument_provider.counter("num_repositories_deleted");
             num_repositories_deleted.add(1, &[]);
@@ -84,15 +93,20 @@ pub async fn handler(
 
 async fn repository_delete(
     repository: Arc<RepositoryContext>,
-    force: bool,
     auth_url: Option<String>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    user_info: Option<crate::auth::jwt::AuthorizationToken>,
     authorization: Option<String>,
 ) -> Result<(), Status> {
+    // The internal lookup below is not the access decision — the checks a
+    // few lines down are — so it must not itself be denied by whichever
+    // authorizer the deployment configures for external callers.
     let Ok(data) = repository_query_id(
         repository.clone(),
         repository.id,
-        None, /* auth url */
-        None, /* authorization */
+        Arc::new(AllowAllRepositoryAuthorizer),
+        None, /* token */
+        None, /* raw_token */
     )
     .await
     .filter_slow_down()?
@@ -111,10 +125,35 @@ async fn repository_delete(
         // Use external auth service to authorize deletion
         repository_delete_auth_resource(auth_url, authorization, repository.id).await?;
     } else {
-        // If not using external auth service, check that the current user is the creator
-        if metadata.creator != user_id && !force {
+        // Replaces the `is_service_account` bypass of the creator check
+        // (LEP 2026-08-20-oidc-oauth2-authentication, D4): deletion is
+        // allowed for the creator, as before, or for a caller who
+        // explicitly holds `owner` or `admin` through the configured
+        // authorizer.
+        let is_creator = metadata.creator == user_id;
+        let holds_delete_action = match user_info.as_ref() {
+            Some(claims) => {
+                let raw = authorization.as_deref().unwrap_or_default();
+                let verified_token = VerifiedToken::new(raw, claims);
+                let mut holds_any = false;
+                for action in DELETE_ACTIONS {
+                    if repository_authorizer
+                        .check_repository_access(Some(&verified_token), repository.id, Some(action))
+                        .await
+                        .is_ok()
+                    {
+                        holds_any = true;
+                        break;
+                    }
+                }
+                holds_any
+            }
+            None => false,
+        };
+
+        if !is_creator && !holds_delete_action {
             info!(
-                "Repository delete refused, user {user_id} is not creator {}",
+                "Repository delete refused, user {user_id} is not creator {} and holds neither owner nor admin",
                 metadata.creator
             );
             return Err(Status::permission_denied("Not repository owner"));

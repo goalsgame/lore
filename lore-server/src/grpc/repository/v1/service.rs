@@ -30,7 +30,7 @@ use super::repository_get;
 use super::repository_list;
 use super::repository_metadata_get;
 use super::repository_metadata_set;
-use crate::authnz::repository_authorizer::repository_authorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
@@ -61,6 +61,7 @@ pub struct LoreRepositoryV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
     rpc_timeout: Duration,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: RepositoryServiceInstrumentProvider,
 }
 
@@ -73,6 +74,7 @@ impl LoreRepositoryV1Service {
         hook_dispatcher: Arc<HookDispatcher>,
         forwarded_requests: Option<Arc<dyn ForwardedRequests>>,
         rpc_timeout: Duration,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Self {
         Self {
             environment,
@@ -81,11 +83,15 @@ impl LoreRepositoryV1Service {
             hook_dispatcher,
             forwarded_requests,
             rpc_timeout,
+            repository_authorizer,
             instrument_provider: RepositoryServiceInstrumentProvider,
         }
     }
 
-    /// Auth-service URL extracted from the environment, if configured.
+    /// Auth-service URL extracted from the environment, if configured. Used
+    /// only by the legacy paths (`repository_create`, `repository_delete`'s
+    /// rebac-resource cleanup, `repository_list`) that predate
+    /// `RepositoryAuthorizer` and still speak to the auth service directly.
     fn auth_url(&self) -> Option<String> {
         self.environment
             .endpoint
@@ -124,6 +130,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             repository_delete::handler(
                 request,
                 self.auth_url(),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.instrument_provider,
@@ -140,7 +147,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_get::handler(
                 request,
-                self.auth_url(),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.forwarded_requests,
@@ -172,7 +179,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_get::handler(
                 request,
-                repository_authorizer(self.auth_url()),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
@@ -188,7 +195,7 @@ impl RepositoryService for LoreRepositoryV1Service {
             self.rpc_timeout,
             repository_metadata_set::handler(
                 request,
-                repository_authorizer(self.auth_url()),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),

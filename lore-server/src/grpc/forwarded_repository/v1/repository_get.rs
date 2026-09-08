@@ -8,12 +8,23 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::repository_authorizer;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::repository::v1::repository_get::repository_get_implementation;
 
 /// Handler that takes a `RepositoryGet` request forwarded on from peer's `RepositoryService`
 /// and executes it, returning the result to the other server for forwarding on to its
 /// client
+///
+/// This peer-to-peer path predates `RepositoryAuthorizer` and carries only the
+/// original caller's raw bearer token (`CallerContext::authorization`), not
+/// decoded claims — the originating server verified the token, and nothing
+/// here re-verifies it. `AllowAllRepositoryAuthorizer` and
+/// `GlobalGrantsAuthorizer` never read a token's raw form, so a default,
+/// unclaimed `AuthorizationToken` paired with the forwarded raw string is
+/// enough to keep `AuthClientAuthorizer` (the only implementation that reads
+/// it) working exactly as it did when this simply forwarded the header.
 #[tracing::instrument(name = "ForwardedRepository::v1::RepositoryGet::Handler", skip_all)]
 pub async fn handler(
     request: Request<RepositoryGetRequest>,
@@ -22,11 +33,18 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
 ) -> Result<Response<RepositoryGetResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
+    let authorizer =
+        repository_authorizer(auth_url, None).map_err(|err| Status::internal(err.to_string()))?;
+    let token = caller_context
+        .authorization
+        .as_ref()
+        .map(|_| AuthorizationToken::default());
 
     repository_get_implementation(
         request.into_inner(),
         caller_context,
-        auth_url,
+        authorizer,
+        token,
         immutable_store,
         mutable_store,
     )
