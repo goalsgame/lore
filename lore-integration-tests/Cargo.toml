@@ -31,6 +31,10 @@ axum = { workspace = true }
 aws-sdk-dynamodb = { version = "1.92.0", default-features = false, features = ["rt-tokio"] }
 aws-sdk-s3 = { version = "1.104.0", default-features = false, features = ["rt-tokio"] }
 bytes = { workspace = true }
+# Pinned the same way as lore-gcp's own dependency (see its Cargo.toml comment): avoids pulling
+# in the aws-lc-rs/aws-lc-sys crypto backend this workspace's deny.toml denies.
+firestore = { version = "=0.47.1", default-features = false, features = ["tls-webpki-roots"] }
+google-cloud-storage = { version = "1.18.0", default-features = false }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -49,6 +53,7 @@ lore = { workspace = true }
 lore-base = { workspace = true }
 lore-storage = { workspace = true }
 lore-aws = { workspace = true }
+lore-gcp = { workspace = true }
 lore-revision = { workspace = true }
 lore-hashicorp = { workspace = true }
 lore-proto = { workspace = true }

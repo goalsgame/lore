@@ -549,3 +549,60 @@ pub(crate) mod aws_common {
         Ok(client)
     }
 }
+
+#[cfg(all(test, feature = "integration_tests"))]
+pub(crate) mod gcp_common {
+    //! Unlike `aws_common`, this has no docker-compose service to talk to: there is no
+    //! standardized, easy-to-run-locally emulator that covers both GCS and Firestore the way
+    //! LocalStack covers S3 and `DynamoDB`. So rather than a fixed endpoint this module reads the
+    //! GCP project/bucket to test against from the environment, and callers skip gracefully
+    //! (report and return `Ok(())`) when they are unset — which is the expected, normal outcome
+    //! in this sandbox and in ordinary CI. Set them to run these tests for real, against a
+    //! scratch GCP project with Application Default Credentials available (e.g. `gcloud auth
+    //! application-default login`, or a service account key via
+    //! `GOOGLE_APPLICATION_CREDENTIALS`):
+    //!
+    //! - `LORE_GCP_TEST_PROJECT` - the GCP project id (used for both GCS quota and Firestore).
+    //! - `LORE_GCP_TEST_BUCKET` - an existing GCS bucket the test may read and write freely.
+    //! - `LORE_GCP_TEST_FIRESTORE_DATABASE` - optional; Firestore database id, default `"(default)"`.
+
+    use std::error::Error;
+
+    use firestore::FirestoreDb;
+    use google_cloud_storage::client::Storage;
+    use google_cloud_storage::client::StorageControl;
+    use lore_gcp::clients;
+
+    /// The GCP project/bucket to run these tests against, read from the environment.
+    pub(crate) struct GcpTestEnv {
+        pub(crate) project: String,
+        pub(crate) bucket: String,
+        pub(crate) database: Option<String>,
+    }
+
+    /// `None` when the environment is not configured for a live GCP run — the signal every test
+    /// in this module uses to skip rather than fail.
+    pub(crate) fn env() -> Option<GcpTestEnv> {
+        Some(GcpTestEnv {
+            project: std::env::var("LORE_GCP_TEST_PROJECT").ok()?,
+            bucket: std::env::var("LORE_GCP_TEST_BUCKET").ok()?,
+            database: std::env::var("LORE_GCP_TEST_FIRESTORE_DATABASE").ok(),
+        })
+    }
+
+    /// A per-test-run suffix so concurrent (and successive) runs against the same real project
+    /// use disjoint Firestore collections rather than accumulating or colliding on shared state
+    /// — there is no ephemeral per-run database the way LocalStack gives `aws_common` a
+    /// throwaway account.
+    pub(crate) fn unique_suffix() -> String {
+        uuid::Uuid::new_v4().simple().to_string()
+    }
+
+    pub(crate) async fn clients(
+        env: &GcpTestEnv,
+    ) -> Result<(Storage, StorageControl, FirestoreDb), Box<dyn Error + 'static>> {
+        let (storage, control) = clients::build_storage_clients(None).await?;
+        let db = clients::build_firestore_db(&env.project, env.database.as_deref()).await?;
+        Ok((storage, control, db))
+    }
+}
