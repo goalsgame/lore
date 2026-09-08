@@ -44,6 +44,7 @@ use super::lock_service::LoreLockService;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_interceptor::JWTAuthnInterceptor;
 use crate::auth::jwt_interceptor::JWTInterceptor;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::correlation::layer::CorrelationIdLayer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::correlation::layer::TraceLayerConfig;
@@ -602,8 +603,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
     pub fn with_jwt_verifier(
         self,
         jwt_verifier: Option<JwtVerifier>,
+        reachability_authorizer: ReachabilityAuthorizer,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
         let rpc_timeout = self.0.request_handler_timeout;
+        let repository_authorizer = reachability_authorizer.authorizer.clone();
         let services = &self.0.service_settings;
         let mut registered = Vec::new();
         let mut check_enabled = |settings: &dyn GrpcServiceSettings, name: &'static str| {
@@ -665,6 +668,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             revision_diff_config,
             history_step_size,
             acceleration,
+            reachability_authorizer.clone(),
         );
 
         let mut admin_svc = self.0.admin_svc;
@@ -675,6 +679,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.immutable_store.clone(),
             self.0.local_store.clone(),
             self.0.mutable_store.clone(),
+            reachability_authorizer.clone(),
         );
         let revision_svc = ServiceBuilder::new().service(LoreRevisionService::new(
             self.0.immutable_store.clone(),
@@ -684,6 +689,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             history_step_size,
             acceleration,
             rpc_timeout,
+            reachability_authorizer.clone(),
         ));
         let revision_v1_svc = LoreRevisionV1Service::new(
             self.0.immutable_store.clone(),
@@ -694,6 +700,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            repository_authorizer.clone(),
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
@@ -701,6 +708,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.mutable_store.clone(),
             self.0.hook_dispatcher.clone(),
             rpc_timeout,
+            repository_authorizer.clone(),
         );
         let repository_v1_svc = LoreRepositoryV1Service::new(
             self.0.environment.clone(),
@@ -709,6 +717,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             self.0.hook_dispatcher.clone(),
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            repository_authorizer.clone(),
         );
 
         let environment_svc = LoreEnvironmentService::new(self.0.environment.clone());
@@ -724,7 +733,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         }
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
-            let jwt_interceptor = JWTInterceptor::new(jwt_verifier);
+            let jwt_interceptor =
+                JWTInterceptor::new(jwt_verifier, reachability_authorizer.clone());
             // TODO(UCS-13506): Placeholder authn verifier until separate authz flow for repository service is in place
             let jwt_authn_interceptor = JWTAuthnInterceptor::new(jwt_verifier);
 
