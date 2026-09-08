@@ -15,7 +15,6 @@ use lore_telemetry::tracing::fields::USER_ID;
 use serde::Deserialize;
 use tracing::Span;
 
-use super::jwt;
 use crate::auth::jwt::AuthorizationToken;
 use crate::http::server::ServerState;
 
@@ -37,7 +36,19 @@ pub async fn jwt_axum_verify_authorization(
                     Context::from_str(params.repository_id.as_str())
                         .unwrap_or_default()
                         .into();
-                if jwt::verify_authorization(&user_info, repository).is_ok() {
+                // Plain reachability check (LEP 2026-08-20-oidc-oauth2-authentication,
+                // D9): this route knows only the partition, not which action is being
+                // performed on it, so it asks the same `action: None` question the
+                // gRPC interceptor asks. Routed through `ReachabilityAuthorizer` (not
+                // the raw authorizer) so a legacy `UrcAuthApi` deployment keeps using
+                // its local, no-network claims check on every request instead of an
+                // online call per HTTP request.
+                if state
+                    .reachability_authorizer
+                    .check_reachability(&user_info, repository)
+                    .await
+                    .is_ok()
+                {
                     Span::current().record(USER_ID, &user_info.user_id);
                     // Set `user_info` as a request extension so it can be used down the stack
                     request.extensions_mut().insert(Some(user_info));

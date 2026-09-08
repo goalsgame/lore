@@ -68,7 +68,7 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::ResourcePermission;
-use crate::auth::jwt::verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
 use crate::protocol::attribute_map::AttributeMap;
@@ -210,13 +210,28 @@ pub fn get_authorization(extensions: &Extensions) -> Result<AuthorizationToken, 
     }
 }
 
+/// Gates cross-partition link reads during revision-graph traversal, which
+/// may call the returned closure many times per request (LEP
+/// 2026-08-20-oidc-oauth2-authentication, D9), so it must answer without
+/// awaiting anything. `ReachabilityAuthorizer::check_reachability_sync`
+/// does exactly that for every configured authorizer, legacy
+/// `AuthClientAuthorizer` included (see its docs for why that one reads the
+/// token's own embedded claim here rather than making an online call).
+///
+/// `None` mirrors the previous behavior: it means no token was ever
+/// inserted into the request, i.e. no verifier is configured at all, so
+/// every partition is reachable — the same shape
+/// `AllowAllRepositoryAuthorizer` answers elsewhere.
 pub fn link_read_authorizer(
+    reachability_authorizer: ReachabilityAuthorizer,
     authorization: Option<AuthorizationToken>,
 ) -> lore_revision::state::CanReadRepository {
     match authorization {
-        Some(token) => {
-            Arc::new(move |repository_id| verify_authorization(&token, repository_id).is_ok())
-        }
+        Some(token) => Arc::new(move |repository_id| {
+            reachability_authorizer
+                .check_reachability_sync(&token, repository_id)
+                .is_ok()
+        }),
         None => lore_revision::state::allow_all_repositories(),
     }
 }

@@ -9,8 +9,8 @@ use tracing::Span;
 use tracing::debug;
 
 use super::jwt::JwtVerifier;
-use super::jwt::verify_authorization;
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::get_repository;
 
 fn add_auth_fields_to_current_span(auth: &AuthorizationToken) {
@@ -45,12 +45,37 @@ fn authorize(verifier: &JwtVerifier, token: &str) -> Result<AuthorizationToken, 
 #[derive(Clone)]
 pub struct JWTInterceptor {
     jwt_verifier: JwtVerifier,
+    /// Answers the plain "may this caller reach this repository at all"
+    /// question once per request. See
+    /// [`ReachabilityAuthorizer`] for why this call, specifically, is
+    /// answered differently for a legacy `UrcAuthApi` deployment than
+    /// [`RepositoryAuthorizer::check_repository_access`] is everywhere
+    /// else: this decision point is picking the interceptor as the
+    /// enforcement point for the plain reachability question, per LEP
+    /// 2026-08-20-oidc-oauth2-authentication (D9). The alternative the LEP
+    /// leaves open — pushing this into every RPC handler across Storage,
+    /// Revision, Lock, Notification and ThinClient — would be a far larger
+    /// change today: none of those services currently take an injected
+    /// authorizer at all, so every one of their handlers would need new
+    /// plumbing for a question the interceptor can already answer
+    /// synchronously for both Tier 1 and legacy deployments (see
+    /// `ReachabilityAuthorizer::check_reachability_sync`). Action-specific
+    /// checks (`obliterate`, `owner`, `push-protected`, ...) still live in
+    /// handlers regardless of this choice, since the interceptor has no way
+    /// to know which action a request performs.
+    ///
+    /// [`RepositoryAuthorizer::check_repository_access`]: crate::authnz::repository_authorizer::RepositoryAuthorizer::check_repository_access
+    reachability_authorizer: ReachabilityAuthorizer,
 }
 
 impl JWTInterceptor {
-    pub fn new(jwt_verifier: &JwtVerifier) -> Self {
+    pub fn new(
+        jwt_verifier: &JwtVerifier,
+        reachability_authorizer: ReachabilityAuthorizer,
+    ) -> Self {
         Self {
             jwt_verifier: jwt_verifier.clone(),
+            reachability_authorizer,
         }
     }
 }
@@ -68,7 +93,8 @@ impl Interceptor for JWTInterceptor {
         add_auth_fields_to_current_span(&authorization);
 
         let repository = get_repository(request.metadata()).unwrap_or_default();
-        verify_authorization(&authorization, repository)
+        self.reachability_authorizer
+            .check_reachability_sync(&authorization, repository)
             .map_err(|_err| crate::grpc::no_repository_access_status())?;
 
         request.extensions_mut().insert(authorization);

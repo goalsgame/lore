@@ -33,6 +33,7 @@ use super::security_headers::PolicyField;
 use super::tracing::lore_http_tracing;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt_axum_middleware::jwt_axum_verify_authorization;
+use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::correlation::layer::CorrelationIdLayerBuilder;
 use crate::http::repositories;
 use crate::util::core_hop::CoreHopLayer;
@@ -62,6 +63,13 @@ pub struct ServerState {
     pub immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     pub mutable_store: Arc<dyn lore_storage::MutableStore>,
     pub jwt_verifier: Option<JwtVerifier>,
+    /// Used directly for per-action questions (presign); wrapped access to
+    /// [`ReachabilityAuthorizer::check_reachability`] for the plain
+    /// per-request reachability question `jwt_axum_verify_authorization`
+    /// asks, which — like the gRPC interceptor — must not turn into an
+    /// online call per HTTP request for a legacy deployment (see
+    /// [`ReachabilityAuthorizer`]'s docs).
+    pub reachability_authorizer: ReachabilityAuthorizer,
     pub max_file_size: u64,
     pub presign_config: Option<PresignConfig>,
 }
@@ -273,6 +281,7 @@ impl LoreHttpServer {
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         jwt_verifier: Option<JwtVerifier>,
+        reachability_authorizer: ReachabilityAuthorizer,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{}:{}", settings.host, settings.port).as_str())
@@ -315,6 +324,7 @@ impl LoreHttpServer {
             immutable_store,
             mutable_store,
             jwt_verifier,
+            reachability_authorizer,
             max_file_size: settings.max_file_size,
             presign_config,
         };

@@ -26,6 +26,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -33,6 +34,13 @@ use crate::http::presign_token::sign;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
+
+/// The action that replaces the `is_service_account` gate on presigned URLs
+/// (LEP 2026-08-20-oidc-oauth2-authentication, D4). One behavior is
+/// preserved exactly: with no verifier configured, `token` is `None` below
+/// and `AllowAllRepositoryAuthorizer::check_repository_access` ignores the
+/// action and permits it — the presign gate stays open, as it is today.
+const PRESIGN_ACTION: &str = "presign";
 
 #[derive(Debug, Error)]
 pub enum PresignError {
@@ -42,8 +50,8 @@ pub enum PresignError {
     ParseAddress(FromHexError),
     #[error("Presign feature is not configured")]
     NotConfigured,
-    #[error("Only service accounts may vend presigned URLs")]
-    NotServiceAccount,
+    #[error("Caller does not hold the presign action")]
+    PermissionDenied,
     #[error("content_type is not allowed: {0}")]
     DisallowedContentType(String),
     #[error("header value is not valid: {0}")]
@@ -67,9 +75,9 @@ impl IntoResponse for PresignError {
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
             ),
-            PresignError::NotServiceAccount => (
+            PresignError::PermissionDenied => (
                 StatusCode::FORBIDDEN,
-                "only service accounts may vend presigned URLs".to_string(),
+                "caller does not hold the presign action".to_string(),
             ),
             PresignError::StoreError | PresignError::SystemTime(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -100,16 +108,38 @@ pub struct PresignResponse {
     pub expires_at: u64,
 }
 
-/// Whether the caller is a service account.
-///
-/// Reads the `is_service_account` claim from the token. A `None` token means no
-/// JWT verifier is configured and auth is disabled server-wide, which counts as
-/// a service account.
-fn call_is_service_account(user_info: &Option<AuthorizationToken>) -> bool {
-    match user_info {
-        Some(token) => token.is_service_account.unwrap_or(false),
-        None => true,
-    }
+/// The bearer token exactly as presented, without the `Bearer ` prefix.
+/// Needed only so a legacy `AuthClientAuthorizer` can forward it to the auth
+/// service; `jwt_axum_middleware` decodes it but does not retain the raw
+/// form, so it is re-extracted here from the same header.
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+}
+
+/// Checks that the caller holds the `presign` action on `repository`
+/// (LEP 2026-08-20-oidc-oauth2-authentication, D4). Replaces the
+/// `is_service_account` gate: with no verifier configured, `user_info` is
+/// `None` and `AllowAllRepositoryAuthorizer` ignores the action and permits
+/// it, which is what keeps the presign gate open exactly as it is today for
+/// a deployment with no OIDC integration.
+async fn check_presign_permission(
+    state: &ServerState,
+    user_info: &Option<AuthorizationToken>,
+    headers: &HeaderMap,
+    repository: RepositoryId,
+) -> Result<(), PresignError> {
+    let verified_token = user_info.as_ref().map(|claims| {
+        VerifiedToken::new(extract_bearer_token(headers).unwrap_or_default(), claims)
+    });
+    state
+        .reachability_authorizer
+        .authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(PRESIGN_ACTION))
+        .await
+        .map_err(|_err| PresignError::PermissionDenied)
 }
 
 pub async fn handler(
@@ -125,16 +155,14 @@ pub async fn handler(
         .ok_or(PresignError::NotConfigured)?
         .clone();
 
-    if !call_is_service_account(&user_info) {
-        return Err(PresignError::NotServiceAccount);
-    }
-
     let repository = repository_id
         .parse::<RepositoryId>()
         .map_err(PresignError::ParseRepository)?;
     let parsed_address = address
         .parse::<Address>()
         .map_err(PresignError::ParseAddress)?;
+
+    check_presign_permission(&state, &user_info, &headers, repository).await?;
 
     // Fast-feedback rejection; redeem also enforces the allowlist for
     // already issued tokens.
@@ -231,14 +259,21 @@ pub async fn handler(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use axum::http::HeaderMap;
     use axum::http::StatusCode;
     use axum_test::TestServer;
     use lore_base::runtime::LORE_CONTEXT;
     use rand::random;
     use serde_json::json;
 
-    use super::call_is_service_account;
+    use super::PresignError;
+    use super::check_presign_permission;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::http::security_headers::ContentTypePolicy;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::ServerHealth;
@@ -248,37 +283,77 @@ mod tests {
     use crate::http::test_utils::presign_config_with_policy;
     use crate::store::test_store_create;
 
-    fn token_with_service_account(is_service_account: Option<bool>) -> AuthorizationToken {
-        AuthorizationToken {
-            is_service_account,
-            ..Default::default()
+    fn state_with_authorizer(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
+        policy: ContentTypePolicy,
+    ) -> ServerState {
+        ServerState {
+            immutable_store,
+            mutable_store,
+            jwt_verifier: None,
+            reachability_authorizer: ReachabilityAuthorizer {
+                authorizer: repository_authorizer,
+                legacy_resource_claim: false,
+            },
+            max_file_size: 100,
+            presign_config: Some(presign_config_with_policy(policy)),
         }
     }
 
-    #[test]
-    fn service_account_may_vend() {
-        assert!(call_is_service_account(&Some(token_with_service_account(
-            Some(true)
-        ))));
+    #[tokio::test]
+    async fn no_auth_configured_may_vend() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+            ContentTypePolicy::default(),
+        );
+        check_presign_permission(&state, &None, &HeaderMap::new(), random())
+            .await
+            .expect("AllowAllRepositoryAuthorizer keeps the gate open with no verifier");
     }
 
-    #[test]
-    fn non_service_account_may_not_vend() {
-        assert!(!call_is_service_account(&Some(token_with_service_account(
-            Some(false)
-        ))));
+    #[tokio::test]
+    async fn caller_holding_presign_action_may_vend() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string()))),
+            ContentTypePolicy::default(),
+        );
+        let serde_json::Value::Object(extra) = json!({ "roles": ["presign"] }) else {
+            unreachable!()
+        };
+        let token = Some(AuthorizationToken {
+            extra,
+            ..Default::default()
+        });
+        check_presign_permission(&state, &token, &HeaderMap::new(), random())
+            .await
+            .expect("a caller holding the presign action may vend");
     }
 
-    #[test]
-    fn missing_service_account_claim_may_not_vend() {
-        assert!(!call_is_service_account(&Some(token_with_service_account(
-            None
-        ))));
-    }
-
-    #[test]
-    fn no_auth_configured_may_vend() {
-        assert!(call_is_service_account(&None));
+    #[tokio::test]
+    async fn caller_without_presign_action_may_not_vend() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string()))),
+            ContentTypePolicy::default(),
+        );
+        let token = Some(AuthorizationToken::default());
+        let err = check_presign_permission(&state, &token, &HeaderMap::new(), random())
+            .await
+            .expect_err("a caller not holding the presign action may not vend");
+        assert!(matches!(err, PresignError::PermissionDenied));
     }
 
     async fn mint(body: serde_json::Value) -> axum_test::TestResponse {
@@ -301,13 +376,12 @@ mod tests {
                 let address = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff-ffffffffffffffffffffffffffffffff";
 
                 let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-                let state = ServerState {
+                let state = state_with_authorizer(
                     immutable_store,
                     mutable_store,
-                    jwt_verifier: None,
-                    max_file_size: 100,
-                    presign_config: Some(presign_config_with_policy(policy)),
-                };
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    policy,
+                );
                 let settings = LoreHttpServerSettings::test_default();
                 let server =
                     TestServer::new(create_router(state, test_health, &settings)).unwrap();
