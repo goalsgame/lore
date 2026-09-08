@@ -19,7 +19,3 @@
 pub mod clients;
 pub mod gcp_error;
 pub mod store;
-
-fn default_gcp_timeout_millis() -> u64 {
-    5_000
-}

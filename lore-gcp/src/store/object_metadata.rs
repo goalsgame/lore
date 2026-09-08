@@ -13,8 +13,18 @@
 //!
 //! The wire format is unchanged from the S3 encoding on purpose: `<flags>:<size_payload>:<size_content>`,
 //! flags in hex and sizes in decimal, under a single key. Keeping the same format (rather than,
-//! say, one custom-metadata entry per field) means this module is a copy of the S3 one with only
-//! the doc comments and the key name adjusted for GCS's naming convention.
+//! say, one custom-metadata entry per field) means this module is a near-verbatim copy of the S3
+//! one, with only the doc comments, the key name's justification, and `from_object_metadata`'s
+//! signature adjusted (GCS's `Object::metadata` is a plain `HashMap`, never absent the way S3's
+//! optional metadata map is, so this version takes `&HashMap` rather than `Option<&HashMap>`).
+//!
+//! This duplication (encode/decode logic, error type, and the whole test module) is intentional
+//! for now rather than an oversight: `lore-aws` and `lore-gcp` are independent crates with no
+//! shared dependency between them today, so sharing this code would mean introducing a new small
+//! crate (or moving it into `lore-base`/`lore-storage`) purely to host it, which is a bigger change
+//! than this module's own size justifies. If a third storage backend ever needs the same encoding,
+//! or if `lore-aws`'s `Option`-based signature turns out not to matter, extracting a shared
+//! `object_metadata` module at that point would remove this copy.
 //!
 //! Only the representation is carried here. Obliteration state is mutable and lives in
 //! Firestore; see [`crate::store::immutable_store`].

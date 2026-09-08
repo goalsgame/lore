@@ -209,15 +209,20 @@ impl ImmutableStorePluginFactory for GcpImmutableStorePluginFactory {
         #[allow(clippy::disallowed_methods)]
         let (storage, control, db) = tokio::task::block_in_place(|| {
             runtime().block_on(async {
-                let (storage, control) =
-                    clients::build_storage_clients(plugin_config.gcs_endpoint_url.as_deref())
-                        .await
-                        .map_err(|e| {
-                            PluginError::from(PluginInitError {
-                                plugin_name: plugin_name.to_string(),
-                                message: format!("Failed to create GCS clients: {e}"),
-                            })
-                        })?;
+                // Production has one GCS endpoint at most (or none, meaning the real service):
+                // the data-plane/control-plane split only matters for a test double whose two
+                // surfaces listen on different ports, so both clients take the same override here.
+                let (storage, control) = clients::build_storage_clients(
+                    plugin_config.gcs_endpoint_url.as_deref(),
+                    plugin_config.gcs_endpoint_url.as_deref(),
+                )
+                .await
+                .map_err(|e| {
+                    PluginError::from(PluginInitError {
+                        plugin_name: plugin_name.to_string(),
+                        message: format!("Failed to create GCS clients: {e}"),
+                    })
+                })?;
 
                 clients::ensure_bucket_exists(&control, &plugin_config.gcs_bucket)
                     .await

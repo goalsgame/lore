@@ -34,11 +34,70 @@
 //! `has_associations` (any association at all, used by obliteration's "is this hash still
 //! referenced" check) is a single equality filter and needs no declared index.
 //!
+//! # Every remote call is bounded and classified
+//!
+//! Every GCS and Firestore call in this module goes through [`crate::clients::bounded`], which
+//! enforces the configured timeout (mapping an elapsed deadline to [`StoreError::SlowDown`] so a
+//! stalled connection fails fast rather than hanging the calling task) and logs a warning once an
+//! operation exceeds the configured slow-operation threshold — the same two knobs
+//! `[plugins.gcp]`'s `timeout_millis`/`*_slow_operation_threshold_millis` control for `lore_aws`,
+//! at the same granularity (per underlying SDK call, not per `ImmutableStore` trait method).
+//! [`is_gcs_retryable`]/[`is_firestore_retryable`] then classify the failure itself: a throttle,
+//! `UNAVAILABLE`, or `DEADLINE_EXCEEDED` also becomes `StoreError::SlowDown` rather than a hard
+//! internal error, mirroring `lore_aws::store::immutable_store::is_dynamodb_overloaded` — so a
+//! client retries a transient failure instead of surfacing it as permanent.
+//!
+//! # A test-double bug, not a `lore-gcp` bug: the GCS testbench rejects this store's writes
+//!
+//! [`GcpImmutableStore::write_payload_and_state`]'s `write_object` call carries custom metadata
+//! (the fragment) in the same call as the body, which forces `google-cloud-storage` onto GCS's
+//! `uploadType=multipart` wire format rather than a simple media upload. `google-cloud-storage`
+//! 1.18.0 never attaches a `Content-Type` header to that request's raw "media" part (only to the
+//! JSON "metadata" part's `contentType` field, which is a different thing). The [Google Cloud
+//! Storage testbench][testbench] this crate's own integration tests run against — not real
+//! GCS — mishandles that: its `parse_multipart`/`init_multipart` (`testbench/common.py`,
+//! `gcs/object.py`) assign the *absence* of that header straight into a field it then feeds to a
+//! protobuf `ParseDict` call, which raises on the resulting `None` and turns into an unhandled
+//! HTTP 500, rather than defaulting the content type the way a real bucket does. Confirmed by
+//! reproducing both directions by hand against the same testbench container: an otherwise
+//! identical multipart request that *does* carry a `Content-Type` header on the media part
+//! succeeds (`200`); the exact bytes this client sends, captured off the wire, do not carry one
+//! and get the `500`. This is a bug in the testbench (and arguably in `google-cloud-storage`,
+//! for never sending that header), not in this store's write path or its atomicity — nothing
+//! about it is specific to GCP-as-opposed-to-AWS, and there is no source-level workaround from
+//! here short of vendoring one of those two dependencies. It means `lore-integration-tests`'
+//! `gcp_store_test.rs` cannot exercise the immutable-store side of the conformance battery
+//! end-to-end in CI today; see `.github/workflows/pr-validate.yml`'s `gcp-integration` job comment
+//! for how that is reflected there. The mutable-store side (Firestore only, no GCS writes) is not
+//! affected and does pass against the emulator.
+//!
+//! [testbench]: https://github.com/googleapis/storage-testbench
+//!
+//! # Known limitations shared with `lore_aws` (not unique to this port)
+//!
+//! - **Obliteration drain window read-inconsistency.** Between [`ImmutableStore::obliterate`]
+//!   taking the `Obliterating` mark and finishing its drain sleep, [`ImmutableStore::get`] (which
+//!   only consults [`GcpImmutableStore::exists`], not fragment state) can still serve a payload
+//!   whose association was already deleted moments earlier, while
+//!   [`ImmutableStore::query`]/[`ImmutableStore::get_metadata`] (which do consult state) already
+//!   report it obliterated. `lore_aws::store::immutable_store::AwsImmutableStore` has the
+//!   identical inconsistency for the identical reason (its `get` also skips the state read this
+//!   store's `do_query`/`do_query_batch` perform) — fixing it only here would just add drift
+//!   between the two backends, not close a GCP-specific gap.
+//! - **Copy-during-obliteration dangling-association race.** [`ImmutableStore::copy`]'s existence
+//!   check and its `associate_fragment` write are not atomic with a concurrent
+//!   [`ImmutableStore::obliterate`] of the same hash: a copy that reads "present" just before an
+//!   obliteration's own association delete can still write a new association after the
+//!   obliteration's re-check has already decided nothing references the hash, leaving that new
+//!   association pointing at a payload GCS has already deleted. `lore_aws` has the same window
+//!   for the same reason (its `copy`/`obliterate` are not one atomic operation there either).
+//!
 //! [`associations_present`]: GcpImmutableStore::associations_present
 //! [`has_partition_association`]: GcpImmutableStore::has_partition_association
 
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
@@ -78,8 +137,6 @@ use lore_telemetry::timer::TimedResult;
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
-use serde::Deserialize;
-use serde::Serialize;
 use smallvec::SmallVec;
 use tokio::task::JoinSet;
 use tracing::Instrument;
@@ -89,6 +146,7 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::clients::bounded;
 use crate::clients::bucket_resource_name;
 use crate::gcp_error::GcpError;
 use crate::store::object_metadata::from_object_metadata;
@@ -106,7 +164,48 @@ fn hex_context(context: Context) -> String {
     hex::encode(context.data())
 }
 
+/// Whether a GCS failure means "retry me" as opposed to "this is a real, permanent failure" —
+/// throttling, a transient `5xx`, or a transport-level hiccup. Mirrors
+/// `lore_aws::store::immutable_store::is_dynamodb_overloaded`'s role for the AWS store: getting
+/// this wrong is not cosmetic there, and is not here either — reporting an overload as a hard
+/// failure denies a client the retry it would otherwise get, and reporting a real failure as
+/// retryable can spin a caller against a request that will never succeed.
+fn is_gcs_retryable(error: &google_cloud_storage::Error) -> bool {
+    match error.http_status_code() {
+        Some(429) => true,
+        Some(code) if (500..600).contains(&code) => true,
+        _ => error.is_timeout() || error.is_transport() || error.is_connect() || error.is_io(),
+    }
+}
+
+/// Whether a Firestore failure means "retry me". `FirestoreDatabaseError::retry_possible` is the
+/// `firestore` crate's own classification of the gRPC status it wrapped (throttling,
+/// `UNAVAILABLE`, `DEADLINE_EXCEEDED`, ...), which is exactly the distinction
+/// [`is_gcs_retryable`] draws by hand for GCS; `NetworkError` covers the transport-level failures
+/// below the gRPC status layer (connection refused, DNS, ...), which are retryable by nature.
+fn is_firestore_retryable(error: &firestore::errors::FirestoreError) -> bool {
+    use firestore::errors::FirestoreError;
+    match error {
+        FirestoreError::DatabaseError(e) => e.retry_possible,
+        FirestoreError::NetworkError(_) => true,
+        _ => false,
+    }
+}
+
+fn to_store_error_gcs(error: google_cloud_storage::Error, context: &'static str) -> StoreError {
+    if is_gcs_retryable(&error) {
+        StoreError::from(SlowDown)
+    } else {
+        StoreError::internal_with_context(GcpError::gcs(error), context)
+    }
+}
+
 fn to_store_error(error: GcpError) -> StoreError {
+    if let GcpError::Firestore(inner) = &error
+        && is_firestore_retryable(inner)
+    {
+        return StoreError::from(SlowDown);
+    }
     StoreError::internal_with_context(error, "GCP immutable store operation failed")
 }
 
@@ -151,7 +250,7 @@ impl FragmentState {
 }
 
 /// A row in the `fragment_state` collection.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FragmentStateEntry {
     state: u32,
 }
@@ -169,7 +268,7 @@ impl FragmentStateEntry {
 }
 
 /// A row in the `fragment_associations` collection.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct AssociationEntry {
     hash: String,
     partition: String,
@@ -183,49 +282,36 @@ fn stored_durable(mut fragment: Fragment) -> Fragment {
     fragment
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// Configuration for the GCS half of the store.
+///
+/// Deliberately a plain struct rather than one that derives `Deserialize` itself: TOML defaulting
+/// lives once, in `lore-server`'s `plugins::gcp::GcpImmutableStorePluginConfig` (mirroring how
+/// `lore_aws::store::immutable_store::S3StoreSettings` is populated field-by-field from
+/// `plugins::aws::AwsImmutableStorePluginConfig` rather than deserialized a second time).
+#[derive(Clone, Debug)]
 pub struct GcsStoreSettings {
     pub bucket: String,
-    #[serde(default)]
     pub endpoint: Option<String>,
-    #[serde(default = "default_slow_threshold")]
     pub slow_operation_threshold_millis: u64,
-    #[serde(default = "crate::default_gcp_timeout_millis")]
     pub timeout_millis: u64,
 }
 
-#[derive(Clone, Debug, Deserialize)]
+/// Configuration for the Firestore half of the immutable store. See [`GcsStoreSettings`] for why
+/// this does not derive `Deserialize`.
+#[derive(Clone, Debug)]
 pub struct FirestoreImmutableStoreSettings {
     pub firestore_project: String,
-    #[serde(default)]
     pub firestore_database: Option<String>,
-    #[serde(default = "default_fragment_state_collection")]
     pub fragment_state_collection: String,
-    #[serde(default = "default_fragment_associations_collection")]
     pub fragment_associations_collection: String,
-    #[serde(default = "default_slow_threshold")]
     pub slow_operation_threshold_millis: u64,
-    #[serde(default = "crate::default_gcp_timeout_millis")]
     pub timeout_millis: u64,
 }
 
-fn default_fragment_state_collection() -> String {
-    "fragment_state".to_string()
-}
-
-fn default_fragment_associations_collection() -> String {
-    "fragment_associations".to_string()
-}
-
-fn default_slow_threshold() -> u64 {
-    u64::MAX
-}
-
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct GcpImmutableStoreSettings {
     pub gcs: GcsStoreSettings,
     pub firestore: FirestoreImmutableStoreSettings,
-    #[serde(default)]
     pub force_write: bool,
 }
 
@@ -268,7 +354,10 @@ pub struct GcpImmutableStore {
     fragment_state_collection: Arc<str>,
     fragment_associations_collection: Arc<str>,
     force_write: bool,
-    timeout: Duration,
+    gcs_timeout: Duration,
+    gcs_slow_threshold: Duration,
+    firestore_timeout: Duration,
+    firestore_slow_threshold: Duration,
     obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
@@ -312,7 +401,12 @@ impl GcpImmutableStore {
                 settings.firestore.fragment_associations_collection.as_str(),
             ),
             force_write: settings.force_write,
-            timeout: Duration::from_millis(settings.gcs.timeout_millis.max(1)),
+            gcs_timeout: Duration::from_millis(settings.gcs.timeout_millis.max(1)),
+            gcs_slow_threshold: Duration::from_millis(settings.gcs.slow_operation_threshold_millis),
+            firestore_timeout: Duration::from_millis(settings.firestore.timeout_millis.max(1)),
+            firestore_slow_threshold: Duration::from_millis(
+                settings.firestore.slow_operation_threshold_millis,
+            ),
             obliteration_drain: Duration::from_millis(
                 settings
                     .firestore
@@ -331,6 +425,40 @@ impl GcpImmutableStore {
         }
     }
 
+    /// Run a Firestore future, bounded by this store's configured Firestore timeout/slow
+    /// threshold, and classify its error as a `StoreError` (retryable failures become
+    /// [`StoreError::SlowDown`]; see [`is_firestore_retryable`]).
+    async fn firestore_op<T>(
+        &self,
+        op: &'static str,
+        fut: impl Future<Output = firestore::FirestoreResult<T>>,
+    ) -> Result<T, StoreError> {
+        bounded(
+            self.firestore_timeout,
+            self.firestore_slow_threshold,
+            op,
+            fut,
+        )
+        .await?
+        .map_err(GcpError::firestore)
+        .map_err(to_store_error)
+    }
+
+    /// Run a GCS future, bounded by this store's configured GCS timeout/slow threshold. Unlike
+    /// [`Self::firestore_op`], this leaves the raw `google_cloud_storage::Error` for the caller:
+    /// several GCS call sites need to distinguish "not found" from other failures themselves
+    /// (`head_fragment`, `get_gcs_object_contents`, `delete_payload`'s best-effort deletes).
+    async fn gcs_op<T>(
+        &self,
+        op: &'static str,
+        fut: impl Future<Output = Result<T, google_cloud_storage::Error>>,
+    ) -> Result<T, StoreError> {
+        match bounded(self.gcs_timeout, self.gcs_slow_threshold, op, fut).await? {
+            Ok(value) => Ok(value),
+            Err(error) => Err(to_store_error_gcs(error, "GCS operation failed")),
+        }
+    }
+
     fn association_doc_id(hash: Hash, partition: Partition, context: Context) -> String {
         format!(
             "{}_{}_{}",
@@ -345,15 +473,16 @@ impl GcpImmutableStore {
     async fn exists(&self, partition: Partition, address: Address) -> Result<bool, StoreError> {
         let doc_id = Self::association_doc_id(address.hash, partition, address.context);
         let entry: Option<AssociationEntry> = self
-            .db
-            .fluent()
-            .select()
-            .by_id_in(self.fragment_associations_collection.as_ref())
-            .obj()
-            .one(&doc_id)
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+            .firestore_op(
+                "fragment_associations.get",
+                self.db
+                    .fluent()
+                    .select()
+                    .by_id_in(self.fragment_associations_collection.as_ref())
+                    .obj()
+                    .one(&doc_id),
+            )
+            .await?;
 
         Ok(entry.is_some())
     }
@@ -380,23 +509,32 @@ impl GcpImmutableStore {
             .collect();
         let ids: Vec<String> = doc_ids.iter().map(|(_, id)| id.clone()).collect();
 
-        let mut stream = self
-            .db
-            .fluent()
-            .select()
-            .by_id_in(self.fragment_associations_collection.as_ref())
-            .obj::<AssociationEntry>()
-            .batch(ids)
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+        let found_ids = bounded(
+            self.firestore_timeout,
+            self.firestore_slow_threshold,
+            "fragment_associations.batch_get",
+            async {
+                let mut stream = self
+                    .db
+                    .fluent()
+                    .select()
+                    .by_id_in(self.fragment_associations_collection.as_ref())
+                    .obj::<AssociationEntry>()
+                    .batch(ids)
+                    .await
+                    .map_err(GcpError::firestore)
+                    .map_err(to_store_error)?;
 
-        let mut found_ids = HashSet::new();
-        while let Some((doc_id, entry)) = stream.next().await {
-            if entry.is_some() {
-                found_ids.insert(doc_id);
-            }
-        }
+                let mut found_ids = HashSet::new();
+                while let Some((doc_id, entry)) = stream.next().await {
+                    if entry.is_some() {
+                        found_ids.insert(doc_id);
+                    }
+                }
+                Ok::<_, StoreError>(found_ids)
+            },
+        )
+        .await??;
 
         Ok(doc_ids
             .into_iter()
@@ -417,16 +555,17 @@ impl GcpImmutableStore {
             context: hex_context(address.context),
         };
 
-        self.db
-            .fluent()
-            .update()
-            .in_col(self.fragment_associations_collection.as_ref())
-            .document_id(&doc_id)
-            .object(&entry)
-            .execute::<AssociationEntry>()
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+        self.firestore_op::<AssociationEntry>(
+            "fragment_associations.set",
+            self.db
+                .fluent()
+                .update()
+                .in_col(self.fragment_associations_collection.as_ref())
+                .document_id(&doc_id)
+                .object(&entry)
+                .execute(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -438,15 +577,16 @@ impl GcpImmutableStore {
     ) -> Result<(), StoreError> {
         let doc_id = Self::association_doc_id(address.hash, partition, address.context);
 
-        self.db
-            .fluent()
-            .delete()
-            .from(self.fragment_associations_collection.as_ref())
-            .document_id(&doc_id)
-            .execute()
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+        self.firestore_op(
+            "fragment_associations.delete",
+            self.db
+                .fluent()
+                .delete()
+                .from(self.fragment_associations_collection.as_ref())
+                .document_id(&doc_id)
+                .execute(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -462,22 +602,23 @@ impl GcpImmutableStore {
         let partition_hex = hex_partition(partition);
 
         let results: Vec<AssociationEntry> = self
-            .db
-            .fluent()
-            .select()
-            .from(self.fragment_associations_collection.as_ref())
-            .filter(|q| {
-                q.for_all([
-                    q.field("hash").eq(hash_hex.clone()),
-                    q.field("partition").eq(partition_hex.clone()),
-                ])
-            })
-            .limit(1)
-            .obj()
-            .query()
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+            .firestore_op(
+                "fragment_associations.query_by_partition",
+                self.db
+                    .fluent()
+                    .select()
+                    .from(self.fragment_associations_collection.as_ref())
+                    .filter(|q| {
+                        q.for_all([
+                            q.field("hash").eq(hash_hex.clone()),
+                            q.field("partition").eq(partition_hex.clone()),
+                        ])
+                    })
+                    .limit(1)
+                    .obj()
+                    .query(),
+            )
+            .await?;
 
         Ok(!results.is_empty())
     }
@@ -487,17 +628,18 @@ impl GcpImmutableStore {
         let hash_hex = hex_hash(hash);
 
         let results: Vec<AssociationEntry> = self
-            .db
-            .fluent()
-            .select()
-            .from(self.fragment_associations_collection.as_ref())
-            .filter(|q| q.for_all([q.field("hash").eq(hash_hex.clone())]))
-            .limit(1)
-            .obj()
-            .query()
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+            .firestore_op(
+                "fragment_associations.query_by_hash",
+                self.db
+                    .fluent()
+                    .select()
+                    .from(self.fragment_associations_collection.as_ref())
+                    .filter(|q| q.for_all([q.field("hash").eq(hash_hex.clone())]))
+                    .limit(1)
+                    .obj()
+                    .query(),
+            )
+            .await?;
 
         Ok(!results.is_empty())
     }
@@ -506,15 +648,16 @@ impl GcpImmutableStore {
     /// unknown.
     pub(crate) async fn load_state(&self, hash: Hash) -> Result<Option<FragmentState>, StoreError> {
         let entry: Option<FragmentStateEntry> = self
-            .db
-            .fluent()
-            .select()
-            .by_id_in(self.fragment_state_collection.as_ref())
-            .obj()
-            .one(&hex_hash(hash))
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+            .firestore_op(
+                "fragment_state.get",
+                self.db
+                    .fluent()
+                    .select()
+                    .by_id_in(self.fragment_state_collection.as_ref())
+                    .obj()
+                    .one(&hex_hash(hash)),
+            )
+            .await?;
 
         Ok(entry.map(|entry| entry.state()))
     }
@@ -529,33 +672,43 @@ impl GcpImmutableStore {
             return Ok(HashMap::new());
         }
 
-        let ids: Vec<(Hash, String)> = distinct
+        // A lookup table from the hex doc id back to the `Hash` it names, built once so the
+        // stream-draining loop below is O(1) per item rather than a linear scan
+        // (`associations_present` already does this correctly with a `HashSet`; this mirrors it).
+        let by_doc_id: HashMap<String, Hash> = distinct
             .iter()
-            .map(|hash| (*hash, hex_hash(*hash)))
+            .map(|hash| (hex_hash(*hash), *hash))
             .collect();
-        let id_strings: Vec<String> = ids.iter().map(|(_, id)| id.clone()).collect();
+        let id_strings: Vec<String> = by_doc_id.keys().cloned().collect();
 
-        let mut stream = self
-            .db
-            .fluent()
-            .select()
-            .by_id_in(self.fragment_state_collection.as_ref())
-            .obj::<FragmentStateEntry>()
-            .batch(id_strings)
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+        bounded(
+            self.firestore_timeout,
+            self.firestore_slow_threshold,
+            "fragment_state.batch_get",
+            async {
+                let mut stream = self
+                    .db
+                    .fluent()
+                    .select()
+                    .by_id_in(self.fragment_state_collection.as_ref())
+                    .obj::<FragmentStateEntry>()
+                    .batch(id_strings)
+                    .await
+                    .map_err(GcpError::firestore)
+                    .map_err(to_store_error)?;
 
-        let mut states = HashMap::new();
-        while let Some((doc_id, entry)) = stream.next().await {
-            if let Some(entry) = entry
-                && let Some((hash, _)) = ids.iter().find(|(_, id)| *id == doc_id)
-            {
-                states.insert(*hash, entry.state());
-            }
-        }
-
-        Ok(states)
+                let mut states = HashMap::new();
+                while let Some((doc_id, entry)) = stream.next().await {
+                    if let Some(entry) = entry
+                        && let Some(hash) = by_doc_id.get(&doc_id)
+                    {
+                        states.insert(*hash, entry.state());
+                    }
+                }
+                Ok::<_, StoreError>(states)
+            },
+        )
+        .await?
     }
 
     /// Record that a payload exists, without disturbing an obliteration that may hold the hash.
@@ -566,56 +719,62 @@ impl GcpImmutableStore {
         let collection = self.fragment_state_collection.clone();
         let doc_id = hex_hash(hash);
 
-        self.db
-            .run_transaction::<FragmentState, _, GcpError>(move |db, transaction| {
-                let collection = collection.clone();
-                let doc_id = doc_id.clone();
-                async move {
-                    let current: Option<FragmentStateEntry> = db
-                        .fluent()
-                        .select()
-                        .by_id_in(collection.as_ref())
-                        .obj()
-                        .one(&doc_id)
-                        .await
-                        .map_err(GcpError::firestore)
-                        .map_err(BackoffError::Permanent)?;
+        bounded(
+            self.firestore_timeout,
+            self.firestore_slow_threshold,
+            "fragment_state.publish_transaction",
+            self.db
+                .run_transaction::<FragmentState, _, GcpError>(move |db, transaction| {
+                    let collection = collection.clone();
+                    let doc_id = doc_id.clone();
+                    async move {
+                        let current: Option<FragmentStateEntry> = db
+                            .fluent()
+                            .select()
+                            .by_id_in(collection.as_ref())
+                            .obj()
+                            .one(&doc_id)
+                            .await
+                            .map_err(GcpError::firestore)
+                            .map_err(BackoffError::Permanent)?;
 
-                    if let Some(current) = current {
-                        return Ok(current.state());
+                        if let Some(current) = current {
+                            return Ok(current.state());
+                        }
+
+                        let entry = FragmentStateEntry::new(FragmentState::Stored);
+                        db.fluent()
+                            .update()
+                            .in_col(collection.as_ref())
+                            .document_id(&doc_id)
+                            .object(&entry)
+                            .add_to_transaction(transaction)
+                            .map_err(GcpError::firestore)
+                            .map_err(BackoffError::Permanent)?;
+
+                        Ok(FragmentState::Stored)
                     }
-
-                    let entry = FragmentStateEntry::new(FragmentState::Stored);
-                    db.fluent()
-                        .update()
-                        .in_col(collection.as_ref())
-                        .document_id(&doc_id)
-                        .object(&entry)
-                        .add_to_transaction(transaction)
-                        .map_err(GcpError::firestore)
-                        .map_err(BackoffError::Permanent)?;
-
-                    Ok(FragmentState::Stored)
-                }
-                .boxed()
-            })
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)
+                    .boxed()
+                }),
+        )
+        .await?
+        .map_err(GcpError::firestore)
+        .map_err(to_store_error)
     }
 
     /// Delete the state document for a hash, so the next put treats it as new content. Only
     /// called for a payload GCS has lost.
     async fn clear_state(&self, hash: Hash) -> Result<(), StoreError> {
-        self.db
-            .fluent()
-            .delete()
-            .from(self.fragment_state_collection.as_ref())
-            .document_id(hex_hash(hash))
-            .execute()
-            .await
-            .map_err(GcpError::firestore)
-            .map_err(to_store_error)?;
+        self.firestore_op(
+            "fragment_state.delete",
+            self.db
+                .fluent()
+                .delete()
+                .from(self.fragment_state_collection.as_ref())
+                .document_id(hex_hash(hash))
+                .execute(),
+        )
+        .await?;
 
         Ok(())
     }
@@ -631,49 +790,55 @@ impl GcpImmutableStore {
         let collection = self.fragment_state_collection.clone();
         let doc_id = hex_hash(hash);
 
-        self.db
-            .run_transaction::<(), _, GcpError>(move |db, transaction| {
-                let collection = collection.clone();
-                let doc_id = doc_id.clone();
-                async move {
-                    let current: Option<FragmentStateEntry> = db
-                        .fluent()
-                        .select()
-                        .by_id_in(collection.as_ref())
-                        .obj()
-                        .one(&doc_id)
-                        .await
-                        .map_err(GcpError::firestore)
-                        .map_err(BackoffError::Permanent)?;
+        bounded(
+            self.firestore_timeout,
+            self.firestore_slow_threshold,
+            "fragment_state.advance_transaction",
+            self.db
+                .run_transaction::<(), _, GcpError>(move |db, transaction| {
+                    let collection = collection.clone();
+                    let doc_id = doc_id.clone();
+                    async move {
+                        let current: Option<FragmentStateEntry> = db
+                            .fluent()
+                            .select()
+                            .by_id_in(collection.as_ref())
+                            .obj()
+                            .one(&doc_id)
+                            .await
+                            .map_err(GcpError::firestore)
+                            .map_err(BackoffError::Permanent)?;
 
-                    if current.map(|entry| entry.state()) != Some(expected) {
-                        return Err(BackoffError::Permanent(GcpError::Decode(format!(
-                            "fragment state for {doc_id} was not {expected:?} when moving to {updated:?}"
-                        ))));
+                        if current.map(|entry| entry.state()) != Some(expected) {
+                            return Err(BackoffError::Permanent(GcpError::Decode(format!(
+                                "fragment state for {doc_id} was not {expected:?} when moving to \
+                                 {updated:?}"
+                            ))));
+                        }
+
+                        let entry = FragmentStateEntry::new(updated);
+                        db.fluent()
+                            .update()
+                            .in_col(collection.as_ref())
+                            .document_id(&doc_id)
+                            .object(&entry)
+                            .add_to_transaction(transaction)
+                            .map_err(GcpError::firestore)
+                            .map_err(BackoffError::Permanent)?;
+
+                        Ok(())
                     }
-
-                    let entry = FragmentStateEntry::new(updated);
-                    db.fluent()
-                        .update()
-                        .in_col(collection.as_ref())
-                        .document_id(&doc_id)
-                        .object(&entry)
-                        .add_to_transaction(transaction)
-                        .map_err(GcpError::firestore)
-                        .map_err(BackoffError::Permanent)?;
-
-                    Ok(())
-                }
-                .boxed()
-            })
-            .await
-            .map_err(|err| match err {
-                firestore::errors::FirestoreError::ErrorInTransaction(inner) => {
-                    warn!(%inner, "Failed to update fragment state due to conflict");
-                    StoreError::internal("Failed to update fragment state due to conflict")
-                }
-                other => to_store_error(GcpError::firestore(other)),
-            })
+                    .boxed()
+                }),
+        )
+        .await?
+        .map_err(|err| match err {
+            firestore::errors::FirestoreError::ErrorInTransaction(inner) => {
+                warn!(%inner, "Failed to update fragment state due to conflict");
+                StoreError::internal("Failed to update fragment state due to conflict")
+            }
+            other => to_store_error(GcpError::firestore(other)),
+        })
     }
 
     /// Move a tombstoned hash back to stored, now that its payload has been uploaded again.
@@ -741,19 +906,30 @@ impl GcpImmutableStore {
         }
 
         let object_name = hex_hash(hash);
-        crate::clients::with_timeout(
-            self.timeout,
+        self.gcs_op(
+            "write_object",
             self.storage
                 .write_object(&self.bucket_resource, object_name.clone(), payload)
                 .set_metadata(to_object_metadata(&fragment))
+                // The payload is an opaque, content-addressed fragment (compressed or not), never
+                // a document a browser or CDN should render — the same value GCS itself defaults
+                // an object's content type to when a request never names one. Naming it
+                // explicitly is more honest about intent than leaning on that default, though it
+                // is not a complete workaround for the Google Cloud Storage testbench
+                // incompatibility documented in the module docs above: `google-cloud-storage`
+                // 1.18.0 never attaches a `Content-Type` header to the multipart request's raw
+                // "media" part regardless of this setting (it only affects the JSON "metadata"
+                // part's `contentType` field, a different thing the testbench does not consult
+                // for this check), so the testbench still answers a multipart upload with a 500.
+                .set_content_type("application/octet-stream")
+                // Content-addressed: the same bytes always hash to the same object name, so a
+                // retried upload after a transient network failure is always safe to repeat.
+                .with_idempotency(true)
                 .send_unbuffered(),
-            || google_cloud_storage::Error::io(std::io::Error::other("GCS write_object timed out")),
         )
         .await
-        .map(|_| ())
-        .map_err(|error| {
+        .inspect_err(|error| {
             warn!(?error, %hash, %object_name, "Failed to write payload for hash");
-            StoreError::internal_with_context(GcpError::gcs(error), "GCS write object failed")
         })?;
 
         match self.publish_state(hash).await? {
@@ -788,7 +964,14 @@ impl GcpImmutableStore {
             .set_versions(true)
             .by_item();
         loop {
-            match items.next().await {
+            match bounded(
+                self.gcs_timeout,
+                self.gcs_slow_threshold,
+                "list_objects.next",
+                items.next(),
+            )
+            .await?
+            {
                 Some(Ok(object)) if object.name == object_name => {
                     generations.push(object.generation);
                 }
@@ -799,10 +982,7 @@ impl GcpImmutableStore {
                 }
                 Some(Err(error)) => {
                     warn!(?error, %hash, "Failed to list versions for hash");
-                    return Err(StoreError::internal_with_context(
-                        GcpError::gcs(error),
-                        "GCS list object versions failed",
-                    ));
+                    return Err(to_store_error_gcs(error, "GCS list object versions failed"));
                 }
                 None => break,
             }
@@ -811,44 +991,51 @@ impl GcpImmutableStore {
         if generations.is_empty() {
             // Either the bucket is not versioned, or the object is already gone. A best-effort
             // delete of the live object covers the first case; a not-found is not an error here,
-            // since obliterate is meant to leave no payload behind either way.
-            match self
-                .control
-                .delete_object()
-                .set_bucket(&self.bucket_resource)
-                .set_object(&object_name)
-                .send()
-                .await
+            // since obliterate is meant to leave no payload behind either way. Bounded directly
+            // (rather than through `gcs_op`) so the raw error is still available to test for
+            // not-found — `gcs_op`'s conversion to `StoreError` collapses that distinction away.
+            match bounded(
+                self.gcs_timeout,
+                self.gcs_slow_threshold,
+                "delete_object",
+                self.control
+                    .delete_object()
+                    .set_bucket(&self.bucket_resource)
+                    .set_object(&object_name)
+                    .send(),
+            )
+            .await?
             {
                 Ok(()) => {}
                 Err(error) if is_not_found(&error) => {}
                 Err(error) => {
                     warn!(?error, %hash, "Failed to delete payload for hash");
-                    return Err(StoreError::internal_with_context(
-                        GcpError::gcs(error),
-                        "GCS delete object failed",
-                    ));
+                    return Err(to_store_error_gcs(error, "GCS delete object failed"));
                 }
             }
             return Ok(());
         }
 
         for generation in generations {
-            match self
-                .control
-                .delete_object()
-                .set_bucket(&self.bucket_resource)
-                .set_object(&object_name)
-                .set_generation(generation)
-                .send()
-                .await
+            match bounded(
+                self.gcs_timeout,
+                self.gcs_slow_threshold,
+                "delete_object_generation",
+                self.control
+                    .delete_object()
+                    .set_bucket(&self.bucket_resource)
+                    .set_object(&object_name)
+                    .set_generation(generation)
+                    .send(),
+            )
+            .await?
             {
                 Ok(()) => {}
                 Err(error) if is_not_found(&error) => {}
                 Err(error) => {
                     warn!(?error, %hash, generation, "Failed to delete payload generation for hash");
-                    return Err(StoreError::internal_with_context(
-                        GcpError::gcs(error),
+                    return Err(to_store_error_gcs(
+                        error,
                         "GCS delete object generation failed",
                     ));
                 }
@@ -863,21 +1050,25 @@ impl GcpImmutableStore {
     /// which transfers no body).
     async fn head_fragment(&self, hash: Hash) -> Result<Fragment, StoreError> {
         let object_name = hex_hash(hash);
-        let object = self
-            .control
-            .get_object()
-            .set_bucket(&self.bucket_resource)
-            .set_object(&object_name)
-            .send()
-            .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    debug!(%hash, "head_fragment: object not found");
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-                } else {
-                    StoreError::internal_with_context(GcpError::gcs(error), "GCS get object failed")
-                }
-            })?;
+        let object = bounded(
+            self.gcs_timeout,
+            self.gcs_slow_threshold,
+            "get_object",
+            self.control
+                .get_object()
+                .set_bucket(&self.bucket_resource)
+                .set_object(&object_name)
+                .send(),
+        )
+        .await?
+        .map_err(|error| {
+            if is_not_found(&error) {
+                debug!(%hash, "head_fragment: object not found");
+                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+            } else {
+                to_store_error_gcs(error, "GCS get object failed")
+            }
+        })?;
 
         let fragment = from_object_metadata(&object.metadata).map_err(|e| {
             warn!(%hash, "Stored object carries unusable or absent fragment metadata: {e}");
@@ -892,22 +1083,32 @@ impl GcpImmutableStore {
         hash: Hash,
     ) -> Result<GetGcsObjectContentsOutput, StoreError> {
         let object_name = hex_hash(hash);
-        let mut response = self
-            .storage
-            .read_object(&self.bucket_resource, &object_name)
-            .send()
-            .await
-            .map_err(|error| {
-                if is_not_found(&error) {
-                    debug!(%hash, "get_gcs_object_contents: object not found");
-                    StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
-                } else {
-                    StoreError::internal_with_context(GcpError::gcs(error), "GCS get object failed")
-                }
-            })?;
+        let mut response = bounded(
+            self.gcs_timeout,
+            self.gcs_slow_threshold,
+            "read_object.send",
+            self.storage
+                .read_object(&self.bucket_resource, &object_name)
+                .send(),
+        )
+        .await?
+        .map_err(|error| {
+            if is_not_found(&error) {
+                debug!(%hash, "get_gcs_object_contents: object not found");
+                StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
+            } else {
+                to_store_error_gcs(error, "GCS get object failed")
+            }
+        })?;
 
         let object = response.object();
 
+        // The hard cap this store ever allows an object to be. Checked twice: once here, against
+        // the size GCS *declares* up front (a cheap early exit for the common case), and again,
+        // unconditionally, inside the streaming loop below against the bytes actually received —
+        // the declared size is attacker/corruption-influenced input, exactly like any other
+        // metadata this store reads, and must never be the only thing standing between a
+        // malicious or corrupted object and an unbounded read into memory.
         const MAX_OBJECT_SIZE: usize = FRAGMENT_SIZE_THRESHOLD + std::mem::size_of::<Fragment>();
         let declared_size = usize::try_from(object.size).ok().filter(|size| *size > 0);
         if let Some(size) = declared_size
@@ -934,15 +1135,40 @@ impl GcpImmutableStore {
         let capacity = declared_size.map_or(MAX_OBJECT_SIZE, |size| size.min(MAX_OBJECT_SIZE));
         let mut buffer = BytesMut::with_capacity(capacity);
         let mut read = 0usize;
-        while let Some(chunk) = response.next().await {
+        loop {
+            let next = bounded(
+                self.gcs_timeout,
+                self.gcs_slow_threshold,
+                "read_object.chunk",
+                response.next(),
+            )
+            .await?;
+            let Some(chunk) = next else { break };
             let chunk = chunk.map_err(|error| {
                 warn!("Failed to read bytes from GCS response for key: {hash}: {error:?}");
-                StoreError::internal_with_context(
-                    GcpError::gcs(error),
-                    "Failed to read bytes from GCS response stream",
-                )
+                to_store_error_gcs(error, "Failed to read bytes from GCS response stream")
             })?;
             read += chunk.len();
+
+            // Enforced unconditionally, independent of whatever `object.size` claimed above: a
+            // stream that keeps sending bytes past the declared length (or one seen when
+            // `declared_size` was `None` because the field was absent, zero, or unparsable) must
+            // still be cut off here rather than buffered without limit.
+            if read > MAX_OBJECT_SIZE {
+                warn!(
+                    %hash,
+                    read,
+                    max = MAX_OBJECT_SIZE,
+                    "GCS object exceeded maximum allowed size while streaming; aborting read"
+                );
+                return Err(StoreError::from(Oversized {
+                    context: format!(
+                        "GCS object for {hash} exceeded maximum size {MAX_OBJECT_SIZE} while \
+                         streaming"
+                    ),
+                }));
+            }
+
             trace!("Read {read} bytes from GCS stream");
             buffer.extend_from_slice(chunk.as_ref());
         }
@@ -1106,6 +1332,10 @@ impl GcpImmutableStore {
         Ok(())
     }
 
+    // Note: the `get`/`query`/`get_metadata` read-inconsistency during an obliteration's drain
+    // window (see the module docs) means `do_query`/`do_query_batch` and `Self::get`
+    // (`ImmutableStoreTrait::get`, below) can disagree about the same address for a short window;
+    // that is the same behavior `lore_aws` has, not a regression introduced here.
     async fn do_query(
         &self,
         partition: Partition,
@@ -1384,6 +1614,9 @@ impl ImmutableStoreTrait for GcpImmutableStore {
         .into()
     }
 
+    // Note: this is not atomic with a concurrent `obliterate` of the same source hash — see the
+    // "copy-during-obliteration dangling-association race" entry in the module docs. Shared with
+    // `lore_aws`, not a GCP-specific gap.
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name = "GcpImmutableStore::copy" skip(self))]
     async fn copy(

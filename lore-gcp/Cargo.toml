@@ -17,7 +17,7 @@ bytes = { workspace = true }
 # startup. See the root Cargo.toml's own rustls comment for the same avoidance on the AWS side.
 firestore = { version = "=0.47.1", default-features = false, features = ["tls-webpki-roots"] }
 futures = { workspace = true }
-google-cloud-gax = "1.14"
+google-cloud-gax = { version = "1.14", default-features = false }
 # default-features = false and no features re-enabled: google-cloud-storage's own default feature
 # ("default-rustls-provider") is what pulls aws-lc-rs (via google-cloud-auth's default feature
 # group). Leaving it off does not break TLS: google-cloud-auth's own reqwest edge unconditionally
@@ -25,7 +25,19 @@ google-cloud-gax = "1.14"
 # whatever crypto provider the process already installed (ring).
 google-cloud-storage = { version = "1.18.0", default-features = false }
 hex = { workspace = true }
+# gcloud-sdk (firestore's transport) depends on jsonwebtoken 10 with no crypto feature selected,
+# so it mints self-signed JWTs (used for Application Default Credentials with a service account
+# key) via a runtime-pluggable `jsonwebtoken::crypto::CryptoProvider` that panics if exactly one of
+# the "rust_crypto"/"aws_lc_rs" crate features is not enabled. Declaring the dependency directly
+# here with "rust_crypto" (pure-Rust, no aws-lc-rs/aws-lc-sys — this workspace's deny.toml denies
+# both) makes jsonwebtoken auto-select that provider at compile time for the one resolved instance
+# gcloud-sdk also links against, via Cargo's feature unification — no runtime install call needed
+# for this crate specifically (unlike rustls's provider; see clients.rs's `ensure_crypto_provider`).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
 opentelemetry = { workspace = true }
+# For the defensive rustls CryptoProvider check in clients.rs. Uses the workspace's own pinned
+# version/features (ring, not aws-lc-rs) rather than pulling in a second one.
+rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
