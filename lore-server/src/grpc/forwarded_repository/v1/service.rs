@@ -17,6 +17,8 @@ use tonic::Status;
 
 use super::repository_create;
 use super::repository_get;
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::timeout_grpc;
 use crate::hooks::HookDispatcher;
 
@@ -38,15 +40,30 @@ pub struct LoreForwardedRepositoryV1Service {
     hook_dispatcher: Arc<HookDispatcher>,
     instrument_provider: ForwardedRepositoryServiceInstrumentProvider,
     rpc_timeout: Duration,
+    /// Verifies the forwarded caller's raw token into real claims for
+    /// `repository_get`, which — unlike `repository_create` — has to make a
+    /// real access decision on the receiving end (LEP
+    /// 2026-08-20-oidc-oauth2-authentication, D8/D9). `None` when this
+    /// deployment has no `[server.auth]` at all, matching
+    /// `AllowAllRepositoryAuthorizer` everywhere else.
+    jwt_verifier: Option<JwtVerifier>,
+    /// The same process-wide authorizer every other gRPC surface uses. Never
+    /// built locally from `auth_url` alone: doing so ignored `[server.auth]`
+    /// entirely and could only ever select `AuthClientAuthorizer` or
+    /// `AllowAllRepositoryAuthorizer`, never `GlobalGrantsAuthorizer`.
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 }
 
 impl LoreForwardedRepositoryV1Service {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         environment: EnvironmentConfig,
         immutable_store: Arc<dyn lore_storage::ImmutableStore>,
         mutable_store: Arc<dyn lore_storage::MutableStore>,
         hook_dispatcher: Arc<HookDispatcher>,
         rpc_timeout: Duration,
+        jwt_verifier: Option<JwtVerifier>,
+        repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Self {
         let instrument_provider = ForwardedRepositoryServiceInstrumentProvider;
         Self {
@@ -56,6 +73,8 @@ impl LoreForwardedRepositoryV1Service {
             hook_dispatcher,
             rpc_timeout,
             instrument_provider,
+            jwt_verifier,
+            repository_authorizer,
         }
     }
 
@@ -95,7 +114,8 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
             self.rpc_timeout,
             repository_get::handler(
                 request,
-                self.auth_url(),
+                self.jwt_verifier.clone(),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
             ),
