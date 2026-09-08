@@ -156,6 +156,8 @@ mod replication_service_tests {
                 notification,
                 hooks,
                 lore_revision::environment::EnvironmentConfig::default(),
+                None, // no JwtVerifier: this suite exercises the mTLS-only replication path
+                Arc::new(lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer),
             )?
             .with_tls_config(
                 Some(certs.server_cert_path.clone()),
