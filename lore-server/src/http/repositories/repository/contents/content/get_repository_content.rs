@@ -21,6 +21,7 @@ use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_revision::immutable;
 use lore_revision::immutable::ImmutableError;
+use lore_revision::lore::RepositoryId;
 use lore_revision::repository::RepositoryContext;
 use lore_telemetry::tracing::fields::ADDRESS;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
@@ -32,10 +33,47 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::debug;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::http::log_http_error;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
+
+/// The bearer token exactly as presented, without the `Bearer ` prefix.
+/// Needed only so a legacy `AuthClientAuthorizer` can forward it to the auth
+/// service; `jwt_axum_middleware` decodes it but does not retain the raw
+/// form, so it is re-extracted here from the same header (mirrors
+/// `presign_repository_content.rs::extract_bearer_token`).
+fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|header| header.strip_prefix("Bearer "))
+}
+
+/// Baseline `read` requirement (closing the Tier 1 gap where any
+/// authenticated caller could fetch repository content with no group
+/// membership at all). Mirrors
+/// `presign_repository_content.rs::check_presign_permission`: with no
+/// verifier configured, `user_info` is `None` and
+/// `AllowAllRepositoryAuthorizer` ignores the action and permits it.
+async fn check_read_permission(
+    state: &ServerState,
+    user_info: &Option<AuthorizationToken>,
+    headers: &HeaderMap,
+    repository: RepositoryId,
+) -> Result<(), GetContentError> {
+    let verified_token = user_info.as_ref().map(|claims| {
+        VerifiedToken::new(extract_bearer_token(headers).unwrap_or_default(), claims)
+    });
+    state
+        .reachability_authorizer
+        .authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| GetContentError::PermissionDenied)
+}
 
 // The maximum number of chunks waiting in the send queue
 const CHUNKED_RESPONSE_BUFFER_SIZE: usize = 16;
@@ -50,6 +88,8 @@ pub enum GetContentError {
     ReadStream(ImmutableError),
     #[error("Failed to generate chunked response headers: {0}")]
     HeaderGeneration(InvalidHeaderValue),
+    #[error("Caller does not hold the read action")]
+    PermissionDenied,
 }
 
 impl IntoResponse for GetContentError {
@@ -66,6 +106,10 @@ impl IntoResponse for GetContentError {
             GetContentError::ReadStream(_) | GetContentError::HeaderGeneration(_) => (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "Something went wrong. See server log for more info.".to_string(),
+            ),
+            GetContentError::PermissionDenied => (
+                StatusCode::FORBIDDEN,
+                "caller does not hold the read action".to_string(),
             ),
         };
 
@@ -131,6 +175,8 @@ pub async fn handler(
         .parse::<Address>()
         .map_err(GetContentError::ParseAddress)?;
 
+    check_read_permission(&state, &user_info, &headers, parsed_repository.into()).await?;
+
     let user_id = get_user_id_from_token(user_info);
 
     let correlation_id = headers
@@ -183,12 +229,85 @@ mod tests {
     use lore_base::types::Context;
     use lore_revision::fragment;
     use rand::random;
+    use serde_json::json;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::http::server::LoreHttpServerSettings;
     use crate::http::server::ServerHealth;
     use crate::http::server::create_router;
     use crate::store::test_store_create;
+
+    fn state_with_authorizer(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+        repository_authorizer: Arc<dyn crate::authnz::repository_authorizer::RepositoryAuthorizer>,
+    ) -> ServerState {
+        ServerState {
+            immutable_store,
+            mutable_store,
+            jwt_verifier: None,
+            reachability_authorizer: ReachabilityAuthorizer {
+                authorizer: repository_authorizer,
+                legacy_resource_claim: false,
+            },
+            max_file_size: 100,
+            presign_config: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn no_auth_configured_may_read() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(AllowAllRepositoryAuthorizer),
+        );
+        check_read_permission(&state, &None, &HeaderMap::new(), random())
+            .await
+            .expect("AllowAllRepositoryAuthorizer keeps the gate open with no verifier");
+    }
+
+    #[tokio::test]
+    async fn caller_holding_read_action_may_read() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string()))),
+        );
+        let serde_json::Value::Object(extra) = json!({ "roles": ["read"] }) else {
+            unreachable!()
+        };
+        let token = Some(AuthorizationToken {
+            extra,
+            ..Default::default()
+        });
+        check_read_permission(&state, &token, &HeaderMap::new(), random())
+            .await
+            .expect("a caller holding the read action may read");
+    }
+
+    #[tokio::test]
+    async fn caller_without_read_action_may_not_read() {
+        let (immutable_store, mutable_store, _) =
+            test_store_create().await.expect("Failed to create stores");
+        let state = state_with_authorizer(
+            immutable_store,
+            mutable_store,
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string()))),
+        );
+        let token = Some(AuthorizationToken::default());
+        let err = check_read_permission(&state, &token, &HeaderMap::new(), random())
+            .await
+            .expect_err("a caller not holding the read action may not read");
+        assert!(matches!(err, GetContentError::PermissionDenied));
+    }
 
     #[tokio::test]
     async fn test_server_is_up_and_listening() {
