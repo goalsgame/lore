@@ -67,6 +67,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt::ResourcePermission;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -230,6 +231,43 @@ pub fn verified_token<'a>(
     claims
         .as_ref()
         .map(|claims| VerifiedToken::new(raw.as_deref().unwrap_or_default(), claims))
+}
+
+/// Verifies a forwarded peer-to-peer request's raw bearer token
+/// (`CallerContext::authorization`) against `jwt_verifier`, mirroring what
+/// `JWTInterceptor` does for a directly-received request: reject outright
+/// when this deployment has auth configured and the caller did not present
+/// a token that verifies, rather than falling back to an anonymous, and
+/// therefore potentially over-permissive, check. `jwt_verifier: None` means
+/// this deployment has no `[server.auth]` at all, so the forwarded request
+/// is not re-verified and `Ok(None)` is returned unconditionally — the same
+/// "no verifier configured" shape every other authorization check in this
+/// crate uses.
+///
+/// Centralizes a ~15-line match that was previously duplicated verbatim
+/// across every `forwarded_*` handler that verifies a forwarded caller
+/// itself rather than trusting the originating server's decision
+/// (`forwarded_revision/v1/branch_{create,delete,get,list}`,
+/// `forwarded_repository/v1/{repository_create,repository_get}`) — this is
+/// token verification, not just an authorization check, so a future fix to
+/// how forwarded tokens get verified previously had to be applied
+/// identically by hand at each of those six call sites.
+pub async fn verify_forwarded_caller(
+    jwt_verifier: &Option<JwtVerifier>,
+    authorization: &Option<String>,
+) -> Result<Option<AuthorizationToken>, Status> {
+    match (jwt_verifier, authorization.as_deref()) {
+        (Some(verifier), Some(raw)) => {
+            let bearer = raw.strip_prefix("Bearer ").unwrap_or(raw);
+            let claims = verifier
+                .verify_token(bearer)
+                .await
+                .map_err(|_err| Status::unauthenticated("invalid forwarded authorization token"))?;
+            Ok(Some(claims))
+        }
+        (Some(_), None) => Err(Status::unauthenticated("authorization header required")),
+        (None, _) => Ok(None),
+    }
 }
 
 /// Gates cross-partition link reads during revision-graph traversal, which

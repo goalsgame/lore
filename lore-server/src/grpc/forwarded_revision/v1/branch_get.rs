@@ -38,24 +38,12 @@ pub async fn handler(
 ) -> Result<Response<BranchGetResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
 
-    // Mirrors what `JWTAuthnInterceptor` does for a directly-received
-    // request: reject outright when this deployment has auth configured and
-    // the caller did not present a token that verifies, rather than falling
-    // back to an anonymous, and therefore potentially over-permissive,
-    // check.
+    // See `grpc::verify_forwarded_caller`'s doc comment: reject outright
+    // when this deployment has auth configured and the caller did not
+    // present a token that verifies, rather than falling back to an
+    // anonymous, and therefore potentially over-permissive, check.
     let claims =
-        match (&jwt_verifier, caller_context.authorization.as_deref()) {
-            (Some(verifier), Some(raw)) => {
-                let bearer = raw.strip_prefix("Bearer ").unwrap_or(raw);
-                Some(verifier.verify_token(bearer).await.map_err(|_err| {
-                    Status::unauthenticated("invalid forwarded authorization token")
-                })?)
-            }
-            (Some(_), None) => {
-                return Err(Status::unauthenticated("authorization header required"));
-            }
-            (None, _) => None,
-        };
+        crate::grpc::verify_forwarded_caller(&jwt_verifier, &caller_context.authorization).await?;
 
     let verified_token = crate::grpc::verified_token(&claims, &caller_context.authorization);
     repository_authorizer
