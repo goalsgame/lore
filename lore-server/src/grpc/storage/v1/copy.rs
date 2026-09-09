@@ -84,7 +84,7 @@ async fn copy_item(
 
     let outcome = if let Some(token) = auth_token.as_ref()
         && let Err(err) = reachability_authorizer
-            .check_reachability(token, source_repository)
+            .check_read(token, source_repository)
             .await
     {
         Err(Status::new(Code::PermissionDenied, err.to_string()))
@@ -146,8 +146,13 @@ pub async fn handler(
 
     // Baseline `push` requirement against the *destination* repository this
     // connection's metadata names — separate from, and in addition to, the
-    // per-fragment plain-reachability check `copy_item` performs above
-    // against each fragment's *source* repository.
+    // per-fragment `read` check `copy_item` performs above against each
+    // fragment's *source* repository (via `check_read`, which degrades to
+    // a local claims check for a legacy deployment rather than an online
+    // call per fragment — see `ReachabilityAuthorizer::check_action`).
+    // Without both: a caller holding `push` on this destination but not
+    // `read` on some other, private source repository could otherwise
+    // exfiltrate that source's content by copying it here.
     let raw_token = extract_authorization_header(&request);
     let verified_token = crate::grpc::verified_token(&auth_token, &raw_token);
     reachability_authorizer
@@ -233,4 +238,121 @@ pub async fn handler(
 
     let recv_stream = ReceiverStream::from(rx);
     Ok(Response::new(Box::pin(recv_stream) as CopyResponseStream))
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_base::types::Address;
+    use lore_base::types::Context;
+    use lore_base::types::Hash;
+    use rand::random;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+    use crate::store::test_store_create;
+
+    /// `groups` is an ordinary named `AuthorizationToken` field (the Dex
+    /// convention), so a `GlobalGrantsAuthorizer` configured with
+    /// `permission_claim = "groups"` reads it directly.
+    fn token_with_groups(groups: &[&str]) -> AuthorizationToken {
+        AuthorizationToken {
+            groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    fn groups_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            legacy_resource_claim: false,
+        }
+    }
+
+    fn make_copy_request(source_repository: RepositoryId) -> storage_v1::CopyRequest {
+        storage_v1::CopyRequest {
+            source_repository_id: source_repository.into(),
+            source_address: Some(
+                Address {
+                    hash: random::<Hash>(),
+                    context: Context::default(),
+                }
+                .into(),
+            ),
+            target_context: Vec::new().into(),
+        }
+    }
+
+    fn status_code(response: &storage_v1::CopyResponse) -> Code {
+        Code::from(
+            response
+                .status
+                .as_ref()
+                .expect("response should carry a status")
+                .code as i32,
+        )
+    }
+
+    /// A caller holding `push` on the destination (checked by `handler`,
+    /// not exercised here) but not `read` on the source is denied at the
+    /// per-fragment source check — closing the exfiltration path where
+    /// push-only access to a destination could be used to copy content out
+    /// of a private repository the caller cannot read.
+    #[tokio::test]
+    async fn copy_item_denies_source_without_read_action() {
+        let (immutable_store, _, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let source_repository = random::<RepositoryId>();
+        let token = token_with_groups(&["push"]);
+        let reachability_authorizer = groups_reachability_authorizer();
+
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let response = copy_item(
+                    Ok(make_copy_request(source_repository)),
+                    random::<RepositoryId>(),
+                    Some(token),
+                    &reachability_authorizer,
+                    "corr".to_string(),
+                    "user".to_string(),
+                    immutable_store,
+                )
+                .await
+                .expect("copy_item reports failures in-band via CopyResponse.status");
+
+                assert_eq!(status_code(&response), Code::PermissionDenied);
+            })
+            .await;
+    }
+
+    /// A caller holding `read` on the source passes the authorization
+    /// check and reaches the actual copy attempt — which then fails with
+    /// `NotFound` because the fragment does not exist, proving the
+    /// permission check itself is what changed, not the copy outcome.
+    #[tokio::test]
+    async fn copy_item_allows_source_with_read_action() {
+        let (immutable_store, _, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let source_repository = random::<RepositoryId>();
+        let token = token_with_groups(&["read"]);
+        let reachability_authorizer = groups_reachability_authorizer();
+
+        lore_base::runtime::LORE_CONTEXT
+            .scope(execution, async move {
+                let response = copy_item(
+                    Ok(make_copy_request(source_repository)),
+                    random::<RepositoryId>(),
+                    Some(token),
+                    &reachability_authorizer,
+                    "corr".to_string(),
+                    "user".to_string(),
+                    immutable_store,
+                )
+                .await
+                .expect("copy_item reports failures in-band via CopyResponse.status");
+
+                assert_eq!(status_code(&response), Code::NotFound);
+            })
+            .await;
+    }
 }

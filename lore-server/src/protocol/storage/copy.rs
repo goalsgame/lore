@@ -158,8 +158,17 @@ impl Message for Copy {
                 token,
                 reachability_authorizer,
             } => {
+                // `read` on the source, not plain reachability: a caller
+                // holding `push` on the destination repository (checked
+                // elsewhere, per-connection) but not `read` on this source
+                // could otherwise exfiltrate the source's content by
+                // copying it into a repository they can write to.
+                // `check_read` degrades to the same local claims check
+                // `check_reachability` used here before, for a legacy
+                // deployment (see `ReachabilityAuthorizer::check_action`),
+                // so this does not add a network round trip.
                 reachability_authorizer
-                    .check_reachability(token, self.source_repository)
+                    .check_read(token, self.source_repository)
                     .await
                     .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
             }
@@ -211,6 +220,7 @@ mod tests {
     use super::*;
     use crate::auth::jwt::AuthorizationToken;
     use crate::auth::jwt::ResourcePermission;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::store::test_store_create;
 
@@ -220,6 +230,16 @@ mod tests {
     fn legacy_reachability() -> ReachabilityAuthorizer {
         ReachabilityAuthorizer::new(Some("http://127.0.0.1:0".to_string()), None)
             .expect("a legacy auth_url always constructs")
+    }
+
+    /// A Tier 1 deployment reading a `groups` claim, for the tests
+    /// exercising the baseline `read` requirement on the source repository
+    /// specifically (as opposed to plain reachability).
+    fn tier1_reachability() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            legacy_resource_claim: false,
+        }
     }
 
     /// No `[server.auth]` configured at all: matches what `Connect` inserts
@@ -529,6 +549,78 @@ mod tests {
                     Err(MessageHandleError::AuthorizationFailure(_)) => (),
                     Err(e) => panic!("Expected AuthorizationFailure error, got {e:?}"),
                     Ok(_) => panic!("Expected AuthorizationFailure error, got Ok"),
+                }
+            })
+            .await;
+    }
+
+    /// A Tier 1 caller holding `push` on the destination (not checked by
+    /// this message, which only ever names the *source*) but not `read` on
+    /// the source is denied — closing the exfiltration path where
+    /// push-only access to some destination could be used to copy content
+    /// out of a private source repository the caller cannot read.
+    #[tokio::test]
+    async fn test_handle_denies_source_without_read_action() {
+        let message = make_copy_message();
+
+        let destination_repository = random::<RepositoryId>();
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(destination_repository);
+
+        let token = AuthorizationToken {
+            groups: Some(vec!["push".to_string()]),
+            ..Default::default()
+        };
+        context_map.insert(ConnectionAuthorization::Verified {
+            token: Box::new(token),
+            reachability_authorizer: tier1_reachability(),
+        });
+
+        let (immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                match message.handle(context_map, immutable_store).await {
+                    Err(MessageHandleError::AuthorizationFailure(_)) => (),
+                    Err(e) => panic!("Expected AuthorizationFailure error, got {e:?}"),
+                    Ok(_) => panic!("Expected AuthorizationFailure error, got Ok"),
+                }
+            })
+            .await;
+    }
+
+    /// A Tier 1 caller holding `read` on the source passes the check and
+    /// reaches the actual copy attempt.
+    #[tokio::test]
+    async fn test_handle_allows_source_with_read_action() {
+        let message = make_copy_message();
+
+        let destination_repository = random::<RepositoryId>();
+        let context_map = Arc::new(AttributeMap::default());
+        context_map.insert(destination_repository);
+
+        let token = AuthorizationToken {
+            groups: Some(vec!["read".to_string()]),
+            ..Default::default()
+        };
+        context_map.insert(ConnectionAuthorization::Verified {
+            token: Box::new(token),
+            reachability_authorizer: tier1_reachability(),
+        });
+
+        let (immutable_store, _mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                // The fragment does not exist, so the copy itself fails —
+                // but with FragmentNotFound, not AuthorizationFailure,
+                // proving the read check passed.
+                match message.handle(context_map, immutable_store).await {
+                    Err(MessageHandleError::FragmentNotFound) => (),
+                    Err(e) => panic!("Expected FragmentNotFound error, got {e:?}"),
+                    Ok(_) => panic!("Expected FragmentNotFound error, got Ok"),
                 }
             })
             .await;

@@ -384,6 +384,39 @@ impl ReachabilityAuthorizer {
         })
     }
 
+    /// Shared implementation behind [`Self::check_reachability`],
+    /// [`Self::check_read`] and [`Self::check_push`]. `action: None` is
+    /// plain reachability; `Some(READ_ACTION)`/`Some(PUSH_ACTION)` are the
+    /// baseline actions. All three take the *same* legacy branch — a local,
+    /// no-network claims check — rather than only `check_reachability`
+    /// doing so, because `read`/`push` have no legacy equivalent (see their
+    /// doc comment on the module): ordinary access under a legacy
+    /// `UrcAuthApi` deployment has always been "listed among the allowed
+    /// resources at all," never gated behind a specific permission string,
+    /// so checking `read` or `push` for such a deployment is defined to
+    /// answer the identical question `check_reachability` already does.
+    /// This matters on hot, per-item paths (the two per-item `Copy`
+    /// handlers) where routing `Some(READ_ACTION)` through
+    /// [`Self::authorizer`] directly would reach [`AuthClientAuthorizer`]'s
+    /// online `CheckUserPermission` call once per fragment — exactly the
+    /// per-item network cost this type exists to avoid.
+    async fn check_action(
+        &self,
+        claims: &AuthorizationToken,
+        repository: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        if self.legacy_resource_claim {
+            verify_authorization(claims, repository)
+                .map_err(|_err| Status::permission_denied("Unauthorized"))
+        } else {
+            let token = VerifiedToken::new("", claims);
+            self.authorizer
+                .check_repository_access(Some(&token), repository, action)
+                .await
+        }
+    }
+
     /// Async form, for the call sites that can await: the two per-item
     /// `Copy` handlers and the HTTP axum middleware.
     ///
@@ -400,15 +433,32 @@ impl ReachabilityAuthorizer {
         claims: &AuthorizationToken,
         repository: RepositoryId,
     ) -> Result<(), Status> {
-        if self.legacy_resource_claim {
-            verify_authorization(claims, repository)
-                .map_err(|_err| Status::permission_denied("Unauthorized"))
-        } else {
-            let token = VerifiedToken::new("", claims);
-            self.authorizer
-                .check_repository_access(Some(&token), repository, None)
-                .await
-        }
+        self.check_action(claims, repository, None).await
+    }
+
+    /// Checks the baseline `read` action, degrading to the same local
+    /// claims check as [`Self::check_reachability`] for a legacy
+    /// deployment — see [`Self::check_action`]'s doc comment. Used on hot,
+    /// per-item paths (the per-fragment `Copy` source check in both the
+    /// gRPC v1 and legacy `urc/0.2` transports) where a fresh online call
+    /// per item would be unacceptable.
+    pub async fn check_read(
+        &self,
+        claims: &AuthorizationToken,
+        repository: RepositoryId,
+    ) -> Result<(), Status> {
+        self.check_action(claims, repository, Some(READ_ACTION))
+            .await
+    }
+
+    /// Checks the baseline `push` action. See [`Self::check_read`].
+    pub async fn check_push(
+        &self,
+        claims: &AuthorizationToken,
+        repository: RepositoryId,
+    ) -> Result<(), Status> {
+        self.check_action(claims, repository, Some(PUSH_ACTION))
+            .await
     }
 
     /// Synchronous form, for the gRPC interceptor and the cross-partition
