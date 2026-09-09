@@ -72,6 +72,23 @@ use crate::util::setup_execution;
 ///   permission at all, matching every other `push`-gated call site added
 ///   alongside this one.
 ///
+/// The `push` check is made via `check_repository_access_by_name` against
+/// the *requested* name (`req.name`), not `check_repository_access` against
+/// a `RepositoryId` (see `RepositoryAuthorizer::check_repository_access_by_name`'s
+/// doc comment): there is no `RepositoryMetadata` to resolve a name from for
+/// a repository that does not exist yet, and `ConfiguredGrantsAuthorizer`
+/// (GOALS fork, `docs/proposals/2026-09-09-goals-repository-acl-config.md`)
+/// needs the name itself to pattern-match against — otherwise a caller
+/// holding `push` on some narrow, unrelated pattern (e.g. `temp/*`) could
+/// still create a repository matching a privileged pattern (e.g.
+/// `art/whatever`) by squatting the name before anyone with a real `art/*`
+/// grant does. `GlobalGrantsAuthorizer` and `AuthClientAuthorizer` are
+/// unaffected by this change: the default trait implementation of
+/// `check_repository_access_by_name` delegates straight back to
+/// `check_repository_access` with an inert `RepositoryId::default()`
+/// sentinel, which both already ignore for this call (see their own doc
+/// comments).
+///
 /// `auth_url`, when a legacy deployment configures one, is used only to
 /// *register* the newly created resource with the auth service
 /// (`repository_create_auth_resource` below) so later permission checks on
@@ -80,15 +97,16 @@ use crate::util::setup_execution;
 ///
 /// The `push` check itself is skipped entirely when `auth_url` is
 /// configured (a legacy `UrcAuthApi` deployment): `AuthClientAuthorizer`
-/// answers `check_repository_access` with an online `CheckUserPermission`
-/// lookup against the *target* resource id, which at this point has not
-/// been registered with the auth service yet — the lookup would find no
-/// entry and fail closed unconditionally, for every caller, on every
-/// legacy deployment, which is not a real access decision but an artifact
-/// of checking before the bookkeeping below runs. Legacy deployments keep
-/// their pre-existing behavior for creation (no check here at all); only
-/// Tier 1 (`GlobalGrantsAuthorizer`) and the no-`[server.auth]` default
-/// (`AllowAllRepositoryAuthorizer`) gain the new `push` requirement.
+/// answers `check_repository_access`/`check_repository_access_by_name` with
+/// an online `CheckUserPermission` lookup against the *target* resource id,
+/// which at this point has not been registered with the auth service yet —
+/// the lookup would find no entry and fail closed unconditionally, for
+/// every caller, on every legacy deployment, which is not a real access
+/// decision but an artifact of checking before the bookkeeping below runs.
+/// Legacy deployments keep their pre-existing behavior for creation (no
+/// check here at all); only Tier 1 (`GlobalGrantsAuthorizer`), the
+/// no-`[server.auth]` default (`AllowAllRepositoryAuthorizer`), and the
+/// GOALS-fork `ConfiguredGrantsAuthorizer` gain the new `push` requirement.
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
@@ -123,7 +141,11 @@ pub async fn handler(
             if !is_legacy_auth {
                 let token = verified_token(&claims, &authorization);
                 repository_authorizer
-                    .check_repository_access(token.as_ref(), id, Some(PUSH_ACTION))
+                    .check_repository_access_by_name(
+                        token.as_ref(),
+                        req.name.as_str(),
+                        Some(PUSH_ACTION),
+                    )
                     .await
                     .map_err(|_err| no_repository_access_status())?;
             }
@@ -794,6 +816,160 @@ mod tests {
                 )
                 .await
                 .expect("AllowAllRepositoryAuthorizer permits repository creation");
+            }))
+            .await;
+        }
+    }
+
+    /// `ConfiguredGrantsAuthorizer`'s (GOALS fork) name-threading fix: the
+    /// `push` check above is made via `check_repository_access_by_name`
+    /// against the *requested* name, not a `RepositoryId` -- this is what
+    /// lets a per-repository-pattern authorizer actually govern
+    /// `RepositoryCreate`, closing the name-pattern-squatting gap described
+    /// in `docs/proposals/2026-09-09-goals-repository-acl-config.md`'s
+    /// Security Considerations (a caller holding `push` on an unrelated
+    /// pattern must not be able to create a repository matching a
+    /// privileged one).
+    mod acl_config_name_authorization {
+        use rand::random;
+
+        use super::*;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::authnz::acl_config::AclConfig;
+        use crate::authnz::acl_config::Grant;
+        use crate::authnz::repository_authorizer::ConfiguredGrantsAuthorizer;
+        use crate::hooks::HookDispatcher;
+        use crate::store::test_store_create;
+
+        struct TestInstrumentProvider;
+
+        impl InstrumentProvider for TestInstrumentProvider {
+            fn namespace(&self) -> &'static str {
+                "test"
+            }
+        }
+
+        fn make_request(
+            repository_id: RepositoryId,
+            name: &str,
+            groups: &[&str],
+        ) -> Request<RepositoryCreateRequest> {
+            let id_bytes: Context = repository_id.into();
+            let mut request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::from(id_bytes),
+                name: name.into(),
+                description: String::new(),
+                default_branch_id: bytes::Bytes::from(Context::from(uuid::Uuid::now_v7())),
+                default_branch_name: "main".into(),
+                creator: "alice".into(),
+                created: 0,
+            });
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(groups.iter().map(|s| s.to_string()).collect()),
+                ..Default::default()
+            });
+            request
+        }
+
+        fn art_leads_authorizer(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(ConfiguredGrantsAuthorizer::new(
+                Some("groups".to_string()),
+                AclConfig {
+                    grants: vec![Grant {
+                        group: "art-leads".to_string(),
+                        repos: vec!["art/*".to_string()],
+                        permissions: vec![PUSH_ACTION.to_string()],
+                    }],
+                },
+                immutable_store,
+                mutable_store,
+            ))
+        }
+
+        /// A caller in `art-leads` creating a name matching its `art/*`
+        /// grant is allowed -- proving the check really does look at
+        /// `req.name`, not an inert sentinel.
+        #[tokio::test]
+        async fn requested_name_matching_the_callers_grant_is_allowed() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let authorizer = art_leads_authorizer(immutable_store.clone(), mutable_store.clone());
+            let hook_dispatcher = HookDispatcher::empty();
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                handler(
+                    make_request(repository_id, "art/hero", &["art-leads"]),
+                    None,
+                    authorizer,
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect("art-leads creating a name under art/* should be allowed");
+            }))
+            .await;
+        }
+
+        /// The security-relevant case: a caller in `art-leads` (which only
+        /// holds `push` on `art/*`) must be denied when creating a name
+        /// *outside* that pattern -- this is the pattern match against the
+        /// requested name actually doing its job, not degrading to "push
+        /// held somewhere" the way the old `RepositoryId::default()`
+        /// sentinel would have under a name-blind authorizer.
+        #[tokio::test]
+        async fn requested_name_outside_the_callers_grant_is_denied() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let authorizer = art_leads_authorizer(immutable_store.clone(), mutable_store.clone());
+            let hook_dispatcher = HookDispatcher::empty();
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    make_request(repository_id, "finance/secrets", &["art-leads"]),
+                    None,
+                    authorizer,
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect_err("art-leads' push grant on art/* must not extend to an unrelated name");
+                assert_eq!(err.code(), Code::PermissionDenied);
+            }))
+            .await;
+        }
+
+        /// A caller with no matching group at all is denied regardless of
+        /// name, same baseline as every other authorizer.
+        #[tokio::test]
+        async fn caller_with_no_matching_group_is_denied() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let authorizer = art_leads_authorizer(immutable_store.clone(), mutable_store.clone());
+            let hook_dispatcher = HookDispatcher::empty();
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    make_request(repository_id, "art/hero", &["qa"]),
+                    None,
+                    authorizer,
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect_err("a caller outside art-leads holds no grant here");
+                assert_eq!(err.code(), Code::PermissionDenied);
             }))
             .await;
         }

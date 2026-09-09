@@ -1855,14 +1855,21 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // `[server.auth]` requesting Tier 2 (`resource_claim`) already failed
     // `Settings::load`'s startup validation before this point; the `?` here
     // is the defense-in-depth backstop for that same check, made again
-    // where the authorizer is actually constructed.
+    // where the authorizer is actually constructed. `new_with_stores` (over
+    // plain `new`) is what lets `acl_config_path` (GOALS fork) select
+    // `ConfiguredGrantsAuthorizer`, which needs read access to the
+    // repository-metadata store already constructed above.
     let legacy_auth_url = settings
         .environment
         .as_ref()
         .and_then(|environment| environment.endpoint.as_ref())
         .and_then(|endpoint| endpoint.auth_url.clone());
-    let reachability_authorizer =
-        ReachabilityAuthorizer::new(legacy_auth_url, settings.server.auth.as_ref())?;
+    let reachability_authorizer = ReachabilityAuthorizer::new_with_stores(
+        legacy_auth_url,
+        settings.server.auth.as_ref(),
+        immutable_store.clone(),
+        mutable_store.clone(),
+    )?;
     let repository_authorizer = reachability_authorizer.authorizer.clone();
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
