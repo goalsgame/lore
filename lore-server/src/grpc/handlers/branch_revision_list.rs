@@ -16,8 +16,12 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -29,10 +33,20 @@ pub async fn handler(
     request: Request<BranchRevisionListRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchRevisionListResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     let source = req.source.map(Hash::from);
     let target = req.target.map(Hash::from);
@@ -105,9 +119,14 @@ mod tests {
     use zerocopy::IntoBytes;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     #[tokio::test]
     async fn test_handle() {
@@ -237,7 +256,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let list = response.into_inner().revisions;
@@ -278,7 +302,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let response = response.into_inner();
@@ -299,7 +328,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let response = response.into_inner();
@@ -320,7 +354,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let response = response.into_inner();
@@ -341,7 +380,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let response = response.into_inner();
@@ -362,7 +406,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let response = response.into_inner();
@@ -399,7 +448,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect_err("Request should have failed");
             assert_eq!(response.code(), tonic::Code::InvalidArgument);
@@ -415,7 +469,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect_err("Request should have failed");
             assert_eq!(response.code(), tonic::Code::InvalidArgument);
@@ -514,7 +573,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let list = response.into_inner().revisions;
@@ -533,7 +597,12 @@ mod tests {
                 REPOSITORY_ID_KEY,
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
             );
-            let response = handler(request, immutable_store.clone(), mutable_store.clone())
+            let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                 .await
                 .expect("Request failed");
             let list = response.into_inner().revisions;
@@ -568,7 +637,12 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
+                let response = handler(
+                request,
+                immutable_store.clone(),
+                mutable_store.clone(),
+                allow_all_authorizer(),
+            )
                     .await
                     .expect_err("Request should have failed");
 

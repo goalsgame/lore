@@ -16,8 +16,12 @@ use tracing::info;
 use tracing::trace;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -27,10 +31,20 @@ pub async fn handler(
     request: Request<RevisionStateHistoryRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionStateHistoryResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let request = request.into_inner();
     let mut revision = Hash::from(request.revision);
     // if we encounter a revision state not found in the history when we expect to find it,
@@ -136,9 +150,14 @@ mod tests {
     use tracing::debug;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::protocol::attribute_map::AttributeMap;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     #[tokio::test]
     async fn test_handle() {
@@ -184,7 +203,12 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
                     .await
                     .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
@@ -206,7 +230,12 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
                     .await
                     .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
@@ -250,7 +279,12 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
                     .await
                     .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
@@ -276,7 +310,12 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
                     .await
                     .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(

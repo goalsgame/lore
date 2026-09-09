@@ -193,6 +193,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -229,6 +230,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -276,6 +278,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -307,6 +310,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -322,6 +326,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -369,6 +374,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
