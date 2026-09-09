@@ -28,12 +28,16 @@ use tracing::warn;
 
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
+use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::link_read_authorizer;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -58,8 +62,23 @@ pub async fn handler(
     acceleration: crate::grpc::server::RevisionListAcceleration,
 ) -> Result<Response<RevisionTreeStream>, Status> {
     let repository_id = get_repository(request.metadata())?;
-    let user_id = get_user_id(request.extensions());
     let authorization = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
+
+    // Explicit `read` check on the primary requested repository, separate
+    // from `link_read_authorizer` below (which answers a different
+    // question — plain reachability, `action: None`, for each linked
+    // partition visited while walking the tree).
+    let verified_token = authorization
+        .as_ref()
+        .map(|claims| VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims));
+    reachability_authorizer
+        .authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| no_repository_access_status())?;
+
+    let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
 
@@ -210,6 +229,9 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::grpc::server::RevisionListAcceleration;
@@ -225,13 +247,37 @@ mod test {
         ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
     }
 
-    /// A legacy `UrcAuthApi`-shaped authorizer: reachability is answered
-    /// from the token's own embedded `resources` claim (see
-    /// `ReachabilityAuthorizer`), which is what `token_authorized_for`
-    /// tokens carry.
+    /// A legacy `UrcAuthApi`-shaped authorizer, for the two tests below that
+    /// exercise `link_read_authorizer`'s per-partition reachability check:
+    /// `legacy_resource_claim: true` makes `check_reachability`/
+    /// `check_reachability_sync` read the token's own embedded `resources`
+    /// claim locally (see `ReachabilityAuthorizer`), which is what
+    /// `token_authorized_for` tokens carry — exactly the legacy behavior
+    /// under test.
+    ///
+    /// `.authorizer` itself is `AllowAllRepositoryAuthorizer` rather than a
+    /// real `AuthClientAuthorizer`: with a real legacy deployment this field
+    /// would be `AuthClientAuthorizer`, which now also answers this
+    /// handler's new explicit primary-repository `read` check — an online
+    /// `CheckUserPermission` call unit tests cannot make. The primary `read`
+    /// check is not what these two tests are about (they are about the
+    /// *linked* repository's reachability), so it is stubbed to always
+    /// allow.
     fn legacy_reachability_authorizer() -> ReachabilityAuthorizer {
-        ReachabilityAuthorizer::new(Some("http://127.0.0.1:0".to_string()), None)
-            .expect("a legacy auth_url always constructs")
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(AllowAllRepositoryAuthorizer),
+            legacy_resource_claim: true,
+        }
+    }
+
+    /// A Tier 1 `ReachabilityAuthorizer` backed by `GlobalGrantsAuthorizer`
+    /// reading the `groups` claim, for the dedicated `read`-action tests
+    /// below.
+    fn groups_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            legacy_resource_claim: false,
+        }
     }
 
     fn make_request(
@@ -1639,6 +1685,87 @@ mod test {
             ));
             let err = items[1].as_ref().expect_err("expected error item");
             assert_eq!(err.code(), tonic::Code::NotFound);
+        }))
+        .await;
+    }
+
+    /// The new explicit `read` check on the primary requested repository —
+    /// separate from `link_read_authorizer`'s per-partition reachability
+    /// closure. A Tier 1 token holding `read` succeeds.
+    #[tokio::test]
+    async fn token_with_read_action_succeeds() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) =
+                push_branch_with_files(&repository_context, &["a.txt"]).await;
+
+            let mut request =
+                make_request(repository, Query::Signature(signature.into()), None, None);
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            handler(
+                request,
+                groups_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            .expect("token holding read must succeed");
+        }))
+        .await;
+    }
+
+    /// A Tier 1 token that is authenticated but does not hold `read` is
+    /// denied before any tree walk happens.
+    #[tokio::test]
+    async fn token_without_read_action_is_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("test stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch, signature) =
+                push_branch_with_files(&repository_context, &["a.txt"]).await;
+
+            let mut request =
+                make_request(repository, Query::Signature(signature.into()), None, None);
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["push".to_string()]),
+                ..Default::default()
+            });
+
+            let err = match handler(
+                request,
+                groups_reachability_authorizer(),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+            )
+            .await
+            {
+                Ok(_) => panic!("token lacking read must be denied"),
+                Err(err) => err,
+            };
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
         }))
         .await;
     }

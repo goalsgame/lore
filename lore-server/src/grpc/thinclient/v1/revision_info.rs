@@ -23,10 +23,16 @@ use tracing::debug;
 use tracing::warn;
 
 use super::helpers::resolve_signature;
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -44,8 +50,19 @@ pub async fn handler(
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionInfoResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
+    let token = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
+    let verified_token = token
+        .as_ref()
+        .map(|claims| VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims));
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| no_repository_access_status())?;
+
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner();
@@ -297,10 +314,26 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::grpc::server::RevisionListAcceleration;
     use crate::store::test_store_create;
+
+    /// None of these tests care about authorization beyond the dedicated
+    /// `read`-action tests below, so they all use an authorizer that
+    /// permits everything.
+    fn no_auth_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    /// A Tier 1 authorizer reading the `groups` claim (the Dex convention),
+    /// matching a real Tier 1 (FoxIDs/OIDC) token's shape.
+    fn groups_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())))
+    }
 
     fn make_request(repository: RepositoryId, query: Query) -> Request<RevisionInfoRequest> {
         let mut request = Request::new(RevisionInfoRequest { query: Some(query) });
@@ -308,6 +341,22 @@ mod test {
             REPOSITORY_ID_KEY,
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
+        request
+    }
+
+    /// Same as `make_request`, but with an `AuthorizationToken` carrying
+    /// `groups` inserted into the request extensions, as the JWT
+    /// interceptor would for an authenticated caller.
+    fn make_request_with_groups(
+        repository: RepositoryId,
+        query: Query,
+        groups: Vec<String>,
+    ) -> Request<RevisionInfoRequest> {
+        let mut request = make_request(repository, query);
+        request.extensions_mut().insert(AuthorizationToken {
+            groups: Some(groups),
+            ..Default::default()
+        });
         request
     }
 
@@ -392,6 +441,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect_err("unset query should fail");
@@ -426,6 +476,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -464,6 +515,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -499,6 +551,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -565,6 +618,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -658,6 +712,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -691,6 +746,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect_err("unknown signature should fail");
@@ -719,6 +775,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect_err("unknown branch should fail");
@@ -750,6 +807,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect_err("unknown branch should fail");
@@ -780,6 +838,7 @@ mod test {
                 mutable_store,
                 DEFAULT_HISTORY_STEP_SIZE,
                 RevisionListAcceleration::default(),
+                no_auth_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -805,6 +864,78 @@ mod test {
                 branch_id: branch_id.into(),
                 number: 0,
             };
+        }))
+        .await;
+    }
+
+    /// A Tier 1 token that holds the `read` action succeeds.
+    #[tokio::test]
+    async fn token_with_read_action_succeeds() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch_id, signatures) = create_branch_with_history(&repository_context, 1).await;
+
+            let response = handler(
+                make_request_with_groups(
+                    repository,
+                    Query::Signature(signatures[0].into()),
+                    vec!["read".to_string()],
+                ),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+                groups_authorizer(),
+            )
+            .await
+            .expect("token holding read must succeed")
+            .into_inner();
+
+            let revision = response.revision.expect("revision");
+            assert_eq!(Hash::from(revision.signature.as_ref()), signatures[0]);
+        }))
+        .await;
+    }
+
+    /// A Tier 1 token that does not hold the `read` action is denied, even
+    /// though it is authenticated.
+    #[tokio::test]
+    async fn token_without_read_action_is_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let (_branch_id, signatures) = create_branch_with_history(&repository_context, 1).await;
+
+            let err = handler(
+                make_request_with_groups(
+                    repository,
+                    Query::Signature(signatures[0].into()),
+                    vec!["push".to_string()],
+                ),
+                immutable_store,
+                mutable_store,
+                DEFAULT_HISTORY_STEP_SIZE,
+                RevisionListAcceleration::default(),
+                groups_authorizer(),
+            )
+            .await
+            .expect_err("token lacking read must be denied");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
         }))
         .await;
     }

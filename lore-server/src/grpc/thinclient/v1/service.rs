@@ -118,6 +118,7 @@ impl ThinClientService for LoreThinClientV1Service {
                 self.mutable_store.clone(),
                 self.history_step_size,
                 self.acceleration,
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
