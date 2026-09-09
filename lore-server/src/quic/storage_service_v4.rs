@@ -21,6 +21,7 @@ use tracing::debug;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::resolve_baseline_actions;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -239,24 +240,24 @@ impl QuicService for StorageServiceV4 {
                     // caller who is reachable at all under a legacy
                     // deployment holds both; a caller who holds neither was
                     // never reachable either way.
-                    holds_read = self
-                        .repository_authorizer
-                        .check_repository_access(
-                            Some(&verified_token),
-                            repository,
-                            Some(crate::authnz::repository_authorizer::READ_ACTION),
-                        )
-                        .await
-                        .is_ok();
-                    holds_push = self
-                        .repository_authorizer
-                        .check_repository_access(
-                            Some(&verified_token),
-                            repository,
-                            Some(crate::authnz::repository_authorizer::PUSH_ACTION),
-                        )
-                        .await
-                        .is_ok();
+                    // Two independent calls against the configured
+                    // authorizer, each of which can fail on its own (most
+                    // notably `AuthClientAuthorizer`'s online call timing
+                    // out or erroring) rather than answering "denied" —
+                    // `resolve_baseline_actions` keeps that distinguishable
+                    // rather than folding it into "holds neither", which
+                    // would otherwise get cached on the session for this
+                    // session's entire lifetime.
+                    (holds_read, holds_push) = resolve_baseline_actions(
+                        self.repository_authorizer.as_ref(),
+                        &verified_token,
+                        repository,
+                    )
+                    .await
+                    .map_err(|status| {
+                        tracing::warn!("Failed to resolve read/push actions: {status}");
+                        MessageHandleError::InternalError
+                    })?;
 
                     if !holds_read && !holds_push {
                         return Err(MessageHandleError::AuthorizationFailure(
@@ -755,81 +756,89 @@ mod tests {
     /// reachability once and every subsequent `StorageCommand` on the
     /// session went unchecked: a per-command `read`/`push` gate against
     /// the flags cached on the session at authorize time.
-    mod baseline_action_gating {
-        use std::ops::Add;
-        use std::time::Duration;
-        use std::time::SystemTime;
-        use std::time::UNIX_EPOCH;
+    // Shared JWT test fixtures: used by both `baseline_action_gating` (session
+    // gating, valid tokens) and `authorize_start_infra_failures` (the
+    // error-collapsing regression, below) — kept at this level, not inside
+    // either, so neither module has to duplicate them.
+    use std::ops::Add;
+    use std::time::Duration;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
 
-        use async_trait::async_trait;
-        use jsonwebtoken::Algorithm;
-        use jsonwebtoken::DecodingKey;
-        use jsonwebtoken::EncodingKey;
-        use jsonwebtoken::Header;
-        use jsonwebtoken::encode;
+    use jsonwebtoken::Algorithm;
+    use jsonwebtoken::DecodingKey;
+    use jsonwebtoken::EncodingKey;
+    use jsonwebtoken::Header;
+    use jsonwebtoken::encode;
+
+    use crate::auth::jwk::JWKService;
+    use crate::auth::jwk::JWKServiceError;
+    use crate::auth::jwt::AuthorizationToken;
+
+    const TEST_ALGORITHM: Algorithm = Algorithm::HS256;
+    const TEST_SIGNING_SECRET: &str = "storage-v4-baseline-action-test-secret";
+    const TEST_AUDIENCE: &str = "lore-test";
+
+    mockall::mock! {
+        TestJWKService {}
+
+        #[async_trait]
+        impl JWKService for TestJWKService {
+            async fn get_key(
+                &self,
+                kid: &str,
+            ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+            fn get_cached_key(
+                &self,
+                kid: &str,
+            ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+            async fn refresh_key(
+                &self,
+                kid: &str,
+            ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
+        }
+    }
+
+    fn make_jwt(groups: Vec<String>) -> Vec<u8> {
+        let claims = AuthorizationToken {
+            user_id: "test-user".to_string(),
+            issuer: "test-issuer".to_string(),
+            issued_at: 1,
+            expires: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .add(Duration::from_secs(60))
+                .as_secs(),
+            audience: vec![TEST_AUDIENCE.to_string()],
+            groups: Some(groups),
+            ..Default::default()
+        };
+        let key = EncodingKey::from_secret(TEST_SIGNING_SECRET.as_ref());
+        let mut header = Header::new(TEST_ALGORITHM);
+        header.kid = Some("test-kid".to_string());
+        encode(&header, &claims, &key).unwrap().into_bytes()
+    }
+
+    mod baseline_action_gating {
         use lore_transport::quic::storage_service::Command;
 
         use super::*;
-        use crate::auth::jwk::JWKService;
-        use crate::auth::jwk::JWKServiceError;
-        use crate::auth::jwt::AuthorizationToken;
         use crate::auth::jwt::JwtVerifier;
         use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
-
-        const ALGORITHM: Algorithm = Algorithm::HS256;
-        const SIGNING_SECRET: &str = "storage-v4-baseline-action-test-secret";
-        const TEST_AUDIENCE: &str = "lore-test";
-
-        mockall::mock! {
-            TestJWKService {}
-
-            #[async_trait]
-            impl JWKService for TestJWKService {
-                async fn get_key(
-                    &self,
-                    kid: &str,
-                ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
-
-                fn get_cached_key(
-                    &self,
-                    kid: &str,
-                ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
-
-                async fn refresh_key(
-                    &self,
-                    kid: &str,
-                ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
-            }
-        }
-
-        fn make_jwt(groups: Vec<String>) -> Vec<u8> {
-            let claims = AuthorizationToken {
-                user_id: "test-user".to_string(),
-                issuer: "test-issuer".to_string(),
-                issued_at: 1,
-                expires: SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .add(Duration::from_secs(60))
-                    .as_secs(),
-                audience: vec![TEST_AUDIENCE.to_string()],
-                groups: Some(groups),
-                ..Default::default()
-            };
-            let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
-            let mut header = Header::new(ALGORITHM);
-            header.kid = Some("test-kid".to_string());
-            encode(&header, &claims, &key).unwrap().into_bytes()
-        }
 
         fn make_tier1_service(
             immutable_store: Arc<dyn lore_storage::ImmutableStore>,
             mutable_store: Arc<dyn lore_storage::MutableStore>,
         ) -> StorageServiceV4 {
             let mut jwk_service = MockTestJWKService::new();
-            jwk_service
-                .expect_get_key()
-                .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
+            jwk_service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(TEST_SIGNING_SECRET.as_ref()),
+                    TEST_ALGORITHM,
+                ))
+            });
             let verifier = JwtVerifier {
                 jwk_service: Arc::new(jwk_service),
                 jwt_issuer: None,
@@ -963,6 +972,95 @@ mod tests {
                 .await
                 .expect_err("a read-only session must be denied a push command");
             assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+        }
+    }
+
+    /// Regression for the error-collapsing bug: `AuthorizeStart` resolves
+    /// `read` and `push` as two independent authorizer calls. A failure of
+    /// one of those calls (e.g. a legacy `AuthClientAuthorizer` deployment's
+    /// online check timing out) must surface as a real error, not get
+    /// silently folded into "does not hold this action" and cached on the
+    /// session as such for its entire lifetime.
+    mod authorize_start_infra_failures {
+        use tonic::Status;
+
+        use super::*;
+        use crate::authnz::repository_authorizer::PUSH_ACTION;
+        use crate::authnz::repository_authorizer::VerifiedToken;
+
+        /// Answers `read` normally but fails `push` with an infrastructure
+        /// error, simulating an online authorizer whose call for one of the
+        /// two actions errors or times out while the other succeeds.
+        struct FlakyPushAuthorizer;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for FlakyPushAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository: lore_revision::lore::RepositoryId,
+                action: Option<&str>,
+            ) -> Result<(), Status> {
+                if action == Some(PUSH_ACTION) {
+                    Err(Status::internal("simulated auth service timeout"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn make_flaky_push_service(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> StorageServiceV4 {
+            let mut jwk_service = MockTestJWKService::new();
+            jwk_service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(TEST_SIGNING_SECRET.as_ref()),
+                    TEST_ALGORITHM,
+                ))
+            });
+            let verifier = crate::auth::jwt::JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            };
+            StorageServiceV4::new(
+                Arc::new(Some(verifier)),
+                Arc::new(FlakyPushAuthorizer),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+            )
+        }
+
+        #[tokio::test]
+        async fn authorize_start_surfaces_infra_failure_instead_of_read_only_fallback() {
+            let (immutable_store, mutable_store, _exec) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = make_flaky_push_service(immutable_store, mutable_store);
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository: random(),
+                        correlation_id: "corr".into(),
+                        auth_token: make_jwt(vec![]),
+                    },
+                )
+                .await
+                .expect_err("a failed push check must not be silently treated as 'push not held'");
+
+            // Must be a real, distinguishable failure — never the same
+            // `AuthorizationFailure` a genuine denial produces, which would
+            // be indistinguishable from "this caller holds neither action"
+            // and would pin the session read-only for its entire lifetime.
+            assert!(
+                matches!(err, MessageHandleError::InternalError),
+                "expected InternalError for a failed check, got {err:?}"
+            );
         }
     }
 }

@@ -484,6 +484,70 @@ impl ReachabilityAuthorizer {
     }
 }
 
+/// Distinguishes a genuine "denied" answer from a failure of the check
+/// itself.
+///
+/// Every [`RepositoryAuthorizer`] implementation returns
+/// [`Code::PermissionDenied`] or [`Code::Unauthenticated`] for an actual
+/// "no" (see each impl's `check_repository_access` above) and anything else
+/// — [`AuthClientAuthorizer`]'s `Status::internal` for a failed or timed-out
+/// online call, most notably — for a failure of the check itself, not an
+/// answer to the question asked. Callers that resolve `read` and `push` as
+/// two independent calls and cache the pair for a connection or session's
+/// entire lifetime (`Connect::handle_auth`, `StorageServiceV4`'s
+/// `AuthorizeStart`) must not fold the latter into "not held": doing so
+/// pins the connection to whatever the other, unaffected call happened to
+/// answer, indistinguishable from a real, deliberate denial, for as long as
+/// the cached value lives. Propagating the failure as `Err` instead lets
+/// the caller surface it as the infrastructure problem it is.
+pub(crate) fn action_held(result: Result<(), Status>) -> Result<bool, Status> {
+    match result {
+        Ok(()) => Ok(true),
+        Err(status)
+            if matches!(
+                status.code(),
+                Code::PermissionDenied | Code::Unauthenticated
+            ) =>
+        {
+            Ok(false)
+        }
+        Err(status) => Err(status),
+    }
+}
+
+/// Resolves whether `token` holds the `read` and `push` baseline actions on
+/// `repository` against `authorizer` as two independent calls, applying
+/// [`action_held`] to each so a failure of either check propagates as `Err`
+/// rather than being silently folded into "not held" — see its doc comment.
+///
+/// Shared by the two once-per-connection/session sites that resolve both
+/// actions up front and cache the pair for the connection or session's
+/// entire lifetime: `Connect::handle_auth` (legacy `urc/0.2` QUIC) and
+/// `StorageServiceV4`'s `AuthorizeStart` (v4 QUIC). Both go through
+/// `authorizer` directly rather than [`ReachabilityAuthorizer`]'s
+/// legacy-degrading `check_read`/`check_push`: this runs once per
+/// connection or session, not per fragment, so it can afford
+/// [`AuthClientAuthorizer`]'s online call at the granularity that
+/// authorizer was built for, rather than the local approximation the
+/// per-fragment `Copy` checks use.
+pub(crate) async fn resolve_baseline_actions(
+    authorizer: &dyn RepositoryAuthorizer,
+    token: &VerifiedToken<'_>,
+    repository: RepositoryId,
+) -> Result<(bool, bool), Status> {
+    let holds_read = action_held(
+        authorizer
+            .check_repository_access(Some(token), repository, Some(READ_ACTION))
+            .await,
+    )?;
+    let holds_push = action_held(
+        authorizer
+            .check_repository_access(Some(token), repository, Some(PUSH_ACTION))
+            .await,
+    )?;
+    Ok((holds_read, holds_push))
+}
+
 #[cfg(test)]
 mod tests {
     use lore_base::types::Context;

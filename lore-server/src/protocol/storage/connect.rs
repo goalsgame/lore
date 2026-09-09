@@ -12,6 +12,7 @@ use tracing::warn;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::authnz::repository_authorizer::resolve_baseline_actions;
 use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::messages::ConnectionAuthorization;
@@ -102,24 +103,24 @@ impl Message for Connect {
                     // the cached result on every subsequent request on this
                     // connection instead of asking again.
                     let verified_token = VerifiedToken::new(auth_token, &authorization);
-                    let holds_read = reachability_authorizer
-                        .authorizer
-                        .check_repository_access(
-                            Some(&verified_token),
-                            self.repository,
-                            Some(crate::authnz::repository_authorizer::READ_ACTION),
-                        )
-                        .await
-                        .is_ok();
-                    let holds_push = reachability_authorizer
-                        .authorizer
-                        .check_repository_access(
-                            Some(&verified_token),
-                            self.repository,
-                            Some(crate::authnz::repository_authorizer::PUSH_ACTION),
-                        )
-                        .await
-                        .is_ok();
+                    // Two independent calls against the configured
+                    // authorizer, each of which can fail on its own (most
+                    // notably `AuthClientAuthorizer`'s online call timing
+                    // out or erroring) rather than answering "denied" —
+                    // `resolve_baseline_actions` keeps that distinguishable
+                    // rather than folding it into "holds neither", which
+                    // would otherwise get cached on `ConnectionAuthorization`
+                    // for this connection's entire lifetime.
+                    let (holds_read, holds_push) = resolve_baseline_actions(
+                        reachability_authorizer.authorizer.as_ref(),
+                        &verified_token,
+                        self.repository,
+                    )
+                    .await
+                    .map_err(|status| {
+                        warn!("Failed to resolve read/push actions: {status}");
+                        MessageHandleError::InternalError
+                    })?;
                     if !holds_read && !holds_push {
                         return Err(MessageHandleError::AuthorizationFailure(
                             "caller holds neither read nor push".to_string(),
@@ -191,6 +192,145 @@ mod tests {
     /// `Arc::new(None)` for `jwt_verifier`.
     fn no_auth_reachability() -> ReachabilityAuthorizer {
         ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
+
+    /// Regression for the error-collapsing bug: `Connect::handle_auth`
+    /// resolves `read` and `push` as two independent calls against the
+    /// configured authorizer. A failure of one of those calls (e.g. a
+    /// legacy `AuthClientAuthorizer` deployment's online check timing out)
+    /// must surface as a real error, not get silently folded into "does not
+    /// hold this action" and cached on `ConnectionAuthorization` for the
+    /// connection's entire lifetime.
+    mod authorize_infra_failures {
+        use std::ops::Add;
+        use std::time::Duration;
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
+
+        use async_trait::async_trait;
+        use jsonwebtoken::Algorithm;
+        use jsonwebtoken::DecodingKey;
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use jsonwebtoken::encode;
+        use tonic::Status;
+
+        use super::*;
+        use crate::auth::jwk::JWKService;
+        use crate::auth::jwk::JWKServiceError;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::JwtVerifier;
+        use crate::authnz::repository_authorizer::PUSH_ACTION;
+        use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+
+        const ALGORITHM: Algorithm = Algorithm::HS256;
+        const SIGNING_SECRET: &str = "connect-infra-failure-test-secret";
+        const AUDIENCE: &str = "lore-test";
+
+        mockall::mock! {
+            TestJWKService {}
+
+            #[async_trait]
+            impl JWKService for TestJWKService {
+                async fn get_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+                fn get_cached_key(
+                    &self,
+                    kid: &str,
+                ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+                async fn refresh_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
+            }
+        }
+
+        fn make_jwt() -> String {
+            let claims = AuthorizationToken {
+                user_id: "test-user".to_string(),
+                issuer: "test-issuer".to_string(),
+                issued_at: 1,
+                expires: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(60))
+                    .as_secs(),
+                audience: vec![AUDIENCE.to_string()],
+                ..Default::default()
+            };
+            let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
+            let mut header = Header::new(ALGORITHM);
+            header.kid = Some("test-kid".to_string());
+            encode(&header, &claims, &key).unwrap()
+        }
+
+        fn jwt_verifier() -> Arc<Option<JwtVerifier>> {
+            let mut jwk_service = MockTestJWKService::new();
+            jwk_service
+                .expect_get_key()
+                .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
+            Arc::new(Some(JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![AUDIENCE.to_string()]),
+            }))
+        }
+
+        /// Answers `read` normally but fails `push` with an infrastructure
+        /// error, simulating an online authorizer whose call for one of the
+        /// two actions errors or times out while the other succeeds.
+        struct FlakyPushAuthorizer;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for FlakyPushAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository: RepositoryId,
+                action: Option<&str>,
+            ) -> Result<(), Status> {
+                if action == Some(PUSH_ACTION) {
+                    Err(Status::internal("simulated auth service timeout"))
+                } else {
+                    Ok(())
+                }
+            }
+        }
+
+        fn flaky_push_reachability() -> ReachabilityAuthorizer {
+            ReachabilityAuthorizer {
+                authorizer: Arc::new(FlakyPushAuthorizer),
+                legacy_resource_claim: false,
+            }
+        }
+
+        #[tokio::test]
+        async fn handle_auth_surfaces_infra_failure_instead_of_read_only_fallback() {
+            let message = Connect {
+                repository: random::<RepositoryId>(),
+                auth_token: Some(make_jwt()),
+            };
+            let context = Arc::new(AttributeMap::default());
+
+            let err = message
+                .handle_auth(context, jwt_verifier(), flaky_push_reachability())
+                .await
+                .expect_err("a failed push check must not be silently treated as 'push not held'");
+
+            // Must be a real, distinguishable failure — never the same
+            // `AuthorizationFailure` a genuine denial produces, which would
+            // be indistinguishable from "this caller holds neither action"
+            // and would pin the connection read-only for its entire
+            // lifetime.
+            assert!(
+                matches!(err, MessageHandleError::InternalError),
+                "expected InternalError for a failed check, got {err:?}"
+            );
+        }
     }
 
     #[test]
