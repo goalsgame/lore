@@ -43,8 +43,8 @@ use tracing::instrument;
 use tracing::span;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::cache::revision::store_history_step;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
@@ -105,6 +105,19 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository = get_repository(request.metadata())?;
 
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = user_info.as_ref().ok().cloned();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+
+    // Baseline `push` requirement (closing the Tier 1 gap where any
+    // authenticated caller could push with no group membership at all).
+    // Stacks with `push-protected` below rather than substituting for it: a
+    // push to a protected branch needs both.
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     // Replaces the `is_service_account` bypass (LEP
     // 2026-08-20-oidc-oauth2-authentication, D4): a push to a protected
     // branch now succeeds only when the caller explicitly holds
@@ -113,21 +126,17 @@ pub async fn handler(
     // legacy service-account claim. Preserves the existing shape exactly:
     // an unauthenticated caller (`user_info` absent, meaning no verifier is
     // configured at all) never bypasses protection, the same as today.
-    let authorization = extract_authorization_header(&request);
-    let bypass_protection = match user_info.as_ref() {
-        Ok(claims) => {
-            let raw = authorization.as_deref().unwrap_or_default();
-            let verified_token = VerifiedToken::new(raw, claims);
-            repository_authorizer
-                .check_repository_access(
-                    Some(&verified_token),
-                    repository,
-                    Some(PUSH_PROTECTED_ACTION),
-                )
-                .await
-                .is_ok()
-        }
-        Err(_) => false,
+    let bypass_protection = if verified_token.is_some() {
+        repository_authorizer
+            .check_repository_access(
+                verified_token.as_ref(),
+                repository,
+                Some(PUSH_PROTECTED_ACTION),
+            )
+            .await
+            .is_ok()
+    } else {
+        false
     };
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip_addr| ip_addr.to_string());
@@ -878,6 +887,8 @@ mod tests {
     use lore_revision::node::Node;
     use lore_revision::node::NodeFlags;
     use lore_revision::node::ROOT_NODE;
+    use lore_transport::grpc::REPOSITORY_ID_KEY;
+    use opentelemetry::KeyValue;
     use rand::random;
     use tonic::Code;
     use tonic::Request;
@@ -885,8 +896,52 @@ mod tests {
     use tonic::transport::server::TcpConnectInfo;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::grpc::server::RevisionListAcceleration;
+    use crate::hooks::HookDispatcher;
+    use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
+
+    struct TestInstrumentProvider {}
+
+    impl InstrumentProvider for TestInstrumentProvider {
+        fn namespace(&self) -> &'static str {
+            "test"
+        }
+        fn labels(&self) -> &[KeyValue] {
+            &[]
+        }
+    }
+
+    fn make_push_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+        roles: &[&str],
+    ) -> Request<BranchPushRequest> {
+        let mut request = Request::new(BranchPushRequest {
+            branch: branch.into(),
+            revision: revision.into(),
+            force: false,
+            fast_forward_merge: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+        let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
+            unreachable!()
+        };
+        request
+            .extensions_mut()
+            .insert(crate::auth::jwt::AuthorizationToken {
+                user_id: "ci-bot".into(),
+                extra,
+                ..crate::auth::jwt::AuthorizationToken::default()
+            });
+        request
+    }
 
     async fn create_test_branch(repository: &Arc<RepositoryContext>) -> BranchId {
         let branch_id = BranchId::from(uuid::Uuid::now_v7());
@@ -1482,6 +1537,162 @@ mod tests {
                 // Segment 400 holds the new head, and 500 was never reached.
                 assert_eq!(load_step_key(&repository, branch, 400).await, None);
                 assert_eq!(load_step_key(&repository, branch, 500).await, None);
+            }))
+            .await;
+        }
+    }
+
+    mod handler_authorization {
+        use super::*;
+
+        fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(AllowAllRepositoryAuthorizer)
+        }
+
+        fn roles_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string())))
+        }
+
+        /// Baseline `push` is required to reach `handler()` at all, closing
+        /// the Tier 1 gap where any authenticated caller could push with no
+        /// group membership.
+        #[tokio::test]
+        async fn denies_caller_without_push_action() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let notification = Arc::new(MockNotificationSender::new());
+            let hook_dispatcher = HookDispatcher::empty();
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let branch = create_test_branch(&repository_context).await;
+                let revision = serialize_revision(
+                    &repository_context,
+                    branch,
+                    Hash::default(),
+                    Hash::default(),
+                    1,
+                )
+                .await
+                .revision();
+
+                let err = handler(
+                    make_push_request(repository, branch, revision, &["read"]),
+                    immutable_store,
+                    mutable_store,
+                    notification,
+                    &hook_dispatcher,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                    roles_authorizer(),
+                    &instrument_provider,
+                )
+                .await
+                .expect_err("a caller without push must be denied");
+                assert_eq!(err.code(), Code::PermissionDenied);
+            }))
+            .await;
+        }
+
+        /// A caller holding `push` reaches the ordinary push path.
+        #[tokio::test]
+        async fn allows_caller_with_push_action() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let mut notification = MockNotificationSender::new();
+            notification
+                .expect_branch_pushed()
+                .return_once(|_, _, _, _, _| ());
+            let notification = Arc::new(notification);
+            let hook_dispatcher = HookDispatcher::empty();
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let branch = create_test_branch(&repository_context).await;
+                let revision = serialize_revision(
+                    &repository_context,
+                    branch,
+                    Hash::default(),
+                    Hash::default(),
+                    1,
+                )
+                .await
+                .revision();
+
+                handler(
+                    make_push_request(repository, branch, revision, &["push"]),
+                    immutable_store,
+                    mutable_store,
+                    notification,
+                    &hook_dispatcher,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                    roles_authorizer(),
+                    &instrument_provider,
+                )
+                .await
+                .expect("a caller holding push should be allowed to push");
+            }))
+            .await;
+        }
+
+        /// With no `[server.auth]` configured, `AllowAllRepositoryAuthorizer`
+        /// keeps a local server able to push exactly as it does today.
+        #[tokio::test]
+        async fn allows_with_no_authorizer_configured() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let mut notification = MockNotificationSender::new();
+            notification
+                .expect_branch_pushed()
+                .return_once(|_, _, _, _, _| ());
+            let notification = Arc::new(notification);
+            let hook_dispatcher = HookDispatcher::empty();
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                let branch = create_test_branch(&repository_context).await;
+                let revision = serialize_revision(
+                    &repository_context,
+                    branch,
+                    Hash::default(),
+                    Hash::default(),
+                    1,
+                )
+                .await
+                .revision();
+
+                handler(
+                    make_push_request(repository, branch, revision, &[]),
+                    immutable_store,
+                    mutable_store,
+                    notification,
+                    &hook_dispatcher,
+                    DEFAULT_HISTORY_STEP_SIZE,
+                    RevisionListAcceleration::default(),
+                    allow_all_authorizer(),
+                    &instrument_provider,
+                )
+                .await
+                .expect("AllowAllRepositoryAuthorizer keeps local pushes working");
             }))
             .await;
         }

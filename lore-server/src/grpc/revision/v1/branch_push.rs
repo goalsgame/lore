@@ -25,8 +25,8 @@ use tracing::debug;
 use tracing::info;
 use tracing::span;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -79,26 +79,35 @@ pub async fn handler(
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let repository_id = get_repository(request.metadata())?;
 
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = user_info.as_ref().ok().cloned();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+
+    // Baseline `push` requirement (closing the Tier 1 gap where any
+    // authenticated caller could push with no group membership at all).
+    // Stacks with `push-protected` below rather than substituting for it: a
+    // push to a protected branch needs both.
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     // Replaces the `is_service_account` bypass (LEP
     // 2026-08-20-oidc-oauth2-authentication, D4) with an explicit
     // `push-protected` action check — see `grpc::handlers::branch_push` for
     // the shared rationale. An unauthenticated caller never bypasses
     // protection, matching the previous shape exactly.
-    let authorization = extract_authorization_header(&request);
-    let bypass_protection = match user_info.as_ref() {
-        Ok(claims) => {
-            let raw = authorization.as_deref().unwrap_or_default();
-            let verified_token = VerifiedToken::new(raw, claims);
-            repository_authorizer
-                .check_repository_access(
-                    Some(&verified_token),
-                    repository_id,
-                    Some(PUSH_PROTECTED_ACTION),
-                )
-                .await
-                .is_ok()
-        }
-        Err(_) => false,
+    let bypass_protection = if verified_token.is_some() {
+        repository_authorizer
+            .check_repository_access(
+                verified_token.as_ref(),
+                repository_id,
+                Some(PUSH_PROTECTED_ACTION),
+            )
+            .await
+            .is_ok()
+    } else {
+        false
     };
 
     let client_ip: Option<String> = extract_client_ip(&request).map(|ip| ip.to_string());
@@ -473,17 +482,46 @@ mod test {
         request
     }
 
-    /// A request whose token's `roles` claim names `push-protected`, for
-    /// use with `push_protected_authorizer` — the Tier 1 replacement for
-    /// the old `is_service_account` bypass.
+    /// A request whose token's `roles` claim names only `push-protected`,
+    /// without the baseline `push` action — for the test asserting that
+    /// `push-protected` alone is no longer sufficient.
     fn make_push_protected_request(
         repository: RepositoryId,
         branch: BranchId,
         revision: Hash,
     ) -> Request<BranchPushRequest> {
+        make_request_with_roles(repository, branch, revision, &["push-protected"])
+    }
+
+    /// A request whose token's `roles` claim names only the baseline `push`
+    /// action, without `push-protected`.
+    fn make_push_only_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+    ) -> Request<BranchPushRequest> {
+        make_request_with_roles(repository, branch, revision, &["push"])
+    }
+
+    /// A request whose token's `roles` claim names both `push` and
+    /// `push-protected` — the Tier 1 replacement for the old
+    /// `is_service_account` bypass, now requiring both actions stacked.
+    fn make_push_and_push_protected_request(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+    ) -> Request<BranchPushRequest> {
+        make_request_with_roles(repository, branch, revision, &["push", "push-protected"])
+    }
+
+    fn make_request_with_roles(
+        repository: RepositoryId,
+        branch: BranchId,
+        revision: Hash,
+        roles: &[&str],
+    ) -> Request<BranchPushRequest> {
         let mut request = make_request(repository, branch, revision, false, false);
-        let serde_json::Value::Object(extra) = serde_json::json!({ "roles": ["push-protected"] })
-        else {
+        let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
             unreachable!()
         };
         request
@@ -761,11 +799,13 @@ mod test {
         .await;
     }
 
-    /// An authenticated caller whose token does not hold `push-protected`
-    /// stays subject to branch protection, even though the configured
-    /// authorizer is consulted this time (`make_request` alone carries no
-    /// token, so the previous test exercises the "not even authenticated"
-    /// path — this one exercises "authenticated but lacking the action").
+    /// An authenticated caller whose token holds no roles at all is now
+    /// denied at the baseline `push` gate, before branch protection is even
+    /// considered — closing the Tier 1 gap where any authenticated caller
+    /// could push with no group membership at all (`make_request` alone
+    /// carries no token, so the earlier `push_to_protected_branch_...` test
+    /// exercises the "not even authenticated" path — this one exercises
+    /// "authenticated but holding no actions").
     #[tokio::test]
     async fn authenticated_caller_without_push_protected_stays_denied() {
         let repository = random::<RepositoryId>();
@@ -801,8 +841,174 @@ mod test {
                 &instrument_provider,
             )
             .await
-            .expect_err("a token with no push-protected role stays protected");
+            .expect_err("a token with no roles at all stays denied");
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    /// A caller holding `push` but not `push-protected` stays subject to
+    /// branch protection: `push` alone is not enough to bypass the
+    /// `PROTECT` flag, only to reach the ordinary push path at all.
+    #[tokio::test]
+    async fn caller_holding_push_without_push_protected_stays_denied_on_protected_branch() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            branch::protect(repository_context.clone(), main)
+                .await
+                .expect("should protect");
+
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                make_push_only_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("push alone does not bypass branch protection");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    /// A caller holding `push-protected` but not the baseline `push` action
+    /// is denied outright, even on an unprotected branch: `push-protected`
+    /// stacks on top of `push` rather than substituting for it.
+    #[tokio::test]
+    async fn push_protected_alone_without_push_is_denied() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                make_push_protected_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("push-protected alone, without push, is not enough to push at all");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    /// An ordinary (unprotected) push is denied outright for a caller
+    /// holding no actions at all, closing the Tier 1 gap where any
+    /// authenticated caller could push with no group membership.
+    #[tokio::test]
+    async fn push_denies_caller_without_push_action() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let notification_sender = Arc::new(MockNotificationSender::new());
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            let err = handler(
+                make_authenticated_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
+                &instrument_provider,
+            )
+            .await
+            .expect_err("a caller without push must be denied even on an unprotected branch");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    /// A caller holding `push` (and nothing else) may push an ordinary,
+    /// unprotected branch.
+    #[tokio::test]
+    async fn push_allows_caller_with_push_action() {
+        let repository = random::<RepositoryId>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        let mut notification_sender = MockNotificationSender::new();
+        notification_sender
+            .expect_branch_pushed()
+            .return_once(|_, _, _, _, _| ());
+        let notification_sender = Arc::new(notification_sender);
+        let instrument_provider = TestInstrumentProvider {};
+
+        Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+            let repository_context = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository,
+            ));
+            let main = create_root_branch(&repository_context, "main").await;
+            let revision = build_revision(&repository_context, Hash::default(), 1).await;
+
+            let hook_dispatcher = HookDispatcher::empty();
+            handler(
+                make_push_only_request(repository, main, revision),
+                immutable_store.clone(),
+                mutable_store.clone(),
+                notification_sender.clone(),
+                &hook_dispatcher,
+                DEFAULT_HISTORY_STEP_SIZE,
+                crate::grpc::server::RevisionListAcceleration::default(),
+                push_protected_authorizer(),
+                &instrument_provider,
+            )
+            .await
+            .expect("a caller holding push may push an unprotected branch");
         }))
         .await;
     }
@@ -902,6 +1108,8 @@ mod test {
         .await;
     }
 
+    /// A caller holding both `push` and `push-protected` bypasses branch
+    /// protection — the two actions stack, so both must be held.
     #[tokio::test]
     async fn caller_holding_push_protected_bypasses_protection() {
         let repository = random::<RepositoryId>();
@@ -929,7 +1137,7 @@ mod test {
 
             let hook_dispatcher = HookDispatcher::empty();
             let response = handler(
-                make_push_protected_request(repository, main, revision),
+                make_push_and_push_protected_request(repository, main, revision),
                 immutable_store.clone(),
                 mutable_store.clone(),
                 notification_sender.clone(),
@@ -940,7 +1148,7 @@ mod test {
                 &instrument_provider,
             )
             .await
-            .expect("a caller holding push-protected should bypass protection");
+            .expect("a caller holding push and push-protected should bypass protection");
             assert_eq!(
                 response.into_inner().revision_signature,
                 bytes::Bytes::from(revision)
