@@ -64,6 +64,23 @@ pub struct JWTInterceptor {
     /// handlers regardless of this choice, since the interceptor has no way
     /// to know which action a request performs.
     ///
+    /// This was reopened when the baseline `read`/`push` actions were added
+    /// (closing the gap where plain reachability granted full read and push
+    /// access to any authenticated principal): could *those* checks move
+    /// here instead, since — unlike the six privileged actions above — they
+    /// gate nearly every request? No. `Interceptor::call` receives a
+    /// `tonic::Request<()>` that tonic builds by stripping the URI off the
+    /// underlying `http::Request` before invoking the interceptor and
+    /// splicing it back in afterward (see `InterceptedService::call` in
+    /// `tonic::service::interceptor`, upstream): `request.metadata()` holds
+    /// only ordinary headers, never the `:path` pseudo-header, and
+    /// `request.extensions()` never receives the URI either. So the
+    /// interceptor has no way to learn which RPC method is being called —
+    /// the same limitation that already keeps the six privileged actions in
+    /// handlers, just now load-bearing for nearly every request instead of
+    /// a handful of them. `read`/`push` are wired in per-handler instead,
+    /// the same way `obliterate`/`push-protected`/etc. already are.
+    ///
     /// [`RepositoryAuthorizer::check_repository_access`]: crate::authnz::repository_authorizer::RepositoryAuthorizer::check_repository_access
     reachability_authorizer: ReachabilityAuthorizer,
 }

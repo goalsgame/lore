@@ -18,6 +18,27 @@ use crate::auth::jwt::verify_authorization;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
 
+/// The baseline actions every partition-scoped read and write now requires
+/// on top of plain authentication, closing the Tier 1 gap where
+/// `check_repository_access(.., None)` — "reachability" — granted full read
+/// and push access to any authenticated principal with no group membership
+/// at all. These sit below the six pre-existing privileged actions
+/// (`obliterate`, `owner`/`admin`, `migrate`, `push-protected`, `presign`),
+/// which stay exactly as they are and stack on top of `push` where noted at
+/// their own call sites (see `PUSH_PROTECTED_ACTION`).
+///
+/// Unlike those six — each a rename of a permission string a legacy
+/// `UrcAuthApi` deployment's `resources` claim already granted for the
+/// equivalent privileged operation — `read` and `push` have no legacy
+/// equivalent: ordinary (non-privileged) access under `UrcAuthApi` has
+/// always been "listed among the allowed resources at all"
+/// (`AuthClientAuthorizer`'s `None` case), never gated behind a specific
+/// permission string. `AuthClientAuthorizer::check_repository_access`
+/// special-cases these two actions for exactly that reason — see its doc
+/// comment.
+pub(crate) const READ_ACTION: &str = "read";
+pub(crate) const PUSH_ACTION: &str = "push";
+
 /// A JWT the caller has already verified, carried both as the raw compact
 /// serialization and as decoded claims.
 ///
@@ -141,21 +162,31 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
             .find(|permission| permission.resource_id == resource_id)
             .ok_or(Status::internal("No permissions for resource"))?;
 
-        match action {
-            // Plain reachability: being listed among the allowed resources
-            // at all is enough, matching every pre-existing caller of this
-            // authorizer (which only ever asked this question).
-            None => Ok(()),
-            Some(action) => {
-                if matched.permission.iter().any(|held| held == action) {
-                    Ok(())
-                } else {
-                    Err(Status::permission_denied(format!(
-                        "caller does not hold the '{action}' action"
-                    )))
-                }
-            }
+        if resource_permission_satisfies(&matched.permission, action) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "caller does not hold the '{}' action",
+                action.unwrap_or("<reachability>")
+            )))
         }
+    }
+}
+
+/// Whether a resource's granted `permission` strings (from a legacy
+/// `UrcAuthApi` `CheckUserPermission` response) satisfy `action`.
+///
+/// `None` (plain reachability) and the two new baseline actions, `read` and
+/// `push`, all resolve the same way: being listed among the allowed
+/// resources at all is enough. That is deliberate for `read`/`push`, not an
+/// oversight — see their doc comment above. Every other action (the six
+/// pre-existing privileged ones) requires the literal permission string,
+/// matching every pre-existing caller of this authorizer.
+fn resource_permission_satisfies(permission: &[String], action: Option<&str>) -> bool {
+    match action {
+        None => true,
+        Some(READ_ACTION) | Some(PUSH_ACTION) => true,
+        Some(action) => permission.iter().any(|held| held == action),
     }
 }
 
@@ -630,6 +661,79 @@ mod tests {
                 .check_repository_access(Some(&token), other_repository, Some("obliterate"))
                 .await
                 .expect("Tier 1 grants are global, not scoped to a partition");
+        }
+
+        /// `read` and `push` are ordinary actions under Tier 1, not special
+        /// cases: a token must literally hold the claim value, exactly like
+        /// the six pre-existing actions. The legacy-only degrade lives
+        /// solely in `AuthClientAuthorizer` (see `resource_permission_satisfies`
+        /// tests below) — `GlobalGrantsAuthorizer` never sees it.
+        #[tokio::test]
+        async fn read_and_push_are_ordinary_actions_requiring_the_literal_claim() {
+            let claims = AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            };
+            let token = VerifiedToken::new("raw", &claims);
+            let authorizer = GlobalGrantsAuthorizer::new(Some("groups".to_string()));
+
+            authorizer
+                .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                .await
+                .expect("the claim names read");
+            let err = authorizer
+                .check_repository_access(Some(&token), repository(), Some(PUSH_ACTION))
+                .await
+                .expect_err("the claim does not name push");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+    }
+
+    mod auth_client_resource_permission {
+        use super::*;
+
+        /// Plain reachability (`None`) is satisfied by mere presence in the
+        /// allowed-resource list, regardless of what permission strings it
+        /// carries — unchanged from before `read`/`push` existed.
+        #[test]
+        fn reachability_is_satisfied_regardless_of_permission_strings() {
+            assert!(resource_permission_satisfies(&[], None));
+            assert!(resource_permission_satisfies(
+                &["unrelated".to_string()],
+                None
+            ));
+        }
+
+        /// `read` and `push` degrade to plain reachability for a legacy
+        /// `UrcAuthApi` deployment: being listed at all is enough, since
+        /// ordinary access there was never gated behind a specific
+        /// permission string (unlike the six pre-existing privileged
+        /// actions). This is what keeps a legacy deployment's existing
+        /// grants working unchanged once `read`/`push` checks start being
+        /// asked at every read/push call site.
+        #[test]
+        fn read_and_push_degrade_to_reachability_for_legacy_deployments() {
+            assert!(resource_permission_satisfies(&[], Some(READ_ACTION)));
+            assert!(resource_permission_satisfies(&[], Some(PUSH_ACTION)));
+            assert!(resource_permission_satisfies(
+                &["obliterate".to_string()],
+                Some(READ_ACTION)
+            ));
+        }
+
+        /// Every other action — the six pre-existing ones, and any future
+        /// one — still requires the literal permission string.
+        #[test]
+        fn other_actions_require_the_literal_permission_string() {
+            assert!(resource_permission_satisfies(
+                &["obliterate".to_string()],
+                Some("obliterate")
+            ));
+            assert!(!resource_permission_satisfies(&[], Some("obliterate")));
+            assert!(!resource_permission_satisfies(
+                &["read".to_string()],
+                Some("obliterate")
+            ));
         }
     }
 
