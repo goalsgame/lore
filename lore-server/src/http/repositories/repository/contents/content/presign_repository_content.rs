@@ -27,6 +27,7 @@ use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::http::extract_bearer_token;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -106,17 +107,6 @@ pub struct PresignRequest {
 pub struct PresignResponse {
     pub url_suffix: String,
     pub expires_at: u64,
-}
-
-/// The bearer token exactly as presented, without the `Bearer ` prefix.
-/// Needed only so a legacy `AuthClientAuthorizer` can forward it to the auth
-/// service; `jwt_axum_middleware` decodes it but does not retain the raw
-/// form, so it is re-extracted here from the same header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| header.strip_prefix("Bearer "))
 }
 
 /// Checks that the caller holds the `presign` action on `repository`

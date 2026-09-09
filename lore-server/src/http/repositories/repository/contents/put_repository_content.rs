@@ -27,6 +27,7 @@ use tracing::info;
 use crate::auth::jwt::AuthorizationToken;
 use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::VerifiedToken;
+use crate::http::extract_bearer_token;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -39,18 +40,6 @@ struct ResponseData {
 #[derive(Serialize)]
 struct ResponseSuccess {
     data: ResponseData,
-}
-
-/// The bearer token exactly as presented, without the `Bearer ` prefix.
-/// Needed only so a legacy `AuthClientAuthorizer` can forward it to the auth
-/// service; `jwt_axum_middleware` decodes it but does not retain the raw
-/// form, so it is re-extracted here from the same header (mirrors
-/// `presign_repository_content.rs::extract_bearer_token`).
-fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|header| header.strip_prefix("Bearer "))
 }
 
 /// Baseline `push` requirement (closing the Tier 1 gap where any
