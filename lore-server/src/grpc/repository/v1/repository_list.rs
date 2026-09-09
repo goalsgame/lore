@@ -49,6 +49,13 @@ type ListStream =
 /// handler's doc comment (`grpc/handlers/repository_list.rs`) for why:
 /// enumeration is answered by the separate `RepositoryDirectory` trait (LEP
 /// 2026-08-20-oidc-oauth2-authentication, D7), not `check_repository_access`.
+///
+/// Reconsidered, and deliberately left as-is, when the `read`/`push`
+/// baseline actions were introduced elsewhere: gating listing behind a
+/// grant would double-gate something intentionally designed as a separate,
+/// non-grant-based mechanism — a caller not being able to see a partition
+/// in the list is a different question from what they may do to it once
+/// they know its ID.
 #[tracing::instrument(name = "RepositoryList::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryListRequest>,

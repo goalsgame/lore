@@ -79,6 +79,7 @@ impl RepositoryService for LoreRepositoryService {
             repository_create::handler(
                 request,
                 self.auth_url(),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,

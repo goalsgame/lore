@@ -24,16 +24,22 @@ use tracing::warn;
 use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
+use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::repository_create::repository_create_auth_resource;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::none_or_status;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
@@ -50,19 +56,24 @@ use crate::util::setup_execution;
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRepositoryService`
 ///
-/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
-/// anywhere in its path — see the v0 handler's doc comment
-/// (`grpc/handlers/repository_create.rs`) for why: creation is a baseline
-/// capability per LEP 2026-08-20-oidc-oauth2-authentication, not an action
-/// gated behind an existing grant on the partition being created.
+/// Does *not* call `RepositoryAuthorizer::check_repository_access` for any
+/// owner/admin-tier (Tier 2) grant, but *does* call it (in
+/// `repository_create_implementation`, shared with the forwarded-received
+/// path) for the baseline `push` action — see the v0 handler's doc comment
+/// (`grpc/handlers/repository_create.rs`) for the full reasoning behind
+/// both halves: no Tier-2 grant can exist yet on a partition that does not
+/// exist yet (moot regardless, since Tier 2 is not implemented), while
+/// `push` is a *global* Tier-1 action with no such problem.
 #[tracing::instrument(
     name = "RepositoryCreate::v1::handle",
     skip_all,
     fields(requested_repo_id)
 )]
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
@@ -71,6 +82,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let claims = get_authorization(request.extensions()).ok();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
     let caller_context = CallerContext {
@@ -88,6 +100,8 @@ pub async fn handler(
         repository_create_implementation(
             req,
             caller_context,
+            claims,
+            repository_authorizer,
             auth_url,
             immutable_store,
             mutable_store,
@@ -119,9 +133,27 @@ async fn forward_repository_create(
 }
 
 /// This `RepositoryCreateRequest` should be fulfilled by this server.
+///
+/// Performs the `push` authorization check described on `handler`'s doc
+/// comment: this function is the one place shared by both the local
+/// (non-forwarded) path and the forwarded-received path
+/// (`forwarded_repository/v1/repository_create.rs::handler`), so the check
+/// lives here rather than being duplicated at each caller. `token` is the
+/// already-verified caller identity from whichever path invoked this: the
+/// local path's own request extensions, or the forwarded path's own
+/// verification of the raw forwarded bearer token. The repository checked
+/// is `caller_context.repository_id`, which — like `token` — is supplied
+/// identically by both callers; for `RepositoryCreate` this is always
+/// `RepositoryId::default()` (there is no pre-existing repository to name),
+/// which is immaterial to the outcome under Tier 1 and `AllowAll` since
+/// neither consults the repository parameter for a global action like
+/// `push`.
+#[allow(clippy::too_many_arguments)]
 pub async fn repository_create_implementation(
     req: RepositoryCreateRequest,
     caller_context: CallerContext,
+    token: Option<AuthorizationToken>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     auth_url: Option<String>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
@@ -131,6 +163,7 @@ pub async fn repository_create_implementation(
     let user_id = caller_context.user_id;
     let correlation_id = caller_context.correlation_id;
     let authorization = caller_context.authorization;
+    let repository_id_checked = caller_context.repository_id;
 
     let id: RepositoryId = Context::from(req.id).into();
     let name = req.name;
@@ -154,6 +187,18 @@ pub async fn repository_create_implementation(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let verified_token = token.as_ref().map(|claims| {
+                VerifiedToken::new(authorization.as_deref().unwrap_or_default(), claims)
+            });
+            repository_authorizer
+                .check_repository_access(
+                    verified_token.as_ref(),
+                    repository_id_checked,
+                    Some(PUSH_ACTION),
+                )
+                .await
+                .map_err(|_err| no_repository_access_status())?;
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)
                 .hook_point(HookPoint::RepositoryCreate)
@@ -472,6 +517,7 @@ mod tests {
         use tonic::Status;
 
         use super::super::*;
+        use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
         use crate::grpc::forwarded_requests::ForwardedRequestResult;
         use crate::grpc::forwarded_requests::ForwardedRequests;
         use crate::grpc::forwarded_requests::InternalClientError;
@@ -605,6 +651,7 @@ mod tests {
                 let response = handler(
                     make_request(repository_id, "test-repo"),
                     None, /* no auth */
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -640,6 +687,7 @@ mod tests {
                 let err = handler(
                     make_request(repository_id, "test-repo"),
                     None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -672,6 +720,7 @@ mod tests {
                 let err = handler(
                     make_request(repository_id, "test-repo"),
                     None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
@@ -705,6 +754,7 @@ mod tests {
                 let response = handler(
                     make_request(repository_id, "my-repo"),
                     None, /* no auth */
+                    Arc::new(AllowAllRepositoryAuthorizer),
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),

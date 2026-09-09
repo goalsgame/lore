@@ -21,6 +21,7 @@ use tracing::info;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
@@ -226,6 +227,20 @@ pub async fn repository_query_name(
 /// `GlobalGrantsAuthorizer` actually answers this (any authenticated
 /// caller reaches every partition), while `AllowAllRepositoryAuthorizer`
 /// and legacy `AuthClientAuthorizer` behave exactly as before.
+///
+/// Asks `Some(READ_ACTION)` rather than plain reachability (`None`): the
+/// LEP's own migration-plan table groups v0's `RepositoryQuery` and v1's
+/// `RepositoryGet` (local and forwarded) together as one enforcement point
+/// requiring `read`, since all three are conceptually the same "look up a
+/// repository" operation. This is the single shared function all three
+/// funnel through, so the requirement is applied uniformly to all of them
+/// here rather than at each call site. It is deliberately *not* used for
+/// `RepositoryCreate`'s/`RepositoryDelete`'s own internal existence-lookup
+/// calls to `repository_query_id`/`repository_query_name`/
+/// `repository_load_id`/`repository_load_name` — those pass
+/// `AllowAllRepositoryAuthorizer` directly for that internal lookup, which
+/// ignores the action (and everything else) regardless of what is asked
+/// here.
 pub(crate) async fn check_repository_query_authorization(
     authorizer: &Arc<dyn RepositoryAuthorizer>,
     token: Option<&AuthorizationToken>,
@@ -235,6 +250,81 @@ pub(crate) async fn check_repository_query_authorization(
     let verified_token =
         token.map(|claims| VerifiedToken::new(raw_token.unwrap_or_default(), claims));
     authorizer
-        .check_repository_access(verified_token.as_ref(), repository_id, None)
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_base::types::Context;
+
+    use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+    use crate::authnz::repository_authorizer::PUSH_ACTION;
+
+    fn repository() -> RepositoryId {
+        Context::from([7u8; 16]).into()
+    }
+
+    fn token_with_groups(groups: Vec<String>) -> AuthorizationToken {
+        AuthorizationToken {
+            groups: Some(groups),
+            ..Default::default()
+        }
+    }
+
+    /// `RepositoryQuery` (v0), `RepositoryGet` (v1, local and forwarded) all
+    /// funnel through this one function, which now asks for `read`
+    /// specifically rather than plain reachability.
+    #[tokio::test]
+    async fn a_read_holding_token_is_authorized() {
+        let authorizer: Arc<dyn RepositoryAuthorizer> =
+            Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+        let claims = token_with_groups(vec![READ_ACTION.to_string()]);
+
+        check_repository_query_authorization(&authorizer, Some(&claims), None, repository())
+            .await
+            .expect("a token holding read is authorized");
+    }
+
+    #[tokio::test]
+    async fn a_push_only_token_is_denied() {
+        let authorizer: Arc<dyn RepositoryAuthorizer> =
+            Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+        let claims = token_with_groups(vec![PUSH_ACTION.to_string()]);
+
+        let err =
+            check_repository_query_authorization(&authorizer, Some(&claims), None, repository())
+                .await
+                .expect_err("push does not imply read");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn an_authenticated_token_with_no_actions_is_denied() {
+        // Before this change, plain reachability (`None`) was enough: any
+        // authenticated principal reached every partition under Tier 1.
+        // Now the token must actually hold `read`.
+        let authorizer: Arc<dyn RepositoryAuthorizer> =
+            Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+        let claims = token_with_groups(vec![]);
+
+        let err =
+            check_repository_query_authorization(&authorizer, Some(&claims), None, repository())
+                .await
+                .expect_err("no actions held means read is not held either");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    /// `AllowAllRepositoryAuthorizer` ignores the action entirely, so a
+    /// deployment with no `[server.auth]` configured is unaffected by the
+    /// `read` requirement.
+    #[tokio::test]
+    async fn allow_all_is_unaffected() {
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(AllowAllRepositoryAuthorizer);
+        check_repository_query_authorization(&authorizer, None, None, repository())
+            .await
+            .expect("no auth configured always allows");
+    }
 }

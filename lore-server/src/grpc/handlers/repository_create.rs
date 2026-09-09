@@ -29,34 +29,59 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
+use crate::grpc::no_repository_access_status;
 use crate::grpc::none_or_status;
+use crate::grpc::verified_token;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
 use crate::hooks::HookPoint;
 use crate::util::setup_execution;
 
-/// Deliberately does not call `RepositoryAuthorizer::check_repository_access`
-/// anywhere in its path. Creation is a baseline capability, not an action
-/// gated behind an existing grant on the (not yet existing) partition —
-/// nothing in LEP 2026-08-20-oidc-oauth2-authentication's D4 (`is_service_account`
-/// migration table) or D9 (every enforcement point) lists this handler, and
-/// D8 does not name an action for it either. `auth_url`, when a legacy
-/// deployment configures one, is used only to *register* the newly created
-/// resource with the auth service (`repository_create_auth_resource` below)
-/// so later permission checks on it have something to check against — that
-/// is bookkeeping, not a permission check on this request.
+/// Does *not* call `RepositoryAuthorizer::check_repository_access` for any
+/// owner/admin-tier (Tier 2) grant, but *does* call it for the baseline
+/// `push` action. These are two separate questions with two separate
+/// answers, and neither contradicts the other:
+///
+/// - No owner/admin-tier check: creation is a baseline capability, not an
+///   action gated behind an *existing grant on the partition being
+///   created* — nothing in LEP 2026-08-20-oidc-oauth2-authentication's D4
+///   (`is_service_account` migration table) or D9 (every enforcement
+///   point) lists this handler, and D8 does not name an action for it
+///   either. A Tier-2, per-partition grant cannot exist yet for a
+///   partition that does not exist yet — though Tier 2
+///   (`ResourceGrantsAuthorizer`) is not implemented in this build
+///   regardless, so this is moot today.
+/// - A `push` check: ordinary write authorization — "may this caller
+///   write at all" — is a *global* action under Tier 1
+///   (`GlobalGrantsAuthorizer` ignores the `repository` parameter
+///   entirely, see its doc comment), so it has no "grant scoped to a
+///   partition that doesn't exist yet" problem to begin with. Requiring it
+///   here is what keeps repository creation from being reachable by any
+///   authenticated caller regardless of whether they hold any write
+///   permission at all, matching every other `push`-gated call site added
+///   alongside this one.
+///
+/// `auth_url`, when a legacy deployment configures one, is used only to
+/// *register* the newly created resource with the auth service
+/// (`repository_create_auth_resource` below) so later permission checks on
+/// it have something to check against — that is bookkeeping, not the
+/// permission check on this request (which is the `push` check above).
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -64,6 +89,7 @@ pub async fn handler(
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let claims = get_authorization(request.extensions()).ok();
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
 
@@ -80,6 +106,12 @@ pub async fn handler(
 
     LORE_CONTEXT
         .scope(execution, async move {
+            let token = verified_token(&claims, &authorization);
+            repository_authorizer
+                .check_repository_access(token.as_ref(), id, Some(PUSH_ACTION))
+                .await
+                .map_err(|_err| no_repository_access_status())?;
+
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)
                 .hook_point(HookPoint::RepositoryCreate)
@@ -604,6 +636,150 @@ mod tests {
                     .contains("Failed to call auth create_resource"),
             );
             assert!(error.message().contains("You used my api wrong!"),);
+        }
+    }
+
+    mod push_authorization {
+        use rand::random;
+        use tonic::metadata::MetadataValue;
+
+        use super::*;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+        use crate::hooks::HookDispatcher;
+        use crate::store::test_store_create;
+
+        struct TestInstrumentProvider;
+
+        impl InstrumentProvider for TestInstrumentProvider {
+            fn namespace(&self) -> &'static str {
+                "test"
+            }
+        }
+
+        fn make_request(
+            repository_id: RepositoryId,
+            name: &str,
+        ) -> Request<RepositoryCreateRequest> {
+            let id_bytes: Context = repository_id.into();
+            let mut request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::from(id_bytes),
+                name: name.into(),
+                description: String::new(),
+                default_branch_id: bytes::Bytes::from(Context::from(uuid::Uuid::now_v7())),
+                default_branch_name: "main".into(),
+                creator: "alice".into(),
+                created: 0,
+            });
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec![PUSH_ACTION.to_string()]),
+                ..Default::default()
+            });
+            let value: MetadataValue<tonic::metadata::Ascii> = "Bearer test-token".parse().unwrap();
+            request.metadata_mut().insert("authorization", value);
+            request
+        }
+
+        /// A token holding `push` is allowed to create a repository.
+        #[tokio::test]
+        async fn push_holding_token_succeeds() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let authorizer: Arc<dyn RepositoryAuthorizer> =
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+            let hook_dispatcher = HookDispatcher::empty();
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                handler(
+                    make_request(repository_id, "my-repo"),
+                    None,
+                    authorizer,
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect("a token holding push should be allowed to create");
+            }))
+            .await;
+        }
+
+        /// A token that does not hold `push` must be denied.
+        #[tokio::test]
+        async fn token_without_push_is_denied() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let authorizer: Arc<dyn RepositoryAuthorizer> =
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+            let hook_dispatcher = HookDispatcher::empty();
+
+            let mut request = make_request(repository_id, "my-repo");
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    request,
+                    None,
+                    authorizer,
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect_err("a token lacking push must be denied");
+                assert_eq!(err.code(), Code::PermissionDenied);
+            }))
+            .await;
+        }
+
+        /// A deployment with no `[server.auth]` configured at all
+        /// (`AllowAllRepositoryAuthorizer`) still succeeds, matching every
+        /// other `push`/`read` check added alongside this one: "no auth
+        /// configured" always means allow.
+        #[tokio::test]
+        async fn no_auth_configured_still_succeeds() {
+            let repository_id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let hook_dispatcher = HookDispatcher::empty();
+
+            // No token at all, and no authorization header either — matches
+            // an anonymous request against a deployment with no auth wired
+            // up at all.
+            let repository = repository_id;
+            let id_bytes: Context = repository.into();
+            let request = Request::new(RepositoryCreateRequest {
+                id: bytes::Bytes::from(id_bytes),
+                name: "my-repo".into(),
+                description: String::new(),
+                default_branch_id: bytes::Bytes::from(Context::from(uuid::Uuid::now_v7())),
+                default_branch_name: "main".into(),
+                creator: "alice".into(),
+                created: 0,
+            });
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                handler(
+                    request,
+                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                    immutable_store,
+                    mutable_store,
+                    &hook_dispatcher,
+                    &TestInstrumentProvider,
+                )
+                .await
+                .expect("AllowAllRepositoryAuthorizer permits repository creation");
+            }))
+            .await;
         }
     }
 }

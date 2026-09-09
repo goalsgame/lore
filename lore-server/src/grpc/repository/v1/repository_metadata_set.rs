@@ -19,6 +19,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::grpc::FilterSlowDownExt;
@@ -76,7 +77,11 @@ pub async fn handler(
                 .as_ref()
                 .map(|claims| VerifiedToken::new(raw_token.as_deref().unwrap_or_default(), claims));
             authorizer
-                .check_repository_access(verified_token.as_ref(), repository_id.into(), None)
+                .check_repository_access(
+                    verified_token.as_ref(),
+                    repository_id.into(),
+                    Some(PUSH_ACTION),
+                )
                 .await
                 .map_err(|_err| no_repository_access_status())?;
 
@@ -210,7 +215,10 @@ mod tests {
         use tonic::Code;
 
         use super::super::*;
+        use crate::auth::jwt::AuthorizationToken;
         use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+        use crate::authnz::repository_authorizer::READ_ACTION;
         use crate::store::test_store_create;
 
         /// A `RepositoryAuthorizer` that always answers the same way,
@@ -325,6 +333,54 @@ mod tests {
                     )
                     .await
                     .unwrap();
+                })
+                .await;
+        }
+
+        /// `RepositoryMetadataSet` asks specifically for the `push` action,
+        /// not plain reachability: a token holding some other action (here
+        /// `read`) must still be denied, and only a token that actually
+        /// holds `push` succeeds.
+        #[tokio::test]
+        async fn requires_the_push_action_specifically() {
+            let (immutable, mutable, execution) = test_store_create().await.unwrap();
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let hash = seed_metadata_blob(immutable.clone(), mutable.clone()).await;
+                    let authorizer: Arc<dyn RepositoryAuthorizer> =
+                        Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())));
+
+                    let mut request = Request::new(RepositoryMetadataSetRequest {
+                        id: REPOSITORY_ID.to_vec().into(),
+                        expected: vec![0u8; 32].into(),
+                        updated: hash.into(),
+                    });
+                    request.extensions_mut().insert(AuthorizationToken {
+                        groups: Some(vec![READ_ACTION.to_string()]),
+                        ..Default::default()
+                    });
+                    let err = handler(
+                        request,
+                        authorizer.clone(),
+                        immutable.clone(),
+                        mutable.clone(),
+                    )
+                    .await
+                    .unwrap_err();
+                    assert_eq!(err.code(), Code::PermissionDenied);
+
+                    let mut request = Request::new(RepositoryMetadataSetRequest {
+                        id: REPOSITORY_ID.to_vec().into(),
+                        expected: vec![0u8; 32].into(),
+                        updated: hash.into(),
+                    });
+                    request.extensions_mut().insert(AuthorizationToken {
+                        groups: Some(vec![PUSH_ACTION.to_string()]),
+                        ..Default::default()
+                    });
+                    handler(request, authorizer, immutable, mutable)
+                        .await
+                        .expect("a token holding push should be allowed");
                 })
                 .await;
         }

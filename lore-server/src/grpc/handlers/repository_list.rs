@@ -42,6 +42,13 @@ use crate::util::setup_execution;
 /// listed, never what they are permitted to do to a listed partition. A
 /// legacy `auth_url` deployment keeps behaving exactly as it does today, via
 /// `LookupUserPermissions` below.
+///
+/// Reconsidered, and deliberately left as-is, when the `read`/`push`
+/// baseline actions were introduced elsewhere: gating listing behind a
+/// grant would double-gate something intentionally designed as a separate,
+/// non-grant-based mechanism — a caller not being able to see a partition
+/// in the list is a different question from what they may do to it once
+/// they know its ID.
 #[tracing::instrument(name = "RepositoryList::handle", skip_all)]
 pub async fn handler(
     request: Request<RepositoryListRequest>,
