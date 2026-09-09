@@ -13,6 +13,10 @@
 #                       (see docs/reference/lore-server-config.md). For
 #                       non-secret config: plugin selection, bucket/project
 #                       names, jwt_issuer/jwt_audience, permission_claim.
+#   lore-acl-toml      Full TOML text, written verbatim as acl.toml — the
+#                       file server.auth.acl_config_path (set in local.toml,
+#                       above) points at, for ConfiguredGrantsAuthorizer. See
+#                       lore-server/src/authnz/acl_config.rs.
 #   lore-secret-refs   One `ENV_VAR_NAME=secret-ref` pair per line, where
 #                       secret-ref is a fully-qualified Secret Manager
 #                       resource name (e.g.
@@ -51,6 +55,14 @@ if [[ -n "$config_toml" ]]; then
   printf '%s\n' "$config_toml" >"$CONFIG_DIR/local.toml"
   chown lore:lore "$CONFIG_DIR/local.toml"
   chmod 0640 "$CONFIG_DIR/local.toml"
+fi
+
+# acl.toml — non-secret, per-environment ConfiguredGrantsAuthorizer config.
+acl_toml="$(fetch_metadata lore-acl-toml)"
+if [[ -n "$acl_toml" ]]; then
+  printf '%s\n' "$acl_toml" >"$CONFIG_DIR/acl.toml"
+  chown lore:lore "$CONFIG_DIR/acl.toml"
+  chmod 0640 "$CONFIG_DIR/acl.toml"
 fi
 
 # secrets.env — resolved from Secret Manager, never written to metadata or
