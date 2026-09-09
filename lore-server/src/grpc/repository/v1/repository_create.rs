@@ -148,6 +148,15 @@ async fn forward_repository_create(
 /// which is immaterial to the outcome under Tier 1 and `AllowAll` since
 /// neither consults the repository parameter for a global action like
 /// `push`.
+///
+/// The check is skipped entirely when `auth_url` is configured (a legacy
+/// `UrcAuthApi` deployment): `AuthClientAuthorizer` does *not* ignore the
+/// repository parameter — it looks the sentinel `RepositoryId::default()`
+/// up as a real resource id via an online `CheckUserPermission` call,
+/// finds no such resource (nothing is ever registered under it), and
+/// fails closed unconditionally for every caller. See the v0 handler's
+/// equivalent comment (`grpc/handlers/repository_create.rs`) for the same
+/// reasoning applied to the real target id there.
 #[allow(clippy::too_many_arguments)]
 pub async fn repository_create_implementation(
     req: RepositoryCreateRequest,
@@ -185,19 +194,23 @@ pub async fn repository_create_implementation(
     ));
     Span::current().record("requested_repo_id", id.to_string());
 
+    let is_legacy_auth = auth_url.is_some();
+
     LORE_CONTEXT
         .scope(execution, async move {
-            let verified_token = token.as_ref().map(|claims| {
-                VerifiedToken::new(authorization.as_deref().unwrap_or_default(), claims)
-            });
-            repository_authorizer
-                .check_repository_access(
-                    verified_token.as_ref(),
-                    repository_id_checked,
-                    Some(PUSH_ACTION),
-                )
-                .await
-                .map_err(|_err| no_repository_access_status())?;
+            if !is_legacy_auth {
+                let verified_token = token.as_ref().map(|claims| {
+                    VerifiedToken::new(authorization.as_deref().unwrap_or_default(), claims)
+                });
+                repository_authorizer
+                    .check_repository_access(
+                        verified_token.as_ref(),
+                        repository_id_checked,
+                        Some(PUSH_ACTION),
+                    )
+                    .await
+                    .map_err(|_err| no_repository_access_status())?;
+            }
 
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)

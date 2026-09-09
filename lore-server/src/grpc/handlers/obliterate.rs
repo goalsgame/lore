@@ -12,6 +12,7 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
@@ -47,10 +48,16 @@ async fn authenticate_request(
     let token = extract_bearer_token(metadata)
         .ok_or_else(|| Status::unauthenticated("authorization header required"))?;
 
-    jwt_verifier
-        .verify_token(&token)
-        .await
-        .map_err(|e| Status::unauthenticated(format!("invalid token ({e:?})")))
+    jwt_verifier.verify_token(&token).await.map_err(|e| {
+        // Mirrors `jwt_interceptor.rs::authorize`: the reason stays in the
+        // log, not in the response — told apart, "the signature is wrong"
+        // vs. "the token expired" vs. "no such key id" is an oracle for a
+        // caller who has not authenticated, and this handler runs on the
+        // same public gRPC surface that interceptor already protects for
+        // every other service.
+        debug!(error = ?e, "Rejecting Obliterate request: token verification failed");
+        Status::permission_denied("Not allowed")
+    })
 }
 
 #[allow(clippy::todo)]
@@ -336,7 +343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn returns_unauthenticated_for_unverifiable_token() {
+    async fn returns_permission_denied_for_unverifiable_token() {
         let repository = random::<RepositoryId>();
         let (immutable_store, mutable_store, _) = test_store_create().await.unwrap();
         let notification = Arc::new(MockNotificationSender::new());
@@ -355,7 +362,10 @@ mod tests {
         .await
         .unwrap_err();
 
-        assert_eq!(err.code(), Code::Unauthenticated);
+        // Mirrors jwt_interceptor.rs's own choice for the same failure: the
+        // response must not distinguish "signature invalid" from "wrong
+        // permissions" for an unauthenticated caller.
+        assert_eq!(err.code(), Code::PermissionDenied);
     }
 
     /// A Tier 1 token (LEP 2026-08-20-oidc-oauth2-authentication, D8): the

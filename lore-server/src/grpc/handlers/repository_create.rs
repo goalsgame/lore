@@ -77,6 +77,18 @@ use crate::util::setup_execution;
 /// (`repository_create_auth_resource` below) so later permission checks on
 /// it have something to check against — that is bookkeeping, not the
 /// permission check on this request (which is the `push` check above).
+///
+/// The `push` check itself is skipped entirely when `auth_url` is
+/// configured (a legacy `UrcAuthApi` deployment): `AuthClientAuthorizer`
+/// answers `check_repository_access` with an online `CheckUserPermission`
+/// lookup against the *target* resource id, which at this point has not
+/// been registered with the auth service yet — the lookup would find no
+/// entry and fail closed unconditionally, for every caller, on every
+/// legacy deployment, which is not a real access decision but an artifact
+/// of checking before the bookkeeping below runs. Legacy deployments keep
+/// their pre-existing behavior for creation (no check here at all); only
+/// Tier 1 (`GlobalGrantsAuthorizer`) and the no-`[server.auth]` default
+/// (`AllowAllRepositoryAuthorizer`) gain the new `push` requirement.
 #[tracing::instrument(name = "RepositoryCreate::handle", skip_all, fields(requested_repo_id))]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
@@ -104,13 +116,17 @@ pub async fn handler(
     ));
     Span::current().record("requested_repo_id", id.to_string());
 
+    let is_legacy_auth = auth_url.is_some();
+
     LORE_CONTEXT
         .scope(execution, async move {
-            let token = verified_token(&claims, &authorization);
-            repository_authorizer
-                .check_repository_access(token.as_ref(), id, Some(PUSH_ACTION))
-                .await
-                .map_err(|_err| no_repository_access_status())?;
+            if !is_legacy_auth {
+                let token = verified_token(&claims, &authorization);
+                repository_authorizer
+                    .check_repository_access(token.as_ref(), id, Some(PUSH_ACTION))
+                    .await
+                    .map_err(|_err| no_repository_access_status())?;
+            }
 
             let hook_ctx = HookContext::builder()
                 .correlation_id(correlation_id)

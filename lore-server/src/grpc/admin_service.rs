@@ -17,6 +17,7 @@ use sysinfo::RefreshKind;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
+use tracing::debug;
 use tracing::info;
 use tracing::instrument;
 use tracing::warn;
@@ -44,6 +45,14 @@ pub struct LoreAdminService {
     /// [`Self::set_repository_authorizer`] runs, matching this service's
     /// existing "unauthenticated until `set_jwt_verifier` runs" shape.
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    /// `true` when `repository_authorizer` is a legacy `AuthClientAuthorizer`
+    /// (a legacy `auth_url` is configured). `ServerInfo`'s `read` check runs
+    /// against `RepositoryId::default()`, a synthetic sentinel with no
+    /// legacy equivalent — no such resource is ever registered with the
+    /// external auth service, so an online `CheckUserPermission` lookup for
+    /// it would fail closed unconditionally regardless of what the caller
+    /// actually holds. See [`Self::set_legacy_resource_claim`].
+    legacy_resource_claim: bool,
 }
 
 impl LoreAdminService {
@@ -97,6 +106,7 @@ impl LoreAdminService {
             hook_dispatcher,
             rpc_timeout: Duration::from_secs(60),
             repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
+            legacy_resource_claim: false,
         }
     }
 
@@ -114,6 +124,11 @@ impl LoreAdminService {
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) {
         self.repository_authorizer = repository_authorizer;
+    }
+
+    /// See [`Self::legacy_resource_claim`]'s doc comment.
+    pub fn set_legacy_resource_claim(&mut self, legacy_resource_claim: bool) {
+        self.legacy_resource_claim = legacy_resource_claim;
     }
 
     pub fn set_rpc_timeout(&mut self, rpc_timeout: Duration) {
@@ -135,12 +150,23 @@ impl AdminService for LoreAdminService {
     /// extract-bearer-token-then-verify dance `obliterate` uses.
     ///
     /// Once `[server.auth]` is configured (`self.jwt_verifier` is `Some`),
-    /// this RPC now requires a valid bearer token *and* the `read` action.
-    /// `ServerInfo` reports hostname/CPU/RAM/settings, not repository data,
-    /// so it is not partition-scoped: the check is made against
+    /// this RPC now requires a valid bearer token. `ServerInfo` reports
+    /// hostname/CPU/RAM/settings, not repository data, so it is not
+    /// partition-scoped: the `read` check, when performed, is made against
     /// `RepositoryId::default()` (the zero/sentinel repository), which
     /// Tier 1's `GlobalGrantsAuthorizer` ignores entirely regardless of
     /// what is passed.
+    ///
+    /// The `read` check itself is skipped for a legacy `AuthClientAuthorizer`
+    /// deployment (`self.legacy_resource_claim`): it does *not* ignore the
+    /// repository parameter the way Tier 1 and `AllowAll` do, so it would
+    /// look the sentinel up as a real resource id via an online
+    /// `CheckUserPermission` call, find no such resource (nothing is ever
+    /// registered under it), and fail closed unconditionally for every
+    /// caller — see `grpc/handlers/repository_create.rs`'s equivalent
+    /// comment for the same reasoning. A legacy deployment therefore only
+    /// gains the new authentication requirement here, not the `read` grant
+    /// requirement.
     ///
     /// When no verifier is configured at all (`self.jwt_verifier` is
     /// `None`, e.g. no `[server.auth]` block), the RPC answers exactly as
@@ -158,25 +184,28 @@ impl AdminService for LoreAdminService {
         if let Some(verifier) = &*self.jwt_verifier {
             let raw_token = extract_bearer_token(request.metadata())
                 .ok_or_else(|| Status::unauthenticated("authorization header required"))?;
-            let claims = verifier
-                .verify_token(&raw_token)
-                .await
-                .map_err(|e| Status::unauthenticated(format!("invalid token ({e:?})")))?;
-            let verified_token = VerifiedToken::new(&raw_token, &claims);
+            let claims = verifier.verify_token(&raw_token).await.map_err(|e| {
+                debug!(error = ?e, "Rejecting ServerInfo request: token verification failed");
+                Status::permission_denied("Not allowed")
+            })?;
 
-            self.repository_authorizer
-                .check_repository_access(
-                    Some(&verified_token),
-                    RepositoryId::default(),
-                    Some(READ_ACTION),
-                )
-                .await
-                .map_err(|_err| {
-                    warn!(
-                        "Attempt to read ServerInfo, but user does not have the correct permissions"
-                    );
-                    Status::permission_denied("Permission denied")
-                })?;
+            if !self.legacy_resource_claim {
+                let verified_token = VerifiedToken::new(&raw_token, &claims);
+
+                self.repository_authorizer
+                    .check_repository_access(
+                        Some(&verified_token),
+                        RepositoryId::default(),
+                        Some(READ_ACTION),
+                    )
+                    .await
+                    .map_err(|_err| {
+                        warn!(
+                            "Attempt to read ServerInfo, but user does not have the correct permissions"
+                        );
+                        Status::permission_denied("Permission denied")
+                    })?;
+            }
         }
 
         Ok(Response::new(self.server_info.clone()))

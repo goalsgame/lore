@@ -675,6 +675,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         admin_svc.set_jwt_verifier(jwt_verifier.clone());
         admin_svc.set_rpc_timeout(rpc_timeout);
         admin_svc.set_repository_authorizer(repository_authorizer.clone());
+        admin_svc.set_legacy_resource_claim(reachability_authorizer.legacy_resource_claim);
 
         let storage_svc = LoreStorageService::new(
             self.0.immutable_store.clone(),
