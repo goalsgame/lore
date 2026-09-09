@@ -20,6 +20,7 @@ config = { workspace = true }
 dashmap = { workspace = true }
 enum_dispatch = { workspace = true }
 futures = { workspace = true }
+glob-match = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
 jsonwebtoken = { workspace = true }
