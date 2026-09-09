@@ -4,6 +4,7 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
+use dashmap::DashSet;
 use lore_revision::lore::RepositoryId;
 
 pub(crate) const MAX_CONCURRENT_SESSIONS: u32 = 10_000;
@@ -32,11 +33,19 @@ pub struct SessionEntry {
 /// allocates a new session ID — deduplication is handled client-side by `StorageConnector`.
 pub struct SessionMap {
     entries: DashMap<u32, SessionEntry>,
-    /// Value is whether the *most recent* `start()` for that repository found `read` held.
-    /// `Copy`'s source check (`has_read_access`) is the only reader; a repository that was only
-    /// ever started with `push` (no `read`) is never eligible as a `Copy` source, even though a
-    /// session exists for it.
-    authorized_repos: DashMap<RepositoryId, bool>,
+    /// Repositories some `AuthorizeStart` on this connection has found `read` held for, ever.
+    ///
+    /// A set, not a per-repository flag: `Copy`'s source may differ from the session actually
+    /// invoking it (`handle_copy` via `has_read_access`), and by the time the copy runs, the
+    /// session that established the source's `read` grant may already have `stop()`ped — see
+    /// `stop`'s doc comment. So this has to accumulate every grant any session on the connection
+    /// has ever established, monotonically, rather than store one overwritable slot per
+    /// repository: a later session's `AuthorizeStart` for the same repository — whatever it
+    /// finds, including a `push`-only result — must never erase an earlier, independently-valid
+    /// grant a different (possibly still-open) session established. A repository that was only
+    /// ever started with `push` (no `read`) is simply never inserted, so it is never eligible as
+    /// a `Copy` source, even though a session exists for it.
+    authorized_repos: DashSet<RepositoryId>,
     counter: AtomicU32,
 }
 
@@ -51,7 +60,7 @@ impl Default for SessionMap {
     fn default() -> Self {
         Self {
             entries: DashMap::new(),
-            authorized_repos: DashMap::new(),
+            authorized_repos: DashSet::new(),
             counter: AtomicU32::new(1),
         }
     }
@@ -89,7 +98,15 @@ impl SessionMap {
             correlation_id
         };
 
-        self.authorized_repos.insert(repository, holds_read);
+        // Only ever adds: this session's own outcome must not erase a grant
+        // some other, unrelated session on this connection already
+        // established for the same repository — see `authorized_repos`'s
+        // doc comment. A `holds_read: false` result for a repository that
+        // some earlier session *did* establish `read` for is correctly a
+        // no-op here, not a downgrade.
+        if holds_read {
+            self.authorized_repos.insert(repository);
+        }
 
         self.entries.insert(
             session_id,
@@ -123,9 +140,9 @@ impl SessionMap {
     /// making the current call) — used by `Copy`'s source-repository check,
     /// which may name a repository other than the calling session's own.
     /// `false` both when the repository was never started at all, and when
-    /// it was started but the caller did not hold `read` on it.
+    /// every session that started it held only `push`, never `read`.
     pub fn has_read_access(&self, repository: RepositoryId) -> bool {
-        self.authorized_repos.get(&repository).is_some_and(|v| *v)
+        self.authorized_repos.contains(&repository)
     }
 }
 
@@ -292,6 +309,53 @@ mod tests {
             .unwrap();
 
         assert!(!map.has_read_access(repo));
+    }
+
+    /// Regression for the last-write-wins bug: session A authorizes `repo`
+    /// for `read` and stays open; session B later authorizes the *same*
+    /// `repo` on the same connection with `push`-only. B's lesser grant
+    /// must not clobber A's still-live `read` grant — `has_read_access`
+    /// stays `true` for `repo` regardless of the order sessions start in,
+    /// and regardless of whether the granting session is still open.
+    #[test]
+    fn concurrent_session_with_lesser_grant_does_not_clobber_earlier_read_grant() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+
+        let (session_a, _) = map
+            .start(repo, "corr-a".into(), String::new(), true, false)
+            .unwrap();
+        assert!(map.has_read_access(repo));
+
+        // Session B, a wholly separate session, authorizes the same
+        // repository with push only.
+        map.start(repo, "corr-b".into(), String::new(), false, true)
+            .unwrap();
+
+        // Session A's own grant is unaffected, and the connection-wide
+        // read access it established for `repo` must still hold — for
+        // both A itself and for any other session's `Copy` naming `repo`
+        // as source.
+        assert!(map.get(session_a).unwrap().holds_read);
+        assert!(map.has_read_access(repo));
+    }
+
+    /// Same scenario, opposite order: the lesser (`push`-only) grant is
+    /// recorded *first*, then a later session actually holding `read`
+    /// establishes it — `has_read_access` must pick that up too, not just
+    /// preserve whatever the first session for a repository saw.
+    #[test]
+    fn later_session_can_still_establish_read_access_after_an_earlier_push_only_session() {
+        let map = SessionMap::default();
+        let repo = random::<RepositoryId>();
+
+        map.start(repo, "corr-a".into(), String::new(), false, true)
+            .unwrap();
+        assert!(!map.has_read_access(repo));
+
+        map.start(repo, "corr-b".into(), String::new(), true, false)
+            .unwrap();
+        assert!(map.has_read_access(repo));
     }
 
     #[test]
