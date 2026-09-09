@@ -7,7 +7,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use futures::FutureExt;
-use lore_base::runtime::runtime;
+use lore_base::runtime::core_runtime;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
@@ -17,6 +17,7 @@ use thiserror::Error;
 use tokio::task;
 use tonic::Code;
 use tonic::Status;
+use tracing::debug;
 
 use super::acl_config;
 use super::auth::grpc_get_auth_client;
@@ -336,21 +337,24 @@ impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
 /// [`GlobalGrantsAuthorizer`]'s flat, repository-unaware ones. See
 /// [`acl_config`] for the pure grant-resolution engine this wraps.
 ///
-/// **The sync/async bridge.** [`ReachabilityAuthorizer::check_reachability_sync`]
-/// polls [`RepositoryAuthorizer::check_repository_access`]'s future exactly
-/// once (`now_or_never()`) and panics if it is not immediately ready. This
-/// type resolves a repository's name -- the one piece of async I/O it
-/// needs -- via [`Self::resolve_name_sync`], entirely *before* doing
-/// anything else in the async fn body, using the same cache-then-
-/// `block_in_place`/`block_on` bridge [`crate::auth::jwt_interceptor::authorize`]
-/// already uses for the identical problem (a sync call site needing a value
-/// backed by async I/O). Because that resolution happens synchronously
-/// inside the function body rather than via an `.await` the returned future
-/// suspends on, the future never actually reaches a `Pending` state when
-/// polled -- see the design doc's "the load-bearing open question" section,
-/// and this module's tests
-/// (`tests::configured_grants::check_reachability_sync_does_not_panic_cold_or_warm_cache`)
-/// for the property proven directly against `check_reachability_sync`.
+/// **The sync/async bridge lives at the call site, not here.**
+/// [`Self::check_repository_access`] resolves a repository's name via
+/// [`Self::resolve_name`] with a *plain* `.await` -- a cache hit returns
+/// without suspending, and a cache miss genuinely suspends on real store
+/// I/O, exactly like any other async fn. This type does no
+/// `block_in_place`/`block_on` bridging itself, deliberately: nearly every
+/// caller of `check_repository_access` is already async (repository query,
+/// metadata get/set, repository delete, branch push, presign, notification
+/// subscribe, `resolve_baseline_actions`'s QUIC connect/`AuthorizeStart`
+/// checks) and can simply `.await` a cache miss like any other I/O, with no
+/// need to ever bridge into a synchronous context at all. Only
+/// [`ReachabilityAuthorizer::check_reachability_sync`]'s two genuinely
+/// synchronous call sites (the gRPC interceptor and the cross-partition
+/// link-read closure, neither of which can await anything) need a
+/// sync/async bridge, and that bridge is implemented once, there, rather
+/// than duplicated (and paid for by every async caller) inside this type --
+/// see that method's doc comment for the bridge itself and why it, not
+/// this type, owns it.
 pub struct ConfiguredGrantsAuthorizer {
     /// Reused verbatim from [`GlobalGrantsAuthorizer`]: the dotted claim
     /// path naming the caller's FoxIDs groups (the design doc directs
@@ -416,61 +420,64 @@ impl ConfiguredGrantsAuthorizer {
         }
     }
 
-    /// Resolves `repository`'s human-readable name, synchronously from the
-    /// caller's perspective: a cache hit returns without ever touching the
-    /// async runtime; a miss falls back to `task::block_in_place` +
-    /// `runtime().block_on`, mirroring
-    /// [`crate::auth::jwt_interceptor::authorize`]'s cache-miss fallback
-    /// exactly, and for the same reason -- this can be reached from
-    /// [`ReachabilityAuthorizer::check_reachability_sync`]'s two genuinely
-    /// synchronous call sites (the gRPC interceptor and the cross-partition
-    /// link-read closure), neither of which can await anything themselves.
+    /// Resolves `repository`'s human-readable name: a cache hit returns
+    /// without suspending, and a cache miss `.await`s the two real store
+    /// reads (`metadata_hash` then `metadata`, per `lore_revision::repository`)
+    /// like any other async I/O -- no `block_in_place`, no special bridging.
+    /// Every caller of [`RepositoryAuthorizer::check_repository_access`] is
+    /// already async and can simply await a cache miss (see the type's doc
+    /// comment); the two callers that cannot await anything
+    /// ([`ReachabilityAuthorizer::check_reachability_sync`]'s gRPC
+    /// interceptor and cross-partition link-read closure) get their
+    /// sync/async bridge there, not here.
     ///
-    /// Two async store reads on a miss (`metadata_hash` then `metadata`,
-    /// per `lore_revision::repository`), confirmed local-only: a server
-    /// context's `remote` is always `RemoteState::Offline`
-    /// (`RepositoryContext::new_server_context`), so this never depends on
-    /// network I/O beyond the local store's own latency.
-    fn resolve_name_sync(&self, repository: RepositoryId) -> Result<String, Status> {
+    /// Confirmed local-only: a server context's `remote` is always
+    /// `RemoteState::Offline` (`RepositoryContext::new_server_context`), so
+    /// this never depends on network I/O beyond the local store's own
+    /// latency.
+    ///
+    /// A repository that cannot be resolved (unknown id, or a store error)
+    /// is reported as [`Status::permission_denied`], not
+    /// [`Status::not_found`]: from an authorization function's perspective
+    /// this is a "no" like any other -- there is nothing to grant access
+    /// to -- and [`action_held`] (relied on by every once-per-connection
+    /// caller that resolves `read`/`push` up front, e.g.
+    /// `resolve_baseline_actions`) only recognizes
+    /// `PermissionDenied`/`Unauthenticated` as a genuine denial, folding
+    /// anything else into "the check itself failed." Reporting
+    /// `NotFound` here would misclassify an ordinary, expected denial (a
+    /// client referencing a repository that was never created, or a stale
+    /// id) as an infrastructure failure -- the same misclassification class
+    /// the `AuthClientAuthorizer` "resource absent from response" fix
+    /// (`interpret_check_user_permission_response_tests`) exists to
+    /// prevent. The real cause is still logged for operators before being
+    /// collapsed into the generic denial.
+    async fn resolve_name(&self, repository: RepositoryId) -> Result<String, Status> {
         if let Some(name) = self.name_cache.get(&repository) {
             return Ok(name.clone());
         }
 
-        let immutable_store = self.immutable_store.clone();
-        let mutable_store = self.mutable_store.clone();
-
-        // See the doc comment above: identical shape to
-        // `jwt_interceptor::authorize`'s `Ok(None) => task::block_in_place(...)`
-        // fallback, and required for the same reason -- this can be reached
-        // from a plain synchronous call site that cannot await anything.
-        #[allow(clippy::disallowed_methods)]
-        let name = task::block_in_place(|| {
-            runtime().block_on(async move {
-                let repository_context = Arc::new(RepositoryContext::new_server_context(
-                    immutable_store,
-                    mutable_store,
-                    repository,
-                ));
-                let metadata_hash = repository::metadata_hash(repository_context.clone())
-                    .await
-                    .map_err(|err| {
-                        Status::not_found(format!(
-                            "failed to resolve name for repository {repository}: {err}"
-                        ))
-                    })?;
-                let metadata = repository::metadata(repository_context, metadata_hash)
-                    .await
-                    .map_err(|err| {
-                        Status::not_found(format!(
-                            "failed to resolve name for repository {repository}: {err}"
-                        ))
-                    })?;
-                Ok::<String, Status>(metadata.name)
-            })
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            self.immutable_store.clone(),
+            self.mutable_store.clone(),
+            repository,
+        ));
+        let resolved = async {
+            let metadata_hash = repository::metadata_hash(repository_context.clone()).await?;
+            repository::metadata(repository_context, metadata_hash)
+                .await
+                .map(|metadata| metadata.name)
+        }
+        .await
+        .map_err(|err| {
+            debug!(%repository, %err, "failed to resolve repository name for authorization");
+            Status::permission_denied(format!(
+                "caller does not hold any grant on repository {repository}"
+            ))
         })?;
 
-        self.name_cache.insert(repository, name.clone());
-        Ok(name)
+        self.name_cache.insert(repository, resolved.clone());
+        Ok(resolved)
     }
 
     /// Shared by both [`RepositoryAuthorizer`] methods once each has settled
@@ -508,7 +515,7 @@ impl RepositoryAuthorizer for ConfiguredGrantsAuthorizer {
             ));
         };
 
-        let repository_name = self.resolve_name_sync(repository)?;
+        let repository_name = self.resolve_name(repository).await?;
         let caller_groups = self.caller_groups(token.claims);
         self.authorize_against(&caller_groups, &repository_name, action)
     }
@@ -807,13 +814,13 @@ impl ReachabilityAuthorizer {
     /// `Copy` handlers and the HTTP axum middleware.
     ///
     /// Takes no raw token: the legacy branch reads only `claims`, and the
-    /// non-legacy branch only ever reaches [`AllowAllRepositoryAuthorizer`]
-    /// or [`GlobalGrantsAuthorizer`], neither of which reads
-    /// [`VerifiedToken::raw`] either — only [`AuthClientAuthorizer`] does,
-    /// and this wrapper exists specifically to never reach it. There is
-    /// therefore no real value to thread through the call sites that use
-    /// this method, several of which do not have the raw compact
-    /// serialization to hand in the first place.
+    /// non-legacy branch only ever reaches [`AllowAllRepositoryAuthorizer`],
+    /// [`GlobalGrantsAuthorizer`] or [`ConfiguredGrantsAuthorizer`] (GOALS
+    /// fork), none of which reads [`VerifiedToken::raw`] either — only
+    /// [`AuthClientAuthorizer`] does, and this wrapper exists specifically
+    /// to never reach it. There is therefore no real value to thread
+    /// through the call sites that use this method, several of which do
+    /// not have the raw compact serialization to hand in the first place.
     pub async fn check_reachability(
         &self,
         claims: &AuthorizationToken,
@@ -848,25 +855,68 @@ impl ReachabilityAuthorizer {
     }
 
     /// Synchronous form, for the gRPC interceptor and the cross-partition
-    /// link-read closure, neither of which can await anything.
+    /// link-read closure — both run on `lore_base::runtime::net_runtime()`
+    /// (every gRPC/QUIC endpoint is spawned there via `lore_spawn_net!` in
+    /// `server.rs`), and neither can await anything: tonic's `Interceptor`
+    /// trait and `lore_revision::state::CanReadRepository` are both plain
+    /// sync signatures.
     ///
-    /// This never actually blocks: the legacy branch is plain, non-async
-    /// code, and the non-legacy branch only ever reaches
-    /// [`AllowAllRepositoryAuthorizer`] or [`GlobalGrantsAuthorizer`] — by
-    /// construction, [`AuthClientAuthorizer`] is selected exactly when
-    /// `legacy_resource_claim` is `true`, which takes the other branch —
-    /// and neither of those implementations awaits anything either.
+    /// For [`AllowAllRepositoryAuthorizer`], [`GlobalGrantsAuthorizer`] and
+    /// the legacy claims-only branch, `check_reachability`'s future never
+    /// awaits anything at all, so `now_or_never()` always succeeds on the
+    /// first, fast path below. [`ConfiguredGrantsAuthorizer`] (GOALS fork)
+    /// breaks that invariant on a name-cache miss: resolving a
+    /// `RepositoryId` to a name is genuine async store I/O (see
+    /// [`ConfiguredGrantsAuthorizer::resolve_name`]), so its future can
+    /// legitimately return `Pending` on first poll. Rather than requiring
+    /// every [`RepositoryAuthorizer`] impl to somehow never suspend (which
+    /// is what made the earlier, since-removed `resolve_name_sync` bridge
+    /// fragile), this method handles both outcomes directly: `now_or_never()`
+    /// as the zero-cost fast path, falling back to
+    /// `task::block_in_place` + `core_runtime().block_on(..)` — the same
+    /// cache-then-block_in_place shape
+    /// [`crate::auth::jwt_interceptor::authorize`] already uses for the
+    /// identical "a sync call site needs a value backed by async I/O"
+    /// problem — only when the fast path doesn't resolve.
+    ///
+    /// `core_runtime()`, not `lore_base::runtime::runtime()`, is used
+    /// deliberately for the future actually being driven: `runtime()`
+    /// resolves to `Handle::try_current()`, which on these two call sites
+    /// is `net_runtime`'s own handle — the "safe to block" runtime is
+    /// `core_runtime`, per its own doc comment ("blocking work must land on
+    /// core's pool wherever it is issued from"), not whatever happens to be
+    /// ambient. This does **not** eliminate every cost of blocking here:
+    /// `task::block_in_place` itself hands this *thread's* remaining
+    /// `net_runtime` work to a replacement drawn from `net_runtime`'s own
+    /// blocking pool (`max_blocking_threads(1)`) for as long as the
+    /// fallback runs, regardless of which runtime's `block_on` is called
+    /// inside it — that part is unavoidable for a genuinely synchronous
+    /// bridge reached from `net_runtime` (the same constraint
+    /// `jwt_interceptor::authorize`'s own JWK-cache-miss fallback is
+    /// already subject to, pre-existing and unrelated to this change). What
+    /// keeps this bounded rather than a standing risk: the name cache never
+    /// invalidates (see [`ConfiguredGrantsAuthorizer`]'s `name_cache` field), so this
+    /// fallback is reached at most once per distinct repository for the
+    /// life of the process, not on every request.
     pub fn check_reachability_sync(
         &self,
         claims: &AuthorizationToken,
         repository: RepositoryId,
     ) -> Result<(), Status> {
-        self.check_reachability(claims, repository)
-            .now_or_never()
-            .expect(
-                "check_reachability resolves synchronously: the legacy branch never awaits, \
-                 and the non-legacy branch never reaches an online authorizer",
-            )
+        match self.check_reachability(claims, repository).now_or_never() {
+            Some(result) => result,
+            None => {
+                // See the doc comment above: reached only when the fast
+                // path's `now_or_never()` observes a genuine suspension
+                // (a `ConfiguredGrantsAuthorizer` name-cache miss) —
+                // `AllowAllRepositoryAuthorizer`, `GlobalGrantsAuthorizer`
+                // and the legacy claims branch never reach this arm.
+                #[allow(clippy::disallowed_methods)]
+                task::block_in_place(|| {
+                    core_runtime().block_on(self.check_reachability(claims, repository))
+                })
+            }
+        }
     }
 }
 
@@ -961,7 +1011,7 @@ mod tests {
     /// Stores `name` as `repository`'s `RepositoryMetadata`, the same two
     /// writes `RepositoryCreate` performs
     /// (`metadata_store`/`metadata_store_hash`) -- enough for
-    /// `ConfiguredGrantsAuthorizer::resolve_name_sync` (via
+    /// `ConfiguredGrantsAuthorizer::resolve_name` (via
     /// `repository::metadata_hash`/`metadata`) to resolve `repository` back
     /// to `name`. Must run inside a `LORE_CONTEXT::scope` matching the
     /// stores' own execution context, same as every other test that seeds
@@ -1231,6 +1281,8 @@ mod tests {
     /// (claim extraction, the `RepositoryId -> name` cache, the sync
     /// bridge) actually wires up correctly.
     mod configured_grants {
+        use lore_base::lore_spawn_net;
+
         use super::*;
 
         fn config_with(grants: Vec<acl_config::Grant>) -> acl_config::AclConfig {
@@ -1336,6 +1388,48 @@ mod tests {
                 .await;
         }
 
+        /// A repository whose name cannot be resolved at all (unknown id,
+        /// or a store failure) must be reported as `PermissionDenied`, not
+        /// `NotFound`: `action_held` (relied on by `resolve_baseline_actions`,
+        /// which resolves `read`/`push` up front and caches the pair for a
+        /// connection or session's entire lifetime) only recognizes
+        /// `PermissionDenied`/`Unauthenticated` as a genuine "no", folding
+        /// anything else into "the check itself failed" and propagating it
+        /// as `Err` rather than a clean denial. This is the same
+        /// misclassification class the `AuthClientAuthorizer`
+        /// "resource absent from response" fix
+        /// (`interpret_check_user_permission_response_tests`, the "Round 5
+        /// regression") exists to prevent, for a new reason: a client
+        /// referencing a repository that was never created (or a stale id)
+        /// must be denied cleanly, not surfaced to a QUIC/gRPC caller as a
+        /// 500-class internal error.
+        #[tokio::test]
+        async fn unresolvable_repository_is_a_clean_denial_not_an_infra_failure() {
+            let (authorizer, _immutable, _mutable, _execution) =
+                authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
+            let claims = token_in_groups(&["engineering"]);
+            let token = VerifiedToken::new("raw", &claims);
+
+            // No metadata was ever seeded for this id.
+            let unknown_repository: RepositoryId = Context::from([9u8; 16]).into();
+            let err = authorizer
+                .check_repository_access(Some(&token), unknown_repository, Some(READ_ACTION))
+                .await
+                .expect_err("an unresolvable repository must be denied, not succeed");
+            assert_eq!(
+                err.code(),
+                tonic::Code::PermissionDenied,
+                "must be a recognized denial, not e.g. NotFound, which action_held cannot \
+                 distinguish from an infra failure"
+            );
+
+            let held = action_held(Err(err)).expect(
+                "action_held must recognize this as a clean denial, not propagate it as an \
+                 infra failure",
+            );
+            assert!(!held, "an unresolvable repository holds no action");
+        }
+
         #[tokio::test(flavor = "multi_thread")]
         async fn reachability_none_succeeds_on_any_grant_but_is_not_a_specific_action() {
             let (authorizer, immutable, mutable, execution) =
@@ -1406,99 +1500,125 @@ mod tests {
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
         }
 
-        /// The sync/no-panic property from the design doc's "load-bearing
-        /// open question": `ReachabilityAuthorizer::check_reachability_sync`
-        /// polls `check_repository_access`'s future exactly once via
-        /// `now_or_never()` and panics if it is not immediately ready. This
-        /// exercises that real synchronous entry point -- not
-        /// `ConfiguredGrantsAuthorizer` directly -- against a
-        /// `ConfiguredGrantsAuthorizer` backed by a real store, on both a
-        /// cold cache (first call, forces the `block_in_place`/`block_on`
-        /// fallback in `resolve_name_sync`) and a warm cache (second call,
-        /// hits the cache and never touches the runtime at all). Neither
-        /// call may panic, and both must resolve to the same, correct
-        /// answer.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn check_reachability_sync_does_not_panic_cold_or_warm_cache() {
+        /// `check_reachability_sync`'s no-panic property, proven under the
+        /// *real* constrained runtime both production call sites (the gRPC
+        /// interceptor and the link-read closure) actually run on:
+        /// `lore_base::runtime::net_runtime()`, built with
+        /// `max_blocking_threads(1)`. This deliberately does **not** run
+        /// under this test's own ambient `#[tokio::test]` runtime (default,
+        /// much larger blocking pool) -- that would prove nothing, since
+        /// this property would hold trivially there even if the bridge
+        /// were unsafe under `net_runtime`'s real constraint. `lore_spawn_net!`
+        /// (the same macro every gRPC/QUIC endpoint uses in `server.rs`)
+        /// spawns the real work onto `net_runtime` exactly the way
+        /// production does. Neither `check_reachability_sync` nor the store
+        /// reads it triggers need `LORE_CONTEXT` (confirmed:
+        /// `repository::metadata_hash`/`metadata` and `Metadata::serialize`/
+        /// `deserialize` never call `execution_context()`), so this test
+        /// does not thread one through the spawned task.
+        #[tokio::test]
+        async fn check_reachability_sync_does_not_panic_under_net_runtimes_constrained_blocking_pool()
+         {
             let (authorizer, immutable, mutable, execution) =
                 authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
-
             LORE_CONTEXT
-                .scope(execution, async move {
-                    seed_repository(immutable, mutable, repository(), "backend").await;
-
-                    let reachability = ReachabilityAuthorizer {
-                        authorizer: Arc::new(authorizer),
-                        legacy_resource_claim: false,
-                    };
-                    let claims = token_in_groups(&["engineering"]);
-
-                    // Cold cache: `resolve_name_sync` has never seen this
-                    // `RepositoryId` before, so this call goes through the
-                    // `block_in_place`/`block_on` fallback. This must not
-                    // panic (the historical failure mode: an async,
-                    // I/O-bound authorizer plugged into `now_or_never()`
-                    // unchanged panics here on first real use) and must
-                    // answer correctly.
-                    reachability
-                        .check_reachability_sync(&claims, repository())
-                        .expect("cold-cache resolution must not panic and must grant reachability");
-
-                    // Warm cache: the same call again must still not panic,
-                    // and must now be answered purely from the cache with
-                    // no store I/O at all.
-                    reachability
-                        .check_reachability_sync(&claims, repository())
-                        .expect("warm-cache resolution must not panic either");
-
-                    // A denied caller on the same (now warm) cache entry
-                    // also must not panic, proving the property holds for
-                    // the deny path too, not just the allow path.
-                    let denied_claims = token_in_groups(&["qa"]);
-                    let err = reachability
-                        .check_reachability_sync(&denied_claims, repository())
-                        .expect_err("qa holds no grant here");
-                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
-                })
+                .scope(
+                    execution,
+                    seed_repository(immutable, mutable, repository(), "backend"),
+                )
                 .await;
+
+            let reachability = ReachabilityAuthorizer {
+                authorizer: Arc::new(authorizer),
+                legacy_resource_claim: false,
+            };
+            let claims = token_in_groups(&["engineering"]);
+            let denied_claims = token_in_groups(&["qa"]);
+
+            lore_spawn_net!(async move {
+                // Cold cache: `resolve_name` has never seen this
+                // `RepositoryId` before, so this goes through the
+                // `block_in_place` + `core_runtime().block_on(..)`
+                // fallback -- on a real `net_runtime` worker thread, with
+                // `net_runtime`'s real, single-slot blocking pool. This
+                // must not panic (the historical failure mode: an async,
+                // I/O-bound authorizer plugged into `now_or_never()`
+                // unchanged panics here on first real use) and must answer
+                // correctly.
+                reachability
+                    .check_reachability_sync(&claims, repository())
+                    .expect(
+                        "cold-cache resolution must not panic under net_runtime's constrained \
+                         blocking pool",
+                    );
+
+                // Warm cache: answered purely from the cache -- the fast
+                // `now_or_never()` path, no blocking-pool involvement at
+                // all.
+                reachability
+                    .check_reachability_sync(&claims, repository())
+                    .expect("warm-cache resolution must not panic either");
+
+                // A denied caller on the same (now warm) cache entry also
+                // must not panic, proving the property for the deny path
+                // too, not just the allow path.
+                let err = reachability
+                    .check_reachability_sync(&denied_claims, repository())
+                    .expect_err("qa holds no grant here");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            })
+            .await
+            .expect("the task spawned onto net_runtime must not panic");
         }
 
-        /// Same property, proven directly against
-        /// `check_repository_access`'s returned future rather than through
-        /// `check_reachability_sync`: `now_or_never()` must return `Some`,
-        /// never `None` (`Pending`), on both a cold and a warm cache.
-        #[tokio::test(flavor = "multi_thread")]
-        async fn check_repository_access_future_never_suspends_when_polled() {
+        /// Blocking-pool *safety* under real contention, not just a single
+        /// call succeeding: two distinct repositories, both cold, resolved
+        /// *concurrently* on `net_runtime`. `net_runtime`'s blocking pool
+        /// has exactly one slot (`max_blocking_threads(1)`), so the second
+        /// `block_in_place` call here cannot get a replacement thread until
+        /// the first one's fallback finishes -- if that serialization were
+        /// instead a deadlock (e.g. two block_in_place calls each waiting
+        /// on the other), this test would hang rather than complete. Both
+        /// calls are independent (neither depends on the other's
+        /// progress), so correct behavior is serialization, not deadlock.
+        #[tokio::test]
+        async fn check_reachability_sync_serializes_rather_than_deadlocks_under_concurrent_cache_misses()
+         {
             let (authorizer, immutable, mutable, execution) =
                 authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
-
+            let repository_a: RepositoryId = Context::from([7u8; 16]).into();
+            let repository_b: RepositoryId = Context::from([8u8; 16]).into();
             LORE_CONTEXT
-                .scope(execution, async move {
-                    seed_repository(immutable, mutable, repository(), "backend").await;
-                    let claims = token_in_groups(&["engineering"]);
-                    let token = VerifiedToken::new("raw", &claims);
-
-                    // Cold cache.
-                    let result = authorizer
-                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
-                        .now_or_never();
-                    assert!(
-                        result.is_some(),
-                        "the future must resolve on first poll even on a cache miss"
-                    );
-                    result.unwrap().expect("engineering holds read");
-
-                    // Warm cache.
-                    let result = authorizer
-                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
-                        .now_or_never();
-                    assert!(
-                        result.is_some(),
-                        "the future must resolve on first poll on a cache hit too"
-                    );
-                    result.unwrap().expect("engineering still holds read");
+                .scope(execution, async {
+                    seed_repository(immutable.clone(), mutable.clone(), repository_a, "a").await;
+                    seed_repository(immutable, mutable, repository_b, "b").await;
                 })
                 .await;
+
+            let reachability = Arc::new(ReachabilityAuthorizer {
+                authorizer: Arc::new(authorizer),
+                legacy_resource_claim: false,
+            });
+            let claims = token_in_groups(&["engineering"]);
+
+            let task_a = {
+                let reachability = reachability.clone();
+                let claims = claims.clone();
+                lore_spawn_net!(async move {
+                    reachability.check_reachability_sync(&claims, repository_a)
+                })
+            };
+            let task_b = lore_spawn_net!(async move {
+                reachability.check_reachability_sync(&claims, repository_b)
+            });
+
+            let (result_a, result_b) = tokio::join!(task_a, task_b);
+            result_a
+                .expect("task a must not panic")
+                .expect("repository_a resolution must succeed despite concurrent contention");
+            result_b
+                .expect("task b must not panic")
+                .expect("repository_b resolution must succeed despite concurrent contention");
         }
     }
 
