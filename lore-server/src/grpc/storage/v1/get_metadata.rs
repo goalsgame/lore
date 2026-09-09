@@ -32,7 +32,11 @@ use tracing::info_span;
 use super::get::GetResponseStream;
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
@@ -106,11 +110,21 @@ async fn get_metadata_item(
 pub async fn handler(
     request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<GetResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let claims = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
+    let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let mut stream = request.into_inner();
 
     let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);

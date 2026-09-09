@@ -32,7 +32,9 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
@@ -141,6 +143,22 @@ pub async fn handler(
     let auth_token = get_authorization(request.extensions()).ok();
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    // Baseline `push` requirement against the *destination* repository this
+    // connection's metadata names — separate from, and in addition to, the
+    // per-fragment plain-reachability check `copy_item` performs above
+    // against each fragment's *source* repository.
+    let raw_token = extract_authorization_header(&request);
+    let verified_token = crate::grpc::verified_token(&auth_token, &raw_token);
+    reachability_authorizer
+        .authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            destination_repository,
+            Some(PUSH_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
     let mut stream = request.into_inner();
 

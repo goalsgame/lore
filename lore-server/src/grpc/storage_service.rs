@@ -46,7 +46,12 @@ use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::grpc::extract_authorization_header;
+use crate::grpc::get_authorization;
+use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::legacy::rpc::storage_service_server::StorageService;
 use crate::protocol::attribute_map::get_user_id_from_context;
@@ -124,6 +129,17 @@ impl StorageService for LoreStorageService {
         )?);
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
+        let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+        self.reachability_authorizer
+            .authorizer
+            .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+            .await
+            .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
         let mut stream = request.into_inner();
 
         // TODO(psharpe): Make channel capacity configurable
@@ -264,6 +280,16 @@ impl StorageService for LoreStorageService {
         )?);
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
+        let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+        self.reachability_authorizer
+            .authorizer
+            .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+            .await
+            .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
         // Stream of fragments
         let mut stream = request.into_inner();
@@ -409,11 +435,21 @@ impl StorageService for LoreStorageService {
     ) -> Result<Response<lore_proto::QueryResponse>, Status> {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
 
         let execution = setup_execution(module_path!(), correlation_id, user_id);
 
         LORE_CONTEXT
             .scope(execution, async move {
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.reachability_authorizer
+                    .authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 let context = Arc::new(metadata_to_attribute(
                     request.metadata(),
                     request.extensions(),
@@ -475,6 +511,26 @@ impl StorageService for LoreStorageService {
         attrs.insert(self.reachability_authorizer.clone());
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+        // Baseline `push` requirement against the *destination* repository
+        // this connection's metadata names — separate from, and in addition
+        // to, the per-fragment plain-reachability check performed deeper in
+        // `Copy::handle` (protocol/storage/copy.rs) against each fragment's
+        // *source* repository via the `ReachabilityAuthorizer` inserted
+        // above.
+        let destination_repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
+        let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+        self.reachability_authorizer
+            .authorizer
+            .check_repository_access(
+                verified_token.as_ref(),
+                destination_repository,
+                Some(PUSH_ACTION),
+            )
+            .await
+            .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
         let mut stream = request.into_inner();
 
@@ -638,6 +694,9 @@ impl StorageService for LoreStorageService {
     ) -> Result<Response<lore_proto::VerifyResponse>, Status> {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
 
         let execution = setup_execution(module_path!(), correlation_id, user_id);
 
@@ -645,6 +704,17 @@ impl StorageService for LoreStorageService {
             .scope(
                 execution,
                 async move {
+                    let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                    self.reachability_authorizer
+                        .authorizer
+                        .check_repository_access(
+                            verified_token.as_ref(),
+                            repository,
+                            Some(READ_ACTION),
+                        )
+                        .await
+                        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                     let context = Arc::new(metadata_to_attribute(
                         request.metadata(),
                         request.extensions(),
@@ -689,10 +759,20 @@ impl StorageService for LoreStorageService {
 
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
         let execution = setup_execution(module_path!(), correlation_id, user_id);
 
         LORE_CONTEXT
             .scope(execution, async move {
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.reachability_authorizer
+                    .authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 let context = Arc::new(metadata_to_attribute(
                     request.metadata(),
                     request.extensions(),
@@ -734,10 +814,20 @@ impl StorageService for LoreStorageService {
 
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
         let execution = setup_execution(module_path!(), correlation_id, user_id);
 
         LORE_CONTEXT
             .scope(execution, async move {
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.reachability_authorizer
+                    .authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 let context = Arc::new(metadata_to_attribute(
                     request.metadata(),
                     request.extensions(),
@@ -772,10 +862,20 @@ impl StorageService for LoreStorageService {
 
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let repository = get_repository(request.metadata())?;
+        let claims = get_authorization(request.extensions()).ok();
+        let raw_token = extract_authorization_header(&request);
         let execution = setup_execution(module_path!(), correlation_id, user_id);
 
         LORE_CONTEXT
             .scope(execution, async move {
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.reachability_authorizer
+                    .authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 let context = Arc::new(metadata_to_attribute(
                     request.metadata(),
                     request.extensions(),

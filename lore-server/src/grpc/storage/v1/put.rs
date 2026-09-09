@@ -32,7 +32,11 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::interpret_streaming_error;
@@ -108,11 +112,20 @@ async fn put_item(
 pub async fn handler(
     request: Request<Streaming<storage_v1::PutRequest>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let claims = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
+    let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
     let mut stream = request.into_inner();
 
@@ -180,4 +193,96 @@ pub async fn handler(
 
     let recv_stream = ReceiverStream::from(rx);
     Ok(Response::new(Box::pin(recv_stream) as PutResponseStream))
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_base::lore_spawn;
+    use lore_base::runtime::LORE_CONTEXT;
+    use lore_base::types::Context;
+    use rand::random;
+    use tonic::Code;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+    use crate::grpc::storage::v1::test_utils::make_empty_put_stream_request;
+    use crate::grpc::storage_service::LoreStorageService;
+    use crate::store::test_store_create;
+
+    /// `groups` is an ordinary named `AuthorizationToken` field (the Dex convention), so a
+    /// `GlobalGrantsAuthorizer` configured with `permission_claim = "groups"` reads it directly.
+    fn groups_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())))
+    }
+
+    fn token_with_groups(groups: &'static [&'static str]) -> AuthorizationToken {
+        AuthorizationToken {
+            groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// The one-time authorization gate runs before the request stream is ever read, so an
+    /// empty stream (no items) is enough to distinguish "denied outright" from "allowed to
+    /// proceed" — no real fragment data is needed either way.
+    ///
+    /// Takes `&'static` rather than a plain borrow: `lore_spawn!` requires
+    /// everything the spawned future captures to be `'static`, and every
+    /// call site already passes a literal slice (eligible for `'static`
+    /// promotion), so this costs call sites nothing.
+    async fn put_with_groups(
+        groups: &'static [&'static str],
+    ) -> Result<Response<PutResponseStream>, Status> {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        let repository = random::<Context>();
+        let token = token_with_groups(groups);
+
+        lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store.clone(),
+                mutable_store,
+                ReachabilityAuthorizer::new(None, None)
+                    .expect("no config never fails to construct"),
+            );
+
+            let mut request = make_empty_put_stream_request(repository);
+            request.extensions_mut().insert(token);
+
+            handler(request, immutable_store, groups_authorizer(), &service).await
+        }))
+        .await
+        .expect("test task failed")
+    }
+
+    #[tokio::test]
+    async fn token_holding_only_push_can_put() {
+        put_with_groups(&["push"])
+            .await
+            .expect("a token holding push must be allowed to put");
+    }
+
+    #[tokio::test]
+    async fn token_holding_only_read_is_denied_on_put() {
+        // `Response<PutResponseStream>` doesn't implement `Debug` (it boxes a trait object
+        // stream), so `expect_err` — which requires the `Ok` side to be `Debug` — doesn't apply
+        // here; match explicitly instead.
+        let err = match put_with_groups(&["read"]).await {
+            Ok(_) => panic!("a token holding only read must not be allowed to put"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn token_holding_neither_action_is_denied_on_put() {
+        let err = match put_with_groups(&[]).await {
+            Ok(_) => panic!("a token holding neither action must not be allowed to put"),
+            Err(err) => err,
+        };
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
 }

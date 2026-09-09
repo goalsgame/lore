@@ -15,7 +15,11 @@ use tonic::Status;
 use tracing::Instrument;
 use zerocopy::IntoBytes;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
@@ -28,10 +32,19 @@ use crate::util::setup_execution;
 pub async fn handler(
     request: Request<storage_v1::QueryRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<storage_v1::QueryResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let claims = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
+    let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
@@ -90,10 +103,84 @@ mod tests {
     use tonic::Request;
 
     use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
     use crate::grpc::storage::v1::test_utils::make_request_with_metadata;
     use crate::grpc::storage_service::LoreStorageService;
     use crate::store::test_store_create;
+
+    /// `groups` is an ordinary named `AuthorizationToken` field (the Dex convention), so a
+    /// `GlobalGrantsAuthorizer` configured with `permission_claim = "groups"` reads it directly.
+    fn groups_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            legacy_resource_claim: false,
+        }
+    }
+
+    fn token_with_groups(groups: &'static [&'static str]) -> AuthorizationToken {
+        AuthorizationToken {
+            groups: Some(groups.iter().map(|g| g.to_string()).collect()),
+            ..Default::default()
+        }
+    }
+
+    /// Takes `&'static` rather than a plain borrow: `lore_spawn!` requires
+    /// everything the spawned future captures to be `'static`, and every
+    /// call site already passes a literal slice (eligible for `'static`
+    /// promotion), so this costs call sites nothing.
+    async fn query_with_groups(
+        groups: &'static [&'static str],
+    ) -> Result<Response<storage_v1::QueryResponse>, Status> {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create store");
+        let repository = random::<Context>();
+        let token = token_with_groups(groups);
+
+        lore_spawn!(LORE_CONTEXT.scope(execution, async move {
+            let service = LoreStorageService::new(
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                groups_reachability_authorizer(),
+            );
+
+            let mut request = make_request_with_metadata(
+                storage_v1::QueryRequest { addresses: vec![] },
+                repository,
+                "",
+            );
+            request.extensions_mut().insert(token);
+
+            StorageServiceV1::query(&service, request).await
+        }))
+        .await
+        .expect("Test task failed")
+    }
+
+    #[tokio::test]
+    async fn token_holding_only_read_can_query() {
+        query_with_groups(&["read"])
+            .await
+            .expect("a token holding read must be allowed to query");
+    }
+
+    #[tokio::test]
+    async fn token_holding_only_push_is_denied_on_query() {
+        let err = query_with_groups(&["push"])
+            .await
+            .expect_err("a token holding only push must not be allowed to query");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
+
+    #[tokio::test]
+    async fn token_holding_neither_action_is_denied_on_query() {
+        let err = query_with_groups(&[])
+            .await
+            .expect_err("a token holding neither action must not be allowed to query");
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+    }
 
     #[tokio::test]
     async fn test_v1_query_with_stored_and_missing_addresses() {

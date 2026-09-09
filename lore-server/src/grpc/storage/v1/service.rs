@@ -33,7 +33,13 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     ) -> Result<Response<Self::GetStream>, Status> {
-        get::handler(request, self.immutable_store().clone(), self).await
+        get::handler(
+            request,
+            self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+            self,
+        )
+        .await
     }
 
     type GetMetadataStream = GetResponseStream;
@@ -42,7 +48,13 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     ) -> Result<Response<Self::GetMetadataStream>, Status> {
-        get_metadata::handler(request, self.immutable_store().clone(), self).await
+        get_metadata::handler(
+            request,
+            self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+            self,
+        )
+        .await
     }
 
     type GetResolvedStream = GetResolvedResponseStream;
@@ -55,6 +67,7 @@ impl StorageServiceV1 for LoreStorageService {
             request,
             self.mutable_store().clone(),
             self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
             self,
         )
         .await
@@ -70,6 +83,7 @@ impl StorageServiceV1 for LoreStorageService {
             request,
             self.mutable_store().clone(),
             self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
             self,
         )
         .await
@@ -81,14 +95,25 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<storage_v1::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
-        put::handler(request, self.immutable_store().clone(), self).await
+        put::handler(
+            request,
+            self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+            self,
+        )
+        .await
     }
 
     async fn query(
         &self,
         request: Request<storage_v1::QueryRequest>,
     ) -> Result<Response<storage_v1::QueryResponse>, Status> {
-        query::handler(request, self.immutable_store().clone()).await
+        query::handler(
+            request,
+            self.immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+        )
+        .await
     }
 
     type CopyStream = CopyResponseStream;
@@ -110,28 +135,48 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<storage_v1::VerifyRequest>,
     ) -> Result<Response<storage_v1::VerifyResponse>, Status> {
-        verify::handler(request, self.local_immutable_store().clone()).await
+        verify::handler(
+            request,
+            self.local_immutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+        )
+        .await
     }
 
     async fn mutable_load(
         &self,
         request: Request<storage_v1::MutableLoadRequest>,
     ) -> Result<Response<storage_v1::MutableLoadResponse>, Status> {
-        mutable_load::handler(request, self.mutable_store().clone()).await
+        mutable_load::handler(
+            request,
+            self.mutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+        )
+        .await
     }
 
     async fn mutable_store(
         &self,
         request: Request<storage_v1::MutableStoreRequest>,
     ) -> Result<Response<storage_v1::MutableStoreResponse>, Status> {
-        mutable_store::handler(request, self.mutable_store().clone()).await
+        mutable_store::handler(
+            request,
+            self.mutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+        )
+        .await
     }
 
     async fn mutable_compare_and_swap(
         &self,
         request: Request<storage_v1::MutableCompareAndSwapRequest>,
     ) -> Result<Response<storage_v1::MutableCompareAndSwapResponse>, Status> {
-        mutable_compare_and_swap::handler(request, self.mutable_store().clone()).await
+        mutable_compare_and_swap::handler(
+            request,
+            self.mutable_store().clone(),
+            self.reachability_authorizer().authorizer.clone(),
+        )
+        .await
     }
 }
 
