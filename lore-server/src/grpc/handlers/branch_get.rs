@@ -15,8 +15,12 @@ use tonic::Status;
 use tracing::debug;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -26,10 +30,20 @@ pub async fn handler(
     request: Request<BranchGetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchGetResponse>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     let branch = BranchId::from(req.branch);
 
@@ -83,8 +97,13 @@ mod tests {
     use rand::random;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     #[tokio::test]
     async fn test_handle() {
@@ -141,9 +160,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect("Request failed");
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
+                .await
+                .expect("Request failed");
                 let response_branch = response
                     .into_inner()
                     .branch
@@ -180,9 +204,14 @@ mod tests {
                     REPOSITORY_ID_KEY,
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
-                let response = handler(request, immutable_store.clone(), mutable_store.clone())
-                    .await
-                    .expect("Request failed");
+                let response = handler(
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
+                .await
+                .expect("Request failed");
                 let response_branch = response
                     .into_inner()
                     .branch
@@ -201,5 +230,109 @@ mod tests {
                 assert_eq!(response_branch, expected);
             })
             .await;
+    }
+
+    mod authorization {
+        use lore_revision::lore::RepositoryId;
+
+        use super::*;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+
+        fn roles_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string())))
+        }
+
+        fn make_request(
+            repository: RepositoryId,
+            branch: BranchId,
+            roles: &[&str],
+        ) -> Request<BranchGetRequest> {
+            let mut request = Request::new(BranchGetRequest {
+                branch: branch.into(),
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
+                unreachable!()
+            };
+            request
+                .extensions_mut()
+                .insert(crate::auth::jwt::AuthorizationToken {
+                    user_id: "ci-bot".into(),
+                    extra,
+                    ..crate::auth::jwt::AuthorizationToken::default()
+                });
+            request
+        }
+
+        /// A token holding `read` succeeds — `BranchGet` is classified as a
+        /// read operation.
+        #[tokio::test]
+        async fn allows_caller_with_read_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            LORE_CONTEXT
+                .scope(execution.clone(), async move {
+                    let repository_context = Arc::new(RepositoryContext::new_server_context(
+                        immutable_store.clone(),
+                        mutable_store.clone(),
+                        repository,
+                    ));
+                    let write_token = get_write_token();
+                    lore_revision::branch::create(
+                        repository_context,
+                        &write_token,
+                        branch_id,
+                        "test-branch",
+                        lore_revision::branch::default_category(),
+                        "creator",
+                        1,
+                        vec![],
+                        false,
+                        false,
+                    )
+                    .await
+                    .expect("Failed to create branch");
+
+                    handler(
+                        make_request(repository, branch_id, &["read"]),
+                        immutable_store,
+                        mutable_store,
+                        roles_authorizer(),
+                    )
+                    .await
+                    .expect("a caller holding read should be allowed to BranchGet");
+                })
+                .await;
+        }
+
+        /// A token holding only `push` (not `read`) is denied — `push` does
+        /// not imply `read`.
+        #[tokio::test]
+        async fn denies_caller_with_only_push_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            LORE_CONTEXT
+                .scope(execution.clone(), async move {
+                    let err = handler(
+                        make_request(repository, branch_id, &["push"]),
+                        immutable_store,
+                        mutable_store,
+                        roles_authorizer(),
+                    )
+                    .await
+                    .expect_err("a caller without read must be denied");
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+                })
+                .await;
+        }
     }
 }

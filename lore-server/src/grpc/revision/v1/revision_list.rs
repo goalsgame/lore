@@ -37,10 +37,14 @@ use tracing::debug;
 use tracing::warn;
 use zerocopy::IntoBytes;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::cache;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::none_or_status;
@@ -154,10 +158,20 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instruments: &RevisionListInstruments,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionListResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let Some(start) = req.start else {
@@ -1052,10 +1066,15 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::FailingLoadStore;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     struct TestInstrumentProvider {}
 
@@ -1319,6 +1338,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("unset start should fail");
@@ -1348,6 +1368,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -1409,6 +1430,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -1450,6 +1472,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("first page")
@@ -1476,6 +1499,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("second page");
@@ -1530,6 +1554,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -1581,6 +1606,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -1650,6 +1676,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("backpressure must not be reported as an absent cursor");
@@ -1706,6 +1733,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("first call");
@@ -1724,6 +1752,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("second call");
@@ -1766,6 +1795,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -1792,6 +1822,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("unknown signature should fail");
@@ -1815,6 +1846,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("unknown branch should fail");
@@ -1850,6 +1882,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -1922,6 +1955,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("first call");
@@ -1946,6 +1980,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("second call");
@@ -1988,6 +2023,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -2078,6 +2114,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("first call");
@@ -2102,6 +2139,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("second call");
@@ -2145,6 +2183,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("cache fast path")
@@ -2163,6 +2202,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("walk path")
@@ -2206,6 +2246,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -2247,6 +2288,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -2300,6 +2342,7 @@ mod test {
                     list_cache: false,
                 },
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("a throttled branch latest must not resolve");
@@ -2338,6 +2381,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -2387,6 +2431,7 @@ mod test {
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                     &make_instruments(),
+                    allow_all_authorizer(),
                 )
                 .await
                 .unwrap_or_else(|err| panic!("revision {number} should resolve: {err}"))
@@ -2432,6 +2477,7 @@ mod test {
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                     &make_instruments(),
+                    allow_all_authorizer(),
                 )
                 .await
                 .unwrap_or_else(|err| panic!("revision {number} should resolve: {err}"))
@@ -2472,6 +2518,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("skipped revision number should not resolve");
@@ -2564,6 +2611,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -2605,6 +2653,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -2649,6 +2698,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -2698,6 +2748,7 @@ mod test {
                     DEFAULT_HISTORY_STEP_SIZE,
                     crate::grpc::server::RevisionListAcceleration::default(),
                     &make_instruments(),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("paginated request failed")
@@ -2762,6 +2813,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -2821,6 +2873,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -2896,6 +2949,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("first request failed");
@@ -2934,6 +2988,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("second request failed");
@@ -3059,6 +3114,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 crate::grpc::server::RevisionListAcceleration::default(),
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect_err("a genuine store failure must surface, not become a missing cursor");
@@ -3116,6 +3172,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")
@@ -3201,6 +3258,7 @@ mod test {
                 DEFAULT_HISTORY_STEP_SIZE,
                 acceleration,
                 &make_instruments(),
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed")

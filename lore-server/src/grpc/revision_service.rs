@@ -126,6 +126,7 @@ impl RevisionService for LoreRevisionService {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -144,6 +145,7 @@ impl RevisionService for LoreRevisionService {
                 self.notification.clone(),
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -159,6 +161,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -174,6 +177,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -333,6 +337,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -348,6 +353,7 @@ impl RevisionService for LoreRevisionService {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await
@@ -381,6 +387,7 @@ impl RevisionService for LoreRevisionService {
                 self.history_step_size,
                 self.acceleration,
                 &self.revision_list_instruments,
+                self.reachability_authorizer.authorizer.clone(),
             ),
         )
         .await

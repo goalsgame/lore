@@ -20,8 +20,12 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -46,10 +50,20 @@ pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.id);
@@ -176,8 +190,13 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -254,6 +273,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("CAS hit should succeed");
@@ -300,6 +320,7 @@ mod test {
                 make_request(repository_id, branch_id, stale_expected, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("CAS miss should still return Ok");
@@ -339,6 +360,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("read-only name modification must fail");
@@ -375,6 +397,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("read-only category modification must fail");
@@ -409,6 +432,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("removal of read-only creator must fail");
@@ -445,6 +469,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("protect toggle must succeed");
@@ -465,6 +490,7 @@ mod test {
                 make_request(repository_id, branch_id, Hash::default(), Hash::default()),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("unknown branch must fail");
@@ -566,6 +592,7 @@ mod test {
                 make_request(repository_id, child_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("CAS on deleted branch must succeed");
@@ -597,6 +624,7 @@ mod test {
                 make_request(repository_id, branch_id, current, garbage),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("garbage updated hash must fail to deserialize");
@@ -634,6 +662,7 @@ mod test {
                 make_request(repository_id, branch_id, garbage, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("garbage expected hash must fail to deserialize");
@@ -674,6 +703,7 @@ mod test {
                 make_request(repository_id, branch_id, current, updated),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("dangling address reference must fail");
@@ -698,6 +728,7 @@ mod test {
             ),
             immutable_store,
             mutable_store,
+            allow_all_authorizer(),
         )
         .await
         .expect_err("zero branch id must fail");
@@ -715,9 +746,14 @@ mod test {
             expected: Hash::default().into(),
             updated: Hash::default().into(),
         });
-        let err = handler(request, immutable_store, mutable_store)
-            .await
-            .expect_err("missing repository must fail");
+        let err = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            allow_all_authorizer(),
+        )
+        .await
+        .expect_err("missing repository must fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

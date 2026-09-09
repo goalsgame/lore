@@ -20,10 +20,14 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
@@ -63,6 +67,7 @@ fn validate_create_input(name: &str, category: &str, creator: &str) -> Result<()
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchCreate::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchCreateRequest>,
@@ -72,8 +77,25 @@ pub async fn handler(
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchCreateResponse>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
+
+    // Checked here, in the front door, using the original caller's own
+    // already-interceptor-verified token — before the fork into
+    // forward-vs-local. See `branch_get.rs` for the shared rationale.
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            caller_context.repository_id,
+            Some(PUSH_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_create
@@ -284,6 +306,8 @@ mod test {
 
     use super::*;
     use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
@@ -297,6 +321,14 @@ mod test {
         fn labels(&self) -> &[KeyValue] {
             &[]
         }
+    }
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    fn roles_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string())))
     }
 
     mod direct_handling {
@@ -338,6 +370,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -394,6 +427,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -444,6 +478,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("empty name should fail");
@@ -492,6 +527,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -544,6 +580,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("first create should succeed");
@@ -556,6 +593,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("duplicate id should fail");
@@ -725,6 +763,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("should succeed");
@@ -764,6 +803,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("forwarded error should propagate");
@@ -799,6 +839,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("transport error should become internal status");
@@ -839,6 +880,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("local execution should succeed");
@@ -848,6 +890,104 @@ mod test {
                     .branch
                     .expect("response should include Branch");
                 assert_eq!(branch.name, "main");
+            }))
+            .await;
+        }
+    }
+
+    mod authorization {
+        use super::*;
+
+        fn make_request_with_roles(
+            repository: RepositoryId,
+            branch_id: BranchId,
+            roles: &[&str],
+        ) -> Request<BranchCreateRequest> {
+            let mut request = Request::new(BranchCreateRequest {
+                id: branch_id.into(),
+                name: "main".into(),
+                creator: Some("alice".into()),
+                category: "default".into(),
+                stack: vec![],
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
+                unreachable!()
+            };
+            request.extensions_mut().insert(AuthorizationToken {
+                user_id: "ci-bot".into(),
+                extra,
+                ..AuthorizationToken::default()
+            });
+            request
+        }
+
+        /// A token holding `push` may create a branch — `BranchCreate` is
+        /// classified as a push operation, checked in the front-door
+        /// `handler()` before the forward-vs-local fork.
+        #[tokio::test]
+        async fn allows_caller_with_push_action() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let mut notification_sender = MockNotificationSender::new();
+            notification_sender
+                .expect_branch_created()
+                .return_once(|_, _| ());
+            let notification_sender = Arc::new(notification_sender);
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let hook_dispatcher = HookDispatcher::empty();
+
+                handler(
+                    make_request_with_roles(repository, branch_id, &["push"]),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    roles_authorizer(),
+                )
+                .await
+                .expect("a caller holding push should be allowed to create a branch");
+            }))
+            .await;
+        }
+
+        /// A token holding only `read` (not `push`) is denied.
+        #[tokio::test]
+        async fn denies_caller_with_only_read_action() {
+            let repository = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let notification_sender = Arc::new(MockNotificationSender::new());
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let branch_id = BranchId::from(uuid::Uuid::now_v7());
+                let hook_dispatcher = HookDispatcher::empty();
+
+                let err = handler(
+                    make_request_with_roles(repository, branch_id, &["read"]),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &None, /* no forwarded requests */
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    roles_authorizer(),
+                )
+                .await
+                .expect_err("a caller without push must be denied");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
             }))
             .await;
         }

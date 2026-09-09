@@ -19,10 +19,14 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -37,6 +41,7 @@ use crate::util::setup_execution;
 ///
 /// Depending on server configuration, this request may get completely delegated to another server
 /// via `ForwardedRevisionService`
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "BranchDelete::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
@@ -46,8 +51,25 @@ pub async fn handler(
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
+
+    // Checked here, in the front door, using the original caller's own
+    // already-interceptor-verified token — before the fork into
+    // forward-vs-local. See `branch_get.rs` for the shared rationale.
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            caller_context.repository_id,
+            Some(PUSH_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_delete
@@ -214,6 +236,7 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::hooks::HookDispatcher;
@@ -229,6 +252,10 @@ mod test {
         fn labels(&self) -> &[KeyValue] {
             &[]
         }
+    }
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
     }
 
     /// Returns the latest revision the test branch was forked at, so
@@ -360,6 +387,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -417,6 +445,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("first delete should succeed");
@@ -430,6 +459,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("second delete should succeed (idempotent)");
@@ -461,6 +491,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("delete on unknown branch should fail");
@@ -498,6 +529,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("default branch delete should fail");
@@ -539,6 +571,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("current-branch delete should fail");
@@ -578,6 +611,7 @@ mod test {
                     &None, /* no forwarded requests */
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("protected delete should fail");
@@ -728,6 +762,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("should succeed");
@@ -767,6 +802,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("forwarded error should propagate");
@@ -802,6 +838,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("transport error should become internal status");
@@ -849,6 +886,7 @@ mod test {
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
                     &hook_dispatcher,
                     &instrument_provider,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("local execution should succeed");

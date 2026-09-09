@@ -18,8 +18,12 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::hook_error_to_status;
@@ -36,10 +40,20 @@ pub async fn handler(
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     let branch = BranchId::from(req.branch);
 
@@ -121,11 +135,16 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     struct TestInstrumentProvider {}
 
@@ -238,6 +257,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -273,6 +293,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -321,6 +342,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                allow_all_authorizer(),
             )
             .await
             .unwrap_err();

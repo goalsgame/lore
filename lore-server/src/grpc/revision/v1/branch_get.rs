@@ -17,10 +17,14 @@ use tonic::Status;
 use tracing::debug;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::util::setup_execution;
 
 /// `lore.revision.v1.RevisionService.BranchGet` handler.
@@ -37,8 +41,27 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchGetResponse>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
+
+    // Checked here, in the front door, using the original caller's own
+    // already-interceptor-verified token — before the fork into
+    // forward-vs-local. The forwarded/receiving side (`ForwardedRevisionService`)
+    // has no verified claims available the same way and performs its own,
+    // separate check (see `forwarded_revision/v1/branch_get.rs`).
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            caller_context.repository_id,
+            Some(READ_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_get
@@ -190,9 +213,14 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     /// Returns the latest revision the test branch was forked at.
     async fn create_test_branch(
@@ -303,6 +331,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -343,6 +372,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -381,6 +411,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -415,6 +446,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("name lookup of deleted branch should fail");
@@ -436,6 +468,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("unknown id should fail");
@@ -456,6 +489,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("unknown name should fail");
@@ -482,6 +516,7 @@ mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("unset query should fail");
@@ -639,6 +674,7 @@ mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("should succeed");
@@ -671,6 +707,7 @@ mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("forwarded error should propagate");
@@ -700,6 +737,7 @@ mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("transport error should become internal status");
@@ -736,6 +774,7 @@ mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("local execution should succeed");
@@ -746,6 +785,94 @@ mod test {
                     .expect("response should include Branch");
                 assert_eq!(branch.name, "test-name");
                 assert!(!branch.deleted);
+            }))
+            .await;
+        }
+    }
+
+    mod authorization {
+        use super::*;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+
+        fn roles_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string())))
+        }
+
+        fn make_request_with_roles(
+            repository: RepositoryId,
+            branch_id: BranchId,
+            roles: &[&str],
+        ) -> Request<BranchGetRequest> {
+            let mut request = Request::new(BranchGetRequest {
+                query: Some(BranchGetQuery::Id(branch_id.into())),
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
+                unreachable!()
+            };
+            request
+                .extensions_mut()
+                .insert(crate::auth::jwt::AuthorizationToken {
+                    user_id: "ci-bot".into(),
+                    extra,
+                    ..crate::auth::jwt::AuthorizationToken::default()
+                });
+            request
+        }
+
+        /// A token holding `read` succeeds — `BranchGet` is classified as a
+        /// read operation, checked in the front-door `handler()` before the
+        /// forward-vs-local fork.
+        #[tokio::test]
+        async fn allows_caller_with_read_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                create_test_branch(repository_context, branch_id).await;
+
+                handler(
+                    make_request_with_roles(repository, branch_id, &["read"]),
+                    immutable_store,
+                    mutable_store,
+                    &None, /* no forwarded requests */
+                    roles_authorizer(),
+                )
+                .await
+                .expect("a caller holding read should be allowed to BranchGet");
+            }))
+            .await;
+        }
+
+        /// A token holding only `push` (not `read`) is denied.
+        #[tokio::test]
+        async fn denies_caller_with_only_push_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let err = handler(
+                    make_request_with_roles(repository, branch_id, &["push"]),
+                    immutable_store,
+                    mutable_store,
+                    &None, /* no forwarded requests */
+                    roles_authorizer(),
+                )
+                .await
+                .expect_err("a caller without read must be denied");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
             }))
             .await;
         }

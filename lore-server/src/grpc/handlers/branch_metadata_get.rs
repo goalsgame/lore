@@ -13,8 +13,12 @@ use tonic::Response;
 use tonic::Status;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -24,10 +28,20 @@ pub async fn handler(
     request: Request<BranchMetadataGetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchMetadataGetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let branch = BranchId::from(req.branch_id);
@@ -74,8 +88,13 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -123,9 +142,14 @@ mod test {
             .expect("Failed to create branch");
 
             let request = make_request(repository_id, branch_id);
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("Handler failed");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await
+            .expect("Handler failed");
 
             let hash: lore_storage::Hash = response.into_inner().metadata_hash.into();
             assert!(!hash.is_zero(), "metadata hash should be non-zero");
@@ -143,7 +167,13 @@ mod test {
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
             let request = make_request(repository_id, branch_id);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await;
 
             assert!(result.is_err());
             assert_eq!(result.unwrap_err().code(), tonic::Code::NotFound);
@@ -159,7 +189,13 @@ mod test {
             test_store_create().await.expect("Failed to create stores");
 
         let request = make_request(repository_id, BranchId::default());
-        let result = handler(request, immutable_store, mutable_store).await;
+        let result = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            allow_all_authorizer(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -175,7 +211,13 @@ mod test {
         let request = Request::new(BranchMetadataGetRequest {
             branch_id: branch_id.into(),
         });
-        let result = handler(request, immutable_store, mutable_store).await;
+        let result = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            allow_all_authorizer(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);

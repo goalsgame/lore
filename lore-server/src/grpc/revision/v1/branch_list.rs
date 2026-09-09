@@ -26,10 +26,14 @@ use tracing::info;
 use tracing::warn;
 
 use super::branch_record::build_branch;
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
+use crate::grpc::get_authorization;
 use crate::grpc::log_server_error;
 use crate::util::setup_execution;
 
@@ -64,8 +68,25 @@ pub async fn handler(
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     forwarded_requests: &Option<Arc<dyn ForwardedRequests>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchListStream>, Status> {
     let caller_context = CallerContext::from_original_request(&request)?;
+
+    // Checked here, in the front door, using the original caller's own
+    // already-interceptor-verified token — before the fork into
+    // forward-vs-local. See `branch_get.rs` for the shared rationale.
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            caller_context.repository_id,
+            Some(READ_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
         && forwarded_requests.rpc_flags().revision_branch_list
@@ -328,9 +349,14 @@ pub mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     /// Creates a root-style branch (empty stack); not deletable.
     pub async fn create_root_branch(
@@ -458,6 +484,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -522,6 +549,7 @@ pub mod test {
                     immutable_store,
                     throttled,
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("handler returns a stream");
@@ -562,6 +590,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -604,6 +633,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -676,6 +706,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -702,6 +733,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -746,6 +778,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -791,6 +824,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -822,6 +856,7 @@ pub mod test {
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &None, /* no forwarded requests */
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -969,6 +1004,7 @@ pub mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("should succeed");
@@ -1006,6 +1042,7 @@ pub mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .map(|_| ())
@@ -1034,6 +1071,7 @@ pub mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .map(|_| ())
@@ -1071,6 +1109,7 @@ pub mod test {
                     immutable_store,
                     mutable_store,
                     &Some(forwarded_requests as Arc<dyn ForwardedRequests>),
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("local execution should succeed");

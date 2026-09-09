@@ -168,6 +168,7 @@ impl RevisionService for LoreRevisionV1Service {
                 &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -187,6 +188,7 @@ impl RevisionService for LoreRevisionV1Service {
                 &self.forwarded_requests,
                 &self.hook_dispatcher,
                 &self.instrument_provider,
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -203,6 +205,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.forwarded_requests,
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -219,6 +222,7 @@ impl RevisionService for LoreRevisionV1Service {
             self.immutable_store.clone(),
             self.mutable_store.clone(),
             &self.forwarded_requests,
+            self.repository_authorizer.clone(),
         )
         .await
     }
@@ -254,6 +258,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -269,6 +274,7 @@ impl RevisionService for LoreRevisionV1Service {
                 request,
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
+                self.repository_authorizer.clone(),
             ),
         )
         .await
@@ -287,6 +293,7 @@ impl RevisionService for LoreRevisionV1Service {
                 self.history_step_size,
                 self.acceleration,
                 &self.revision_list_instruments,
+                self.repository_authorizer.clone(),
             ),
         )
         .await

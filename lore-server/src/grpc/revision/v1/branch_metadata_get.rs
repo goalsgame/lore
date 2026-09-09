@@ -16,8 +16,12 @@ use tonic::Status;
 use tracing::debug;
 use tracing::info;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::util::setup_execution;
@@ -32,10 +36,20 @@ pub async fn handler(
     request: Request<BranchMetadataGetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchMetadataGetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.id);
@@ -92,9 +106,14 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -143,6 +162,7 @@ mod test {
                 make_request(repository_id, branch_id),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("Handler failed");
@@ -236,6 +256,7 @@ mod test {
                 make_request(repository_id, child_id),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect("Handler failed");
@@ -258,6 +279,7 @@ mod test {
                 make_request(repository_id, branch_id),
                 immutable_store,
                 mutable_store,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("nonexistent branch should fail");
@@ -276,6 +298,7 @@ mod test {
             make_request(repository_id, BranchId::default()),
             immutable_store,
             mutable_store,
+            allow_all_authorizer(),
         )
         .await
         .expect_err("zero branch id should fail");
@@ -291,9 +314,14 @@ mod test {
         let request = Request::new(BranchMetadataGetRequest {
             id: branch_id.into(),
         });
-        let err = handler(request, immutable_store, mutable_store)
-            .await
-            .expect_err("missing repository should fail");
+        let err = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            allow_all_authorizer(),
+        )
+        .await
+        .expect_err("missing repository should fail");
         assert_eq!(err.code(), tonic::Code::InvalidArgument);
     }
 }

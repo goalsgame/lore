@@ -33,8 +33,12 @@ use tonic::metadata::MetadataValue;
 use tracing::debug;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::revision_service::RevisionListInstruments;
@@ -82,10 +86,19 @@ pub async fn handler(
     history_step_size: u64,
     acceleration: crate::grpc::server::RevisionListAcceleration,
     instruments: &RevisionListInstruments,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<RevisionListResponse>, Status> {
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let user_id = get_user_id(request.extensions());
     let repository_id = get_repository(request.metadata())?;
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
     let req = request.into_inner();
 

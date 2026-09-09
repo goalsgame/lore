@@ -18,8 +18,12 @@ use tonic::Response;
 use tonic::Status;
 use tracing::debug;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -65,10 +69,20 @@ pub async fn handler(
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchCreateResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let branch = BranchId::from(req.branch);
@@ -217,6 +231,8 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
+    use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
@@ -230,6 +246,14 @@ mod test {
         fn labels(&self) -> &[KeyValue] {
             &[]
         }
+    }
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    fn roles_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(GlobalGrantsAuthorizer::new(Some("roles".to_string())))
     }
 
     #[tokio::test]
@@ -272,6 +296,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                allow_all_authorizer(),
             )
             .await
             .expect("Request failed");
@@ -317,6 +342,7 @@ mod test {
                 notification_sender.clone(),
                 &hook_dispatcher,
                 &instrument_provider,
+                allow_all_authorizer(),
             )
             .await
             .unwrap_err();
@@ -324,5 +350,104 @@ mod test {
             assert_eq!(response.code(), tonic::Code::InvalidArgument);
         }))
         .await;
+    }
+
+    mod authorization {
+        use super::*;
+
+        fn make_request(
+            repository: RepositoryId,
+            branch: BranchId,
+            roles: &[&str],
+        ) -> Request<BranchCreateRequest> {
+            let mut request = Request::new(BranchCreateRequest {
+                branch: branch.into(),
+                name: "main".into(),
+                creator: "creator".into(),
+                created: 1,
+                category: "default".into(),
+                stack: vec![],
+                revision_deprecated: None,
+                parent_deprecated: None,
+            });
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            let serde_json::Value::Object(extra) = serde_json::json!({ "roles": roles }) else {
+                unreachable!()
+            };
+            request
+                .extensions_mut()
+                .insert(crate::auth::jwt::AuthorizationToken {
+                    user_id: "ci-bot".into(),
+                    extra,
+                    ..crate::auth::jwt::AuthorizationToken::default()
+                });
+            request
+        }
+
+        /// A token holding `push` may create a branch — `BranchCreate` is
+        /// classified as a push operation.
+        #[tokio::test]
+        async fn allows_caller_with_push_action() {
+            let repository = random::<RepositoryId>();
+            let branch_context = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let mut notification_sender = MockNotificationSender::new();
+            notification_sender
+                .expect_branch_created()
+                .return_once(|_, _| ());
+            let notification_sender = Arc::new(notification_sender);
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let hook_dispatcher = HookDispatcher::empty();
+                handler(
+                    make_request(repository, branch_context, &["push"]),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    roles_authorizer(),
+                )
+                .await
+                .expect("a caller holding push should be allowed to create a branch");
+            }))
+            .await;
+        }
+
+        /// A token holding only `read` (not `push`) is denied — `read` does
+        /// not imply `push`.
+        #[tokio::test]
+        async fn denies_caller_with_only_read_action() {
+            let repository = random::<RepositoryId>();
+            let branch_context = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            let notification_sender = Arc::new(MockNotificationSender::new());
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+                let hook_dispatcher = HookDispatcher::empty();
+                let err = handler(
+                    make_request(repository, branch_context, &["read"]),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    roles_authorizer(),
+                )
+                .await
+                .expect_err("a caller without push must be denied");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            }))
+            .await;
+        }
     }
 }

@@ -18,8 +18,12 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
+use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
@@ -93,10 +97,20 @@ pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchMetadataSetResponse>, Status> {
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+
+    let authorization = extract_authorization_header(&request);
+    let claims_for_authz = get_authorization(request.extensions()).ok();
+    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
+    repository_authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(PUSH_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let req = request.into_inner();
 
     let branch_id = BranchId::from(req.branch_id);
@@ -206,8 +220,13 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     fn make_request(
         repository: RepositoryId,
@@ -285,9 +304,14 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("Handler failed");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await
+            .expect("Handler failed");
 
             let inner = response.into_inner();
             assert!(inner.success);
@@ -322,7 +346,13 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -356,7 +386,13 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
@@ -392,9 +428,14 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let response = handler(request, immutable_store, mutable_store)
-                .await
-                .expect("Handler failed — protect should be writable");
+            let response = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await
+            .expect("Handler failed — protect should be writable");
 
             assert!(response.into_inner().success);
         }))
@@ -428,7 +469,13 @@ mod test {
             // Use a bogus expected hash
             let stale_hash = Hash::from(random::<[u8; 32]>());
             let request = make_request(repository_id, branch_id, stale_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await;
 
             // CAS should fail because expected_hash doesn't match (it can't be deserialized)
             assert!(result.is_err());
@@ -449,7 +496,13 @@ mod test {
             Hash::default(),
             Hash::default(),
         );
-        let result = handler(request, immutable_store, mutable_store).await;
+        let result = handler(
+            request,
+            immutable_store,
+            mutable_store,
+            allow_all_authorizer(),
+        )
+        .await;
 
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
@@ -481,7 +534,13 @@ mod test {
             let new_hash = serialize_metadata(repository.clone(), &proposed).await;
 
             let request = make_request(repository_id, branch_id, current_hash, new_hash);
-            let result = handler(request, immutable_store, mutable_store).await;
+            let result = handler(
+                request,
+                immutable_store,
+                mutable_store,
+                allow_all_authorizer(),
+            )
+            .await;
 
             assert!(result.is_err());
             let status = result.unwrap_err();
