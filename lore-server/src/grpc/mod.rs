@@ -70,6 +70,7 @@ use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::auth::jwt::ResourcePermission;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::hooks::traits::HookError;
 use crate::hooks::traits::StatusCode;
@@ -231,6 +232,37 @@ pub fn verified_token<'a>(
     claims
         .as_ref()
         .map(|claims| VerifiedToken::new(raw.as_deref().unwrap_or_default(), claims))
+}
+
+/// Runs the single per-repository authorization check every directly-
+/// received handler with exactly one action to check performs before doing
+/// any work: builds the `VerifiedToken` from the request's already-decoded
+/// claims (`get_authorization`) and raw bearer token
+/// (`extract_authorization_header`), then asks `repository_authorizer`
+/// whether the caller holds `action` (or plain reachability, for
+/// `action: None`) on `repository`.
+///
+/// Centralizes the extract-header → get_authorization → verified_token →
+/// check_repository_access → map_err block duplicated across every
+/// directly-received handler that performs exactly one such check.
+/// Handlers that need the token again afterward — for a second, stacked
+/// check (`branch_push`'s `push-protected`), a loop over several actions
+/// (`repository_delete`), or a downstream call — build it themselves via
+/// [`verified_token`] and call `check_repository_access` directly instead,
+/// since this helper's token does not outlive the check.
+pub async fn check_repository_action<B>(
+    request: &tonic::Request<B>,
+    repository_authorizer: &dyn RepositoryAuthorizer,
+    repository: RepositoryId,
+    action: Option<&str>,
+) -> Result<(), Status> {
+    let claims = get_authorization(request.extensions()).ok();
+    let raw = extract_authorization_header(request);
+    let token = verified_token(&claims, &raw);
+    repository_authorizer
+        .check_repository_access(token.as_ref(), repository, action)
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))
 }
 
 /// Verifies a forwarded peer-to-peer request's raw bearer token

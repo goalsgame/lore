@@ -17,9 +17,7 @@ use zerocopy::IntoBytes;
 
 use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
-use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
-use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
 use crate::grpc::log_server_error;
@@ -38,13 +36,13 @@ pub async fn handler(
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
-    let claims = get_authorization(request.extensions()).ok();
-    let raw_token = extract_authorization_header(&request);
-    let verified_token = crate::grpc::verified_token(&claims, &raw_token);
-    repository_authorizer
-        .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
-        .await
-        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+    crate::grpc::check_repository_action(
+        &request,
+        repository_authorizer.as_ref(),
+        repository,
+        Some(READ_ACTION),
+    )
+    .await?;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 

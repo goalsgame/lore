@@ -23,10 +23,8 @@ use crate::authnz::repository_authorizer::PUSH_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
-use crate::grpc::extract_authorization_header;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
-use crate::grpc::get_authorization;
 use crate::grpc::hook_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -58,17 +56,13 @@ pub async fn handler(
     // Checked here, in the front door, using the original caller's own
     // already-interceptor-verified token — before the fork into
     // forward-vs-local. See `branch_get.rs` for the shared rationale.
-    let authorization = extract_authorization_header(&request);
-    let claims_for_authz = get_authorization(request.extensions()).ok();
-    let verified_token = crate::grpc::verified_token(&claims_for_authz, &authorization);
-    repository_authorizer
-        .check_repository_access(
-            verified_token.as_ref(),
-            caller_context.repository_id,
-            Some(PUSH_ACTION),
-        )
-        .await
-        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+    crate::grpc::check_repository_action(
+        &request,
+        repository_authorizer.as_ref(),
+        caller_context.repository_id,
+        Some(PUSH_ACTION),
+    )
+    .await?;
 
     let req = request.into_inner();
     if let Some(forwarded_requests) = forwarded_requests
