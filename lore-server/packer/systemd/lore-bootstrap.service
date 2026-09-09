@@ -1,0 +1,11 @@
+[Unit]
+Description=Fetch lore-server's per-environment config and secrets
+Before=lore.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/bin/lore-bootstrap.sh
+
+[Install]
+WantedBy=multi-user.target

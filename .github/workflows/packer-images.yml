@@ -1,0 +1,124 @@
+# SPDX-FileCopyrightText: 2026 GOALS
+# SPDX-License-Identifier: MIT
+
+# Builds and publishes the lore-server GCE image. See lore-server/packer/ for
+# the Packer template and lore-server/packer/lore-server.pkr.hcl's header for
+# why this lives here rather than in the org's shared nonseastarq image
+# pipeline.
+name: Build lore-server image
+
+on:
+  # Cheap, no-cloud-cost syntax check on every change to the packer config,
+  # so a broken template is caught before anyone tries a real build.
+  push:
+    paths:
+      - .github/workflows/packer-images.yml
+      - lore-server/packer/**
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to bake (e.g. a git tag like v0.9.2). Used only for the output image name."
+        required: true
+      proxy_base_version:
+        description: "org shared proxybase-{version}-amd64 base image version to build on (overrides the .pkr.hcl default)"
+        required: false
+        default: ""
+      zone:
+        description: "GCP zone for the build VM"
+        required: false
+        default: "europe-west1-b"
+
+permissions:
+  contents: read
+
+env:
+  BUILD_PROJECT: prj-comm-cicd-g000
+  IMAGE_PROJECT: prj-comm-artifacts-g000
+  PACKER_SA: sa-packer-lore@prj-comm-cicd-g000.iam.gserviceaccount.com
+  NETWORK_PROJECT: prj-comm-network-hub-g000
+  NETWORK: vpc-comm-shared-hub
+  SUBNETWORK: snet-comm-euw1-cicd-primary
+  WIF_PROVIDER: projects/697903885246/locations/global/workloadIdentityPools/github-wi-pool/providers/github-jwt
+  WIF_SA: sa-github-lore-builder@prj-comm-cicd-g000.iam.gserviceaccount.com
+
+jobs:
+  # Runs on every push touching the packer config. No GCP auth, no build VM,
+  # no cost — just confirms the template still parses.
+  validate:
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: hashicorp/setup-packer@v3
+      - working-directory: lore-server/packer
+        run: |
+          packer init lore-server.pkr.hcl
+          packer validate -syntax-only -var "project_id=placeholder" -var "version=0.0.0-validate" lore-server.pkr.hcl
+
+  build:
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # for google-github-actions/auth's WIF exchange
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      # See pr-validate.yml's unit job for why: the runner's root filesystem
+      # doesn't have room for a release build's artifacts.
+      - name: Build on the larger /mnt volume
+        run: |
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packer-lore-server-build
+
+      - name: Build loreserver (release, x86_64-unknown-linux-gnu)
+        run: cargo build --release --target x86_64-unknown-linux-gnu -p lore-server --bin loreserver
+
+      - name: Stage release binary for packer
+        run: |
+          mkdir -p lore-server/packer/release-binaries
+          cp /mnt/cargo-target/x86_64-unknown-linux-gnu/release/loreserver lore-server/packer/release-binaries/loreserver
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ env.WIF_PROVIDER }}
+          service_account: ${{ env.WIF_SA }}
+
+      - uses: hashicorp/setup-packer@v3
+
+      - name: Init packer plugins
+        working-directory: lore-server/packer
+        run: packer init lore-server.pkr.hcl
+
+      - name: Build lore-server image
+        working-directory: lore-server/packer
+        run: |
+          args=(
+            -var "project_id=${{ env.BUILD_PROJECT }}"
+            -var "image_project_id=${{ env.IMAGE_PROJECT }}"
+            -var "service_account_email=${{ env.PACKER_SA }}"
+            -var "network_project_id=${{ env.NETWORK_PROJECT }}"
+            -var "network=${{ env.NETWORK }}"
+            -var "subnetwork=${{ env.SUBNETWORK }}"
+            -var "zone=${{ inputs.zone }}"
+            -var "version=${{ inputs.version }}"
+          )
+          if [ -n "${{ inputs.proxy_base_version }}" ]; then
+            args+=(-var "proxy_base_version=${{ inputs.proxy_base_version }}")
+          fi
+          packer build "${args[@]}" lore-server.pkr.hcl
