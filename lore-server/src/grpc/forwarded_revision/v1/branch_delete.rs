@@ -10,6 +10,9 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::revision::v1::branch_delete::branch_delete_implementation;
 use crate::hooks::HookDispatcher;
@@ -17,6 +20,14 @@ use crate::hooks::HookDispatcher;
 /// Handler that takes a `BranchDelete` request forwarded on from peer's `RevisionService`
 /// and executes it, returning the result to the other server for forwarding on to its
 /// client
+///
+/// This peer-to-peer path predates `RepositoryAuthorizer` — see
+/// `forwarded_revision/v1/branch_get.rs` for the shared rationale: this
+/// service is mounted on the internal mTLS server with no JWT interceptor
+/// of its own, so this handler must verify the forwarded raw bearer token
+/// (`CallerContext::authorization`) itself, into real claims, rather than
+/// trusting the originating server's decision.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(name = "ForwardedRevision::v1::BranchDelete::Handler", skip_all)]
 pub async fn handler(
     request: Request<BranchDeleteRequest>,
@@ -25,8 +36,34 @@ pub async fn handler(
     notification_sender: Arc<dyn NotificationSender>,
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
 ) -> Result<Response<BranchDeleteResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
+
+    let claims =
+        match (&jwt_verifier, caller_context.authorization.as_deref()) {
+            (Some(verifier), Some(raw)) => {
+                let bearer = raw.strip_prefix("Bearer ").unwrap_or(raw);
+                Some(verifier.verify_token(bearer).await.map_err(|_err| {
+                    Status::unauthenticated("invalid forwarded authorization token")
+                })?)
+            }
+            (Some(_), None) => {
+                return Err(Status::unauthenticated("authorization header required"));
+            }
+            (None, _) => None,
+        };
+
+    let verified_token = crate::grpc::verified_token(&claims, &caller_context.authorization);
+    repository_authorizer
+        .check_repository_access(
+            verified_token.as_ref(),
+            caller_context.repository_id,
+            Some(PUSH_ACTION),
+        )
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
 
     branch_delete_implementation(
         request.into_inner(),
@@ -60,11 +97,16 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::grpc::get_write_token;
     use crate::grpc::handlers::branch_push;
     use crate::hooks::HookDispatcher;
     use crate::notification::testing::MockNotificationSender;
     use crate::store::test_store_create;
+
+    fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     struct TestInstrumentProvider {}
 
@@ -183,6 +225,8 @@ mod test {
                 notification_sender,
                 &hook_dispatcher,
                 &instrument_provider,
+                None,
+                allow_all_authorizer(),
             )
             .await
             .expect_err("missing user id should fail");
@@ -228,6 +272,8 @@ mod test {
                     notification_sender,
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect("Request failed");
@@ -261,10 +307,184 @@ mod test {
                     notification_sender,
                     &hook_dispatcher,
                     &instrument_provider,
+                    None,
+                    allow_all_authorizer(),
                 )
                 .await
                 .expect_err("unknown branch should fail");
                 assert_eq!(err.code(), tonic::Code::NotFound);
+            }))
+            .await;
+        }
+    }
+
+    /// Exercises the second, independent layer of defense this handler adds
+    /// on top of the originating server's own front-door check — mirrors
+    /// `forwarded_revision/v1/branch_get.rs`'s `authorization` test module.
+    mod authorization {
+        use std::ops::Add;
+        use std::time::Duration;
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
+
+        use async_trait::async_trait;
+        use jsonwebtoken::Algorithm;
+        use jsonwebtoken::DecodingKey;
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use jsonwebtoken::encode;
+
+        use super::*;
+        use crate::auth::jwk::JWKService;
+        use crate::auth::jwk::JWKServiceError;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+
+        const ALGORITHM: Algorithm = Algorithm::HS256;
+        const SIGNING_SECRET: &str = "forwarded-branch-delete-test-secret";
+        const TEST_AUDIENCE: &str = "lore-test";
+
+        mockall::mock! {
+            TestJWKService {}
+
+            #[async_trait]
+            impl JWKService for TestJWKService {
+                async fn get_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+                fn get_cached_key(
+                    &self,
+                    kid: &str,
+                ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+                async fn refresh_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
+            }
+        }
+
+        fn verifier() -> JwtVerifier {
+            let mut service = MockTestJWKService::new();
+            service
+                .expect_get_key()
+                .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
+            JwtVerifier {
+                jwk_service: Arc::new(service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            }
+        }
+
+        fn make_jwt(groups: Option<Vec<String>>) -> String {
+            let claims = AuthorizationToken {
+                user_id: "test-user".to_string(),
+                issuer: "test-issuer".to_string(),
+                issued_at: 1,
+                expires: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(60))
+                    .as_secs(),
+                audience: vec![TEST_AUDIENCE.to_string()],
+                groups,
+                ..Default::default()
+            };
+            let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
+            let mut header = Header::new(ALGORITHM);
+            header.kid = Some("test-kid".to_string());
+            encode(&header, &claims, &key).unwrap()
+        }
+
+        fn tier1_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+            Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string())))
+        }
+
+        fn make_forwarded_request_with_token(
+            repository: RepositoryId,
+            branch_id: BranchId,
+            token: String,
+        ) -> Request<BranchDeleteRequest> {
+            CallerContext {
+                repository_id: repository,
+                user_id: "alice".into(),
+                correlation_id: String::new(),
+                authorization: Some(format!("Bearer {token}")),
+            }
+            .to_forwarded_request(BranchDeleteRequest {
+                id: branch_id.into(),
+            })
+            .expect("CallerContext::to_forwarded_request failed in test")
+        }
+
+        /// A forwarded caller lacking `push` is denied.
+        #[tokio::test]
+        async fn denies_forwarded_caller_without_push_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let notification_sender = Arc::new(MockNotificationSender::new());
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let hook_dispatcher = HookDispatcher::empty();
+                let token = make_jwt(Some(vec!["read".to_string()]));
+                let err = handler(
+                    make_forwarded_request_with_token(repository, branch_id, token),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    Some(verifier()),
+                    tier1_authorizer(),
+                )
+                .await
+                .expect_err("a forwarded caller without push must be denied");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            }))
+            .await;
+        }
+
+        /// A forwarded caller holding `push` succeeds.
+        #[tokio::test]
+        async fn allows_forwarded_caller_with_push_action() {
+            let repository = random::<RepositoryId>();
+            let branch_id = BranchId::from(uuid::Uuid::now_v7());
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+            let notification_sender = {
+                let mut sender = MockNotificationSender::new();
+                sender.expect_branch_deleted().return_once(|_, _| ());
+                Arc::new(sender)
+            };
+            let instrument_provider = TestInstrumentProvider {};
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    repository,
+                ));
+                create_test_branch(repository_context, branch_id).await;
+
+                let hook_dispatcher = HookDispatcher::empty();
+                let token = make_jwt(Some(vec!["push".to_string()]));
+                handler(
+                    make_forwarded_request_with_token(repository, branch_id, token),
+                    immutable_store,
+                    mutable_store,
+                    notification_sender,
+                    &hook_dispatcher,
+                    &instrument_provider,
+                    Some(verifier()),
+                    tier1_authorizer(),
+                )
+                .await
+                .expect("a forwarded caller holding push should be allowed");
             }))
             .await;
         }

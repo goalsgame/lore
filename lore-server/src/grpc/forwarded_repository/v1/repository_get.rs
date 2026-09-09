@@ -401,7 +401,13 @@ mod test {
                 )
                 .await;
 
-                let token = format!("Bearer {}", make_jwt(Some(vec!["anything".to_string()])));
+                // Was `["anything"]` before `RepositoryGet` required the
+                // baseline `read` action (closing the Tier 1 gap where any
+                // authenticated caller reached every partition regardless
+                // of group membership) — any claim value sufficed then,
+                // since the check was plain reachability. Now the token
+                // must actually hold `read`.
+                let token = format!("Bearer {}", make_jwt(Some(vec!["read".to_string()])));
                 let response = handler(
                     make_forwarded_request_with_auth(Query::Name("my-repo".into()), Some(token)),
                     Some(verifier()),
@@ -417,6 +423,42 @@ mod test {
                     .repository
                     .expect("response should include Repository");
                 assert_eq!(repository.name, "my-repo");
+            }))
+            .await;
+        }
+
+        /// A verified caller whose token does not hold `read` is denied,
+        /// even though authentication itself succeeds — the baseline `read`
+        /// requirement applies to the forwarded path exactly as it does to
+        /// the local one (both funnel through
+        /// `check_repository_query_authorization`).
+        #[tokio::test]
+        async fn denies_forwarded_request_without_read_action() {
+            let id = random::<RepositoryId>();
+            let (immutable_store, mutable_store, execution) =
+                test_store_create().await.expect("Failed to create stores");
+
+            Box::pin(LORE_CONTEXT.scope(execution, async move {
+                store_repository(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    id,
+                    "my-repo",
+                )
+                .await;
+
+                let token = format!("Bearer {}", make_jwt(Some(vec!["push".to_string()])));
+                let err = handler(
+                    make_forwarded_request_with_auth(Query::Name("my-repo".into()), Some(token)),
+                    Some(verifier()),
+                    tier1_authorizer(),
+                    immutable_store,
+                    mutable_store,
+                )
+                .await
+                .expect_err("a verified caller lacking read must still be denied");
+
+                assert_eq!(err.code(), tonic::Code::NotFound);
             }))
             .await;
         }

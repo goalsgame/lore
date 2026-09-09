@@ -222,6 +222,8 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
                 self.0.notification_sender.clone(),
                 self.0.hook_dispatcher.clone(),
                 rpc_timeout,
+                self.0.jwt_verifier.clone(),
+                self.0.repository_authorizer.clone(),
             ),
         ));
 

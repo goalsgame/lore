@@ -41,8 +41,8 @@ pub struct LoreForwardedRepositoryV1Service {
     instrument_provider: ForwardedRepositoryServiceInstrumentProvider,
     rpc_timeout: Duration,
     /// Verifies the forwarded caller's raw token into real claims for
-    /// `repository_get`, which — unlike `repository_create` — has to make a
-    /// real access decision on the receiving end (LEP
+    /// `repository_get` and `repository_create`, both of which have to make
+    /// a real access decision on the receiving end (LEP
     /// 2026-08-20-oidc-oauth2-authentication, D8/D9). `None` when this
     /// deployment has no `[server.auth]` at all, matching
     /// `AllowAllRepositoryAuthorizer` everywhere else.
@@ -97,6 +97,8 @@ impl ForwardedRepositoryService for LoreForwardedRepositoryV1Service {
             repository_create::handler(
                 request,
                 self.auth_url(),
+                self.jwt_verifier.clone(),
+                self.repository_authorizer.clone(),
                 self.immutable_store.clone(),
                 self.mutable_store.clone(),
                 &self.hook_dispatcher,

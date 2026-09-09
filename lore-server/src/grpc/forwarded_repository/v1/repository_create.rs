@@ -9,6 +9,8 @@ use tonic::Request;
 use tonic::Response;
 use tonic::Status;
 
+use crate::auth::jwt::JwtVerifier;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::repository::v1::repository_create::repository_create_implementation;
 use crate::hooks::HookDispatcher;
@@ -16,10 +18,21 @@ use crate::hooks::HookDispatcher;
 /// Handler that takes a `RepositoryCreate` request forwarded on from peer's `RepositoryService`
 /// and executes it, returning the result to the other server for forwarding on to its
 /// client
+///
+/// This peer-to-peer path predates `RepositoryAuthorizer`, same as
+/// `repository_get.rs`'s forwarded handler (see its doc comment for the full
+/// reasoning). The receiving server — this one — is the only side that can
+/// run a meaningful `push` check, so it must verify the forwarded raw
+/// bearer token (`CallerContext::authorization`) itself into real claims
+/// rather than trusting the originating server's decision or fabricating an
+/// already-authenticated token.
 #[tracing::instrument(name = "ForwardedRepository::v1::RepositoryCreate::Handler", skip_all)]
+#[allow(clippy::too_many_arguments)]
 pub async fn handler(
     request: Request<RepositoryCreateRequest>,
     auth_url: Option<String>,
+    jwt_verifier: Option<JwtVerifier>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     hook_dispatcher: &HookDispatcher,
@@ -27,9 +40,31 @@ pub async fn handler(
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
     let caller_context = CallerContext::from_forwarded_request(&request)?;
 
+    // Mirrors what `JWTAuthnInterceptor` does for a directly-received
+    // request, and exactly what `forwarded_repository/v1/repository_get.rs`
+    // does for the same reason: reject outright when this deployment has
+    // auth configured and the caller did not present a token that
+    // verifies, rather than falling back to an anonymous, and therefore
+    // potentially over-permissive, check.
+    let token =
+        match (&jwt_verifier, caller_context.authorization.as_deref()) {
+            (Some(verifier), Some(raw)) => {
+                let bearer = raw.strip_prefix("Bearer ").unwrap_or(raw);
+                Some(verifier.verify_token(bearer).await.map_err(|_err| {
+                    Status::unauthenticated("invalid forwarded authorization token")
+                })?)
+            }
+            (Some(_), None) => {
+                return Err(Status::unauthenticated("authorization header required"));
+            }
+            (None, _) => None,
+        };
+
     repository_create_implementation(
         request.into_inner(),
         caller_context,
+        token,
+        repository_authorizer,
         auth_url,
         immutable_store,
         mutable_store,
@@ -49,8 +84,13 @@ mod test {
     use tonic::Request;
 
     use super::*;
+    use crate::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
     use crate::hooks::HookDispatcher;
     use crate::store::test_store_create;
+
+    fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(AllowAllRepositoryAuthorizer)
+    }
 
     struct TestInstrumentProvider;
 
@@ -100,6 +140,8 @@ mod test {
             let err = handler(
                 request,
                 None,
+                None,
+                allow_all(),
                 immutable_store,
                 mutable_store,
                 &hook_dispatcher,
@@ -131,6 +173,8 @@ mod test {
                 let response = handler(
                     make_forwarded_request(repository_id, "my-repo"),
                     None, /* no auth */
+                    None,
+                    allow_all(),
                     immutable_store,
                     mutable_store,
                     &hook_dispatcher,
@@ -163,6 +207,8 @@ mod test {
                 handler(
                     make_forwarded_request(repository_id, "my-repo"),
                     None,
+                    None,
+                    allow_all(),
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &hook_dispatcher,
@@ -175,6 +221,8 @@ mod test {
                 let err = handler(
                     make_forwarded_request(repository_id, "other-name"),
                     None,
+                    None,
+                    allow_all(),
                     immutable_store,
                     mutable_store,
                     &hook_dispatcher,
