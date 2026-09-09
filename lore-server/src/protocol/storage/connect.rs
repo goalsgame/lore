@@ -331,6 +331,64 @@ mod tests {
                 "expected InternalError for a failed check, got {err:?}"
             );
         }
+
+        /// Round 5 regression: a legacy `AuthClientAuthorizer` deployment's
+        /// *only* way of denying `read`/`push` is the requested resource
+        /// being absent from `CheckUserPermissionResponse
+        /// .allowed_resource_permission` — which
+        /// `interpret_check_user_permission_response`
+        /// (`authnz/repository_authorizer.rs`) maps to
+        /// `Status::permission_denied`, not `Status::internal`. This mock
+        /// reproduces exactly that shape (denies both actions with
+        /// `PermissionDenied`, mirroring what a real `AuthClientAuthorizer`
+        /// now returns when a repository is simply unreachable) and proves
+        /// `action_held` recognizes it as a real denial: a clean
+        /// `AuthorizationFailure`, never `InternalError`.
+        struct AuthClientShapedDenialAuthorizer;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for AuthClientShapedDenialAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository: RepositoryId,
+                action: Option<&str>,
+            ) -> Result<(), Status> {
+                Err(Status::permission_denied(format!(
+                    "caller has no permissions for resource (action: {action:?})"
+                )))
+            }
+        }
+
+        fn auth_client_shaped_denial_reachability() -> ReachabilityAuthorizer {
+            ReachabilityAuthorizer {
+                authorizer: Arc::new(AuthClientShapedDenialAuthorizer),
+                legacy_resource_claim: false,
+            }
+        }
+
+        #[tokio::test]
+        async fn handle_auth_gives_a_clean_rejection_for_an_auth_client_shaped_denial() {
+            let message = Connect {
+                repository: random::<RepositoryId>(),
+                auth_token: Some(make_jwt()),
+            };
+            let context = Arc::new(AttributeMap::default());
+
+            let err = message
+                .handle_auth(
+                    context,
+                    jwt_verifier(),
+                    auth_client_shaped_denial_reachability(),
+                )
+                .await
+                .expect_err("a caller denied both actions must be rejected");
+
+            assert!(
+                matches!(err, MessageHandleError::AuthorizationFailure(_)),
+                "expected a clean AuthorizationFailure for a real denial, got {err:?}"
+            );
+        }
     }
 
     #[test]

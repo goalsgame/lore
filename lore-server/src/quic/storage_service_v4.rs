@@ -1062,5 +1062,83 @@ mod tests {
                 "expected InternalError for a failed check, got {err:?}"
             );
         }
+
+        /// Round 5 regression: a legacy `AuthClientAuthorizer` deployment's
+        /// *only* way of denying `read`/`push` is the requested resource
+        /// being absent from `CheckUserPermissionResponse
+        /// .allowed_resource_permission` — which
+        /// `interpret_check_user_permission_response`
+        /// (`authnz/repository_authorizer.rs`) maps to
+        /// `Status::permission_denied`, not `Status::internal`. This mock
+        /// reproduces exactly that shape (denies both actions with
+        /// `PermissionDenied`, mirroring what a real `AuthClientAuthorizer`
+        /// now returns when a repository is simply unreachable) and proves
+        /// `action_held` recognizes it as a real denial: a clean
+        /// `AuthorizationFailure`, never `InternalError`.
+        struct AuthClientShapedDenialAuthorizer;
+
+        #[async_trait]
+        impl RepositoryAuthorizer for AuthClientShapedDenialAuthorizer {
+            async fn check_repository_access(
+                &self,
+                _token: Option<&VerifiedToken<'_>>,
+                _repository: lore_revision::lore::RepositoryId,
+                action: Option<&str>,
+            ) -> Result<(), Status> {
+                Err(Status::permission_denied(format!(
+                    "caller has no permissions for resource (action: {action:?})"
+                )))
+            }
+        }
+
+        fn make_auth_client_shaped_denial_service(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> StorageServiceV4 {
+            let mut jwk_service = MockTestJWKService::new();
+            jwk_service.expect_get_key().returning(|_| {
+                Ok((
+                    DecodingKey::from_secret(TEST_SIGNING_SECRET.as_ref()),
+                    TEST_ALGORITHM,
+                ))
+            });
+            let verifier = crate::auth::jwt::JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            };
+            StorageServiceV4::new(
+                Arc::new(Some(verifier)),
+                Arc::new(AuthClientShapedDenialAuthorizer),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+            )
+        }
+
+        #[tokio::test]
+        async fn authorize_start_gives_a_clean_rejection_for_an_auth_client_shaped_denial() {
+            let (immutable_store, mutable_store, _exec) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = make_auth_client_shaped_denial_service(immutable_store, mutable_store);
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository: random(),
+                        correlation_id: "corr".into(),
+                        auth_token: make_jwt(vec![]),
+                    },
+                )
+                .await
+                .expect_err("a caller denied both actions must be rejected");
+
+            assert!(
+                matches!(err, MessageHandleError::AuthorizationFailure(_)),
+                "expected a clean AuthorizationFailure for a real denial, got {err:?}"
+            );
+        }
     }
 }

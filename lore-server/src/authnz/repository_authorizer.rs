@@ -7,6 +7,7 @@ use async_trait::async_trait;
 use futures::FutureExt;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
+use lore_proto::auth::CheckUserPermissionResponse;
 use thiserror::Error;
 use tonic::Code;
 use tonic::Status;
@@ -155,21 +156,44 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
                 Status::internal(format!("Failed to call auth check_user_permission: {err}"))
             })?;
 
-        let matched = permissions
-            .into_inner()
-            .allowed_resource_permission
-            .into_iter()
-            .find(|permission| permission.resource_id == resource_id)
-            .ok_or(Status::internal("No permissions for resource"))?;
+        interpret_check_user_permission_response(permissions.into_inner(), &resource_id, action)
+    }
+}
 
-        if resource_permission_satisfies(&matched.permission, action) {
-            Ok(())
-        } else {
-            Err(Status::permission_denied(format!(
-                "caller does not hold the '{}' action",
-                action.unwrap_or("<reachability>")
-            )))
-        }
+/// Interprets a `CheckUserPermissionResponse` already received for `resource_id` — no more
+/// network calls happen past this point, so every `Err` this returns is a genuine "no" from
+/// the auth service, never a failure of the check itself (that already would have short-
+/// circuited via `warn_map_err` in `check_repository_access`, above).
+///
+/// Two distinct shapes both mean "denied", and both must resolve to `Code::PermissionDenied`
+/// for [`action_held`] to recognize them: the resource is simply absent from
+/// `allowed_resource_permission` — the auth service granting the caller no access to it at
+/// all — or it is present but its granted `permission` strings don't satisfy `action`. Prior
+/// to this function existing, the first case returned `Status::internal("No permissions for
+/// resource")` — indistinguishable, to [`action_held`], from an actual infra failure, so a
+/// legacy deployment's *only* way of denying `read`/`push` (a repository a caller cannot
+/// reach at all is never listed) was misclassified as "the check itself failed" and
+/// `Connect::handle_auth`/`AuthorizeStart` turned every such denial into
+/// `MessageHandleError::InternalError` instead of a clean rejection.
+fn interpret_check_user_permission_response(
+    response: CheckUserPermissionResponse,
+    resource_id: &str,
+    action: Option<&str>,
+) -> Result<(), Status> {
+    let matched = response
+        .allowed_resource_permission
+        .into_iter()
+        .find(|permission| permission.resource_id == resource_id);
+
+    match matched {
+        None => Err(Status::permission_denied(format!(
+            "caller has no permissions for resource '{resource_id}'"
+        ))),
+        Some(matched) if resource_permission_satisfies(&matched.permission, action) => Ok(()),
+        Some(_) => Err(Status::permission_denied(format!(
+            "caller does not hold the '{}' action",
+            action.unwrap_or("<reachability>")
+        ))),
     }
 }
 
@@ -848,6 +872,99 @@ mod tests {
                 &["read".to_string()],
                 Some("obliterate")
             ));
+        }
+    }
+
+    /// Round 5 regression: `AuthClientAuthorizer`'s *only* way of denying
+    /// `read`/`push` for a legacy deployment — the requested resource is
+    /// simply absent from `CheckUserPermissionResponse.allowed_resource_permission`
+    /// — must classify as `Code::PermissionDenied`, the same as every other
+    /// genuine "no", not `Code::Internal`. Before this fix, `action_held`
+    /// (in `resolve_baseline_actions`) could not tell this apart from an
+    /// actual auth-service failure, so a legacy caller correctly denied
+    /// `push` (say) got `MessageHandleError::InternalError` out of
+    /// `Connect::handle_auth`/`AuthorizeStart` instead of a clean rejection
+    /// — the one denial shape a legacy deployment actually produces was the
+    /// one `action_held` could never recognize.
+    mod interpret_check_user_permission_response_tests {
+        use lore_proto::auth::ResourcePermission;
+
+        use super::*;
+
+        fn response(entries: &[(&str, &[&str])]) -> CheckUserPermissionResponse {
+            CheckUserPermissionResponse {
+                allowed_resource_permission: entries
+                    .iter()
+                    .map(|(resource_id, permission)| ResourcePermission {
+                        resource_id: (*resource_id).to_string(),
+                        permission: permission.iter().map(|p| p.to_string()).collect(),
+                    })
+                    .collect(),
+                denied_resource_permission: vec![],
+            }
+        }
+
+        /// The exact shape this whole regression is about: the resource
+        /// simply isn't in the response at all. This is `AuthClientAuthorizer`'s
+        /// only way of expressing "the caller cannot reach this repository",
+        /// which is also its only way of denying `read`/`push` — so this
+        /// must be a real, recognizable denial (`PermissionDenied`), not
+        /// `Internal`.
+        #[test]
+        fn resource_absent_from_response_is_permission_denied_not_internal() {
+            let resp = response(&[]);
+            let err =
+                interpret_check_user_permission_response(resp, "urc-target", Some(PUSH_ACTION))
+                    .expect_err("resource not listed at all must be denied");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+
+        /// Same, but the response lists *other* resources — still absent
+        /// for the one actually requested.
+        #[test]
+        fn resource_absent_among_other_listed_resources_is_permission_denied() {
+            let resp = response(&[("urc-other", &["read", "push"])]);
+            let err =
+                interpret_check_user_permission_response(resp, "urc-target", Some(READ_ACTION))
+                    .expect_err("the requested resource is not among those listed");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+
+        /// The pre-existing denial shape (resource present, permission
+        /// string insufficient) is unaffected by this fix — still
+        /// `PermissionDenied`.
+        #[test]
+        fn resource_present_without_the_action_is_permission_denied() {
+            let resp = response(&[("urc-target", &["obliterate"])]);
+            let err = interpret_check_user_permission_response(
+                resp,
+                "urc-target",
+                Some("push-protected"),
+            )
+            .expect_err("listed but without the requested action");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+
+        /// The success path is unaffected: resource present and its
+        /// permissions satisfy the action.
+        #[test]
+        fn resource_present_with_the_action_is_ok() {
+            let resp = response(&[("urc-target", &["push"])]);
+            interpret_check_user_permission_response(resp, "urc-target", Some(PUSH_ACTION))
+                .expect("listed with the requested action");
+        }
+
+        /// `read`/`push` degrade to plain reachability for a legacy
+        /// deployment (see `auth_client_resource_permission` above): being
+        /// listed at all — any permission strings, even unrelated ones —
+        /// is enough.
+        #[test]
+        fn resource_present_satisfies_read_and_push_regardless_of_permission_strings() {
+            let resp = response(&[("urc-target", &["some-other-permission"])]);
+            interpret_check_user_permission_response(resp.clone(), "urc-target", Some(READ_ACTION))
+                .expect("read degrades to reachability for a legacy deployment");
+            interpret_check_user_permission_response(resp, "urc-target", Some(PUSH_ACTION))
+                .expect("push degrades to reachability for a legacy deployment");
         }
     }
 
