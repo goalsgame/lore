@@ -73,10 +73,7 @@ pub async fn handler(
 
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(
-                reachability_authorizer,
-                authorization,
-            )),
+            .with_link_read(link_read_authorizer(reachability_authorizer, authorization)),
     );
     LORE_CONTEXT
         .scope(execution, async move {

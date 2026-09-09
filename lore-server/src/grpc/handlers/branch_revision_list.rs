@@ -262,8 +262,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let list = response.into_inner().revisions;
             assert_eq!(list.len(), 4);
             assert_eq!(list[3].id, first_hash.as_bytes());
@@ -308,8 +308,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let response = response.into_inner();
             let list = response.revisions;
             assert_eq!(list.len(), 2);
@@ -334,8 +334,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let response = response.into_inner();
             let list = response.revisions;
             assert_eq!(list.len(), 2);
@@ -360,8 +360,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let response = response.into_inner();
             let list = response.revisions;
             assert_eq!(list.len(), 2);
@@ -386,8 +386,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let response = response.into_inner();
             let list = response.revisions;
             assert_eq!(list.len(), 1);
@@ -412,8 +412,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let response = response.into_inner();
             let list = response.revisions;
             assert_eq!(list.len(), 3);
@@ -454,8 +454,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect_err("Request should have failed");
+            .await
+            .expect_err("Request should have failed");
             assert_eq!(response.code(), tonic::Code::InvalidArgument);
 
             // No branch with only target should also fail with invalid_argument
@@ -475,8 +475,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect_err("Request should have failed");
+            .await
+            .expect_err("Request should have failed");
             assert_eq!(response.code(), tonic::Code::InvalidArgument);
 
             // Set up a branch with 3 revisions that have branch metadata
@@ -579,8 +579,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let list = response.into_inner().revisions;
             assert_eq!(list.len(), 2);
             assert_eq!(list[0].id, third_hash.as_bytes());
@@ -603,8 +603,8 @@ mod tests {
                 mutable_store.clone(),
                 allow_all_authorizer(),
             )
-                .await
-                .expect("Request failed");
+            .await
+            .expect("Request failed");
             let list = response.into_inner().revisions;
             assert_eq!(list.len(), 3);
             assert_eq!(list[0].id, third_hash.as_bytes());
@@ -638,13 +638,13 @@ mod tests {
                     tonic::metadata::BinaryMetadataValue::from_bytes(repository.id.data()),
                 );
                 let response = handler(
-                request,
-                immutable_store.clone(),
-                mutable_store.clone(),
-                allow_all_authorizer(),
-            )
-                    .await
-                    .expect_err("Request should have failed");
+                    request,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    allow_all_authorizer(),
+                )
+                .await
+                .expect_err("Request should have failed");
 
                 assert_eq!(response.code(), tonic::Code::NotFound);
             })

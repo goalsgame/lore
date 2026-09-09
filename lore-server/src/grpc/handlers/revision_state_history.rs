@@ -209,8 +209,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Failed RevisionStateHistoryRequest message handle");
+                .await
+                .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
                     RevisionStateHistoryResponse {
                         signature: vec![],
@@ -236,8 +236,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Failed RevisionStateHistoryRequest message handle");
+                .await
+                .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
                     RevisionStateHistoryResponse {
                         signature: vec![],
@@ -285,8 +285,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Failed RevisionStateHistoryRequest message handle");
+                .await
+                .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
                     RevisionStateHistoryResponse {
                         signature: vec![
@@ -316,8 +316,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Failed RevisionStateHistoryRequest message handle");
+                .await
+                .expect("Failed RevisionStateHistoryRequest message handle");
                 assert_eq!(
                     RevisionStateHistoryResponse {
                         signature: vec![],

@@ -237,8 +237,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Request failed");
+                .await
+                .expect("Request failed");
                 let revision = response
                     .into_inner()
                     .revision
@@ -264,8 +264,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Request failed");
+                .await
+                .expect("Request failed");
                 let revision = response
                     .into_inner()
                     .revision
@@ -318,8 +318,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect("Request failed");
+                .await
+                .expect("Request failed");
                 let revision = response
                     .into_inner()
                     .revision
@@ -348,8 +348,8 @@ mod tests {
                     mutable_store.clone(),
                     allow_all_authorizer(),
                 )
-                    .await
-                    .expect_err("Request should have failed");
+                .await
+                .expect_err("Request should have failed");
             })
             .await;
     }
