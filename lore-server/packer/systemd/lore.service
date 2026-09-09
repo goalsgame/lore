@@ -1,7 +1,7 @@
 [Unit]
 Description=Lore Server
-After=network.target lore-bootstrap.service
-Requires=lore-bootstrap.service
+After=network.target lore-bootstrap.service lore-cache-storage.service
+Requires=lore-bootstrap.service lore-cache-storage.service
 
 [Service]
 User=lore
@@ -18,16 +18,19 @@ LimitNOFILE=1048576
 Restart=always
 RestartSec=2s
 
-# Hardening. There is no local persistent store to protect a writable path
-# for — durable state lives in GCS/Firestore via the lore-gcp plugin — so
-# this can be strict: PrivateTmp gives the process its own /tmp for any
-# scratch use, and nothing under /etc/lore needs to be writable at runtime
-# (lore-bootstrap writes it before this unit starts, as root).
+# Hardening. Durable state lives in GCS/Firestore via the lore-gcp plugin,
+# not on this VM, so this can be strict: PrivateTmp gives the process its
+# own /tmp for any scratch use, nothing under /etc/lore needs to be writable
+# at runtime (lore-bootstrap writes it before this unit starts, as root),
+# and the one real writable path is /var/lib/lore/cache — only used, and
+# only needs to exist, if immutable_store.mode is ever set to "composite"
+# (see lore-cache-storage.service).
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
 ProtectHome=yes
 ReadOnlyPaths=/etc/lore
+ReadWritePaths=/var/lib/lore/cache
 
 [Install]
 WantedBy=multi-user.target

@@ -99,7 +99,7 @@ variable "subnetwork" {
 
 variable "version" {
   type        = string
-  description = "lore-server release version being baked (e.g. a git tag). Used only for the output image name — the binary itself is whatever release-binaries/loreserver the caller staged."
+  description = "lore-server release version being baked (e.g. a git tag like v0.9.2, or an X.Y.Z). Used only for the output image name — the binary itself is whatever release-binaries/loreserver the caller staged. Sanitized for GCE's image-name character set below; no need to strip a leading \"v\" or dots yourself."
 }
 
 variable "proxy_base_version" {
@@ -115,7 +115,14 @@ variable "proxy_base_image_project_id" {
 }
 
 locals {
-  image_name              = var.image_name != "" ? var.image_name : "lore-server-amd64-v${var.version}"
+  // GCE image names must be lowercase and may only contain letters, digits,
+  // and dashes — no dots. Mirrors nomad-server.pkr.hcl's version_suffix
+  // exactly (plain literal replace, not a regex: a first attempt here used
+  // replace()'s Terraform-style "/regex/" form, which Packer's HCL does not
+  // support the same way — it matched nothing and passed the dots straight
+  // through, caught by a failed local validation build).
+  version_sanitized       = lower(replace(var.version, ".", "-"))
+  image_name              = var.image_name != "" ? var.image_name : "lore-server-amd64-v${local.version_sanitized}"
   image_project_id        = var.image_project_id != "" ? var.image_project_id : var.project_id
   source_image            = "proxybase-${var.proxy_base_version}-amd64"
   source_image_project_id = var.proxy_base_image_project_id != "" ? var.proxy_base_image_project_id : local.image_project_id
@@ -169,12 +176,26 @@ build {
   # Stage the release binary. Built by the calling workflow (see
   # .github/workflows/packer-images.yml) into release-binaries/loreserver
   # before packer runs — nothing is compiled on this VM.
+  #
+  # The mkdir here isn't redundant: with exactly one file in
+  # release-binaries/, Packer's file provisioner (SCP under the hood) is
+  # ambiguous about whether a non-existent destination should become a
+  # directory or the uploaded file itself renamed to that path — confirmed
+  # by a local validation build that landed the binary at
+  # /tmp/lore-server-release (a file) instead of
+  # /tmp/lore-server-release/loreserver, failing install-lore.sh with "Not
+  # a directory". Pre-creating the destination as a real directory removes
+  # the ambiguity.
+  provisioner "shell" {
+    inline = ["mkdir -p /tmp/lore-server-release"]
+  }
+
   provisioner "file" {
     source      = "release-binaries/"
     destination = "/tmp/lore-server-release"
   }
 
-  # Stage systemd units and the bootstrap script.
+  # Stage systemd units and the bootstrap/cache-storage scripts.
   provisioner "file" {
     source      = "systemd/lore.service"
     destination = "/tmp/lore.service"
@@ -190,12 +211,32 @@ build {
     destination = "/tmp/lore-bootstrap.sh"
   }
 
+  provisioner "file" {
+    source      = "systemd/lore-cache-storage.service"
+    destination = "/tmp/lore-cache-storage.service"
+  }
+
+  provisioner "file" {
+    source      = "scripts/lore-cache-storage-init.sh"
+    destination = "/tmp/lore-cache-storage-init.sh"
+  }
+
   # Install everything. Deliberately does NOT `systemctl start lore` —
   # startup depends on per-environment config (LORE_ENV, secrets) that only
   # exists once a real instance boots from Terraform-supplied metadata, not
   # during the image bake. `enable` is safe here; `start` is not.
   provisioner "shell" {
     script = "scripts/install-lore.sh"
+  }
+
+  # Ops Agent binary already ships in proxy-base; this just points it at
+  # lore-server's journal (matching nomad-server's journal-only setup — see
+  # scripts/install-lore-ops-agent.sh for why metrics scraping isn't wired
+  # up here). Journal access for non-root SSH users (pam_group ->
+  # systemd-journal) is also already configured by proxy-base — nothing
+  # lore-specific needed there.
+  provisioner "shell" {
+    script = "scripts/install-lore-ops-agent.sh"
   }
 
   provisioner "shell" {

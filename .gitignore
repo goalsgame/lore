@@ -7,6 +7,9 @@
 lore-server/config/local*.toml
 **/.grafana.local.yaml
 
+# Staged by the packer-images workflow / a local packer build; never checked in
+lore-server/packer/release-binaries/
+
 #################
 ## Visual Studio
 #################

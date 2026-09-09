@@ -5,7 +5,7 @@ Before=lore.service
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-ExecStart=/usr/local/bin/lore-bootstrap.sh
+ExecStart=/usr/local/sbin/lore-bootstrap.sh
 
 [Install]
 WantedBy=multi-user.target

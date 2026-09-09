@@ -1,0 +1,13 @@
+[Unit]
+Description=Assemble RAID-0 across Local SSDs and mount /var/lib/lore/cache
+DefaultDependencies=no
+After=local-fs.target
+Before=lore.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/lore-cache-storage-init.sh
+
+[Install]
+WantedBy=multi-user.target
