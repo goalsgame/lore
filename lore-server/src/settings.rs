@@ -185,6 +185,15 @@ impl Settings {
 /// this is the fail-loudly-at-startup half of that defense in depth, so an
 /// operator sees the problem before the server accepts a single request
 /// rather than on whichever request first reaches an authorizer.
+///
+/// Finally, when `acl_config_path` is set (GOALS fork, selecting
+/// `ConfiguredGrantsAuthorizer`), this parses that file eagerly via
+/// [`crate::authnz::acl_config::load_from_path`] purely to fail startup
+/// loudly on a malformed file — see the design doc's Security
+/// Considerations ("a malformed config file refuses server startup"). The
+/// parsed result is discarded here; `repository_authorizer_with_stores`
+/// parses it again where the authorizer is actually constructed, the same
+/// defense-in-depth duplication as the `resource_claim` check above.
 fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> {
     let Some(auth) = settings.server.auth.as_ref() else {
         return Ok(());
@@ -217,6 +226,16 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
              enabling Tier 2."
                 .to_string(),
         ));
+    }
+
+    if let Some(acl_config_path) = auth.acl_config_path.as_ref() {
+        crate::authnz::acl_config::load_from_path(std::path::Path::new(acl_config_path)).map_err(
+            |err| {
+                config::ConfigError::Message(format!(
+                    "server.auth.acl_config_path ({acl_config_path}) failed to load: {err}"
+                ))
+            },
+        )?;
     }
 
     Ok(())
@@ -305,6 +324,20 @@ pub struct AuthSettings {
     /// access to the contents.
     #[serde(default)]
     pub baseline_access: BaselineAccess,
+    /// Path to a config-driven, per-repository group grants file (GOALS
+    /// fork, `docs/proposals/2026-09-09-goals-repository-acl-config.md`),
+    /// parsed by `crate::authnz::acl_config`. When set, selects
+    /// `ConfiguredGrantsAuthorizer` in place of Tier 1's
+    /// `GlobalGrantsAuthorizer` — see
+    /// `crate::authnz::repository_authorizer::repository_authorizer_with_stores`.
+    /// Mutually compatible with `permission_claim`, which this authorizer
+    /// also reads, but now interpreted as the caller's FoxIDs group
+    /// membership rather than a flat, directly-held action set.
+    ///
+    /// Name chosen from the design doc's own illustrative example; the doc
+    /// leaves the exact name open ("Unresolved Questions"), so this is the
+    /// implementation's resolution of that, not a settled design decision.
+    pub acl_config_path: Option<String>,
 }
 
 impl AuthSettings {
@@ -921,6 +954,108 @@ mod tests {
             toml::from_str(Box::leak(config.to_string().into_boxed_str())).unwrap();
         validate_auth_config(&settings)
             .expect("a legacy auth_url exempts resource_claim from the Tier 2 rejection");
+    }
+
+    /// GOALS fork: `acl_config_path` round-trips like any other optional
+    /// `[server.auth]` field, absent by default.
+    #[test]
+    fn acl_config_path_round_trips_and_defaults_to_absent() {
+        let without: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+        "#,
+        )
+        .expect("[server.auth] without acl_config_path should deserialize");
+        assert_eq!(without.acl_config_path, None);
+
+        let with: AuthSettings = toml::from_str(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            acl_config_path = "/etc/lore/acl.toml"
+        "#,
+        )
+        .expect("[server.auth] with acl_config_path should deserialize");
+        assert_eq!(with.acl_config_path.as_deref(), Some("/etc/lore/acl.toml"));
+    }
+
+    /// The design doc's fail-closed requirement: a malformed ACL config
+    /// file must refuse server startup, not merely fail once
+    /// `ConfiguredGrantsAuthorizer` is actually constructed. `validate_auth_config`
+    /// is `Settings::load`'s fail-fast startup check, so this is where that
+    /// guarantee has to live.
+    #[test]
+    fn acl_config_path_pointing_at_a_malformed_file_fails_validation() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "lore-settings-test-malformed-acl-{}.toml",
+            std::process::id()
+        ));
+        fs::write(&path, "this is not valid ACL config toml = [[[").expect("scratch file write");
+
+        let settings = settings_with_auth_keys(&format!(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            acl_config_path = "{}"
+        "#,
+            path.display()
+        ))
+        .expect("acl_config_path still parses as a plain string field");
+        let error = validate_auth_config(&settings);
+        let _ = fs::remove_file(&path);
+
+        let error = error.expect_err("a malformed ACL config file must fail startup validation");
+        assert!(
+            error.to_string().contains("acl_config_path"),
+            "the error must name the offending setting: {error}"
+        );
+    }
+
+    /// The mirror image: a missing file is just as much a startup failure as
+    /// a malformed one -- there is no silent "no grants" fallback.
+    #[test]
+    fn acl_config_path_pointing_at_a_missing_file_fails_validation() {
+        let settings = settings_with_auth_keys(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            acl_config_path = "/nonexistent/lore-acl-does-not-exist.toml"
+        "#,
+        )
+        .expect("acl_config_path still parses as a plain string field");
+        validate_auth_config(&settings)
+            .expect_err("a missing ACL config file must fail startup validation");
+    }
+
+    /// A well-formed ACL config file at `acl_config_path` passes validation
+    /// cleanly, same as any other complete `[server.auth]`.
+    #[test]
+    fn acl_config_path_pointing_at_a_valid_file_passes_validation() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "lore-settings-test-valid-acl-{}.toml",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            "[[grant]]\ngroup = \"engineering\"\nrepos = [\"**\"]\npermissions = [\"read\"]\n",
+        )
+        .expect("scratch file write");
+
+        let settings = settings_with_auth_keys(&format!(
+            r#"
+            jwt_issuer = "https://auth.example.com"
+            jwt_audience = ["lore"]
+            acl_config_path = "{}"
+        "#,
+            path.display()
+        ))
+        .expect("a complete [server.auth] with acl_config_path must parse");
+        let result = validate_auth_config(&settings);
+        let _ = fs::remove_file(&path);
+        result.expect("a valid ACL config file must pass startup validation");
     }
 
     /// No `[server.auth]` at all keeps starting: verification stays off and

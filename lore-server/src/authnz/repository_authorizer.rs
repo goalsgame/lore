@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::collections::HashSet;
+use std::path::Path;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -547,12 +548,40 @@ pub enum RepositoryAuthorizerError {
          before enabling Tier 2."
     )]
     ResourceGrantsNotImplemented,
+
+    /// `server.auth.acl_config_path` (GOALS fork) is set but the file it
+    /// names failed to load or parse. `Settings::load`'s
+    /// `validate_auth_config` already checks this once at startup (see its
+    /// doc comment); this is the same defense-in-depth backstop pattern as
+    /// [`Self::ResourceGrantsNotImplemented`], made again here where the
+    /// authorizer is actually constructed.
+    #[error("failed to load server.auth.acl_config_path: {0}")]
+    AclConfig(#[from] acl_config::AclConfigError),
+
+    /// `server.auth.acl_config_path` is set, which selects
+    /// [`ConfiguredGrantsAuthorizer`], but no repository-metadata store was
+    /// supplied to resolve names against. Reached only by a caller that
+    /// builds an authorizer via [`repository_authorizer`] /
+    /// [`ReachabilityAuthorizer::new`] (which pass no stores at all) for a
+    /// deployment that also sets `acl_config_path` — server bootstrap always
+    /// uses [`repository_authorizer_with_stores`] /
+    /// [`ReachabilityAuthorizer::new_with_stores`] instead, which cannot
+    /// reach this.
+    #[error(
+        "server.auth.acl_config_path is set, which selects ConfiguredGrantsAuthorizer, but no \
+         repository metadata store was supplied to resolve repository names against. Construct \
+         the authorizer via repository_authorizer_with_stores / \
+         ReachabilityAuthorizer::new_with_stores instead."
+    )]
+    AclConfigRequiresStores,
 }
 
 /// Creates the appropriate authorizer for a deployment's configuration.
 ///
 /// Branches exactly as LEP 2026-08-20-oidc-oauth2-authentication (D8)
-/// describes:
+/// describes, plus one GOALS-fork addition (see
+/// [`repository_authorizer_with_stores`]'s doc comment for the full
+/// decision tree, including where `ConfiguredGrantsAuthorizer` fits):
 ///
 /// - No `[server.auth]` at all: [`AllowAllRepositoryAuthorizer`]. Every
 ///   check passes, matching today's behavior for a deployment with no OIDC
@@ -562,17 +591,71 @@ pub enum RepositoryAuthorizerError {
 ///   factory exactly — legacy deployments select this authorizer whether or
 ///   not `[server.auth]` itself is also present, which is the shape today's
 ///   callers already rely on.
-/// - `[server.auth]` present, no legacy `auth_url`, no `resource_claim`:
-///   Tier 1's [`GlobalGrantsAuthorizer`], reading `permission_claim`.
+/// - `[server.auth]` present, no legacy `auth_url`, no `resource_claim`, no
+///   `acl_config_path`: Tier 1's [`GlobalGrantsAuthorizer`], reading
+///   `permission_claim`.
 /// - `[server.auth]` present, no legacy `auth_url`, `resource_claim` set:
 ///   Tier 2. Not implemented — see [`RepositoryAuthorizerError`].
 ///   `Settings::load`'s startup validation rejects this configuration before
 ///   the server ever accepts a request; this is the defense-in-depth
 ///   backstop for any caller that builds an authorizer without going
 ///   through that validation.
+///
+/// This is a thin, stores-less wrapper around
+/// [`repository_authorizer_with_stores`] (`immutable_store`/`mutable_store`
+/// both `None`) kept for the many existing callers — mostly test fixtures
+/// building an authorizer that is never asked to select
+/// `ConfiguredGrantsAuthorizer` — that have no store to offer. See that
+/// function's doc comment for why the store-accepting form is a separate
+/// function rather than a signature change here.
 pub fn repository_authorizer(
     auth_url: Option<String>,
     auth_settings: Option<&AuthSettings>,
+) -> Result<Arc<dyn RepositoryAuthorizer>, RepositoryAuthorizerError> {
+    repository_authorizer_with_stores(auth_url, auth_settings, None, None)
+}
+
+/// Stores-aware counterpart of [`repository_authorizer`]: the same decision
+/// tree, plus the GOALS-fork branch that needs a repository-metadata store
+/// to resolve names against.
+///
+/// Kept as a separate function — rather than adding
+/// `immutable_store`/`mutable_store` parameters to [`repository_authorizer`]
+/// directly — so the ~30 existing call sites across `lore-server` and
+/// `lore-integration-tests` that construct an authorizer purely for
+/// [`AllowAllRepositoryAuthorizer`]/[`GlobalGrantsAuthorizer`]/
+/// [`AuthClientAuthorizer`] behavior in tests, none of which ever set
+/// `acl_config_path`, need no changes at all. `immutable_store`/
+/// `mutable_store` are `None` exactly when the caller has none to offer
+/// (i.e. every call through the plain [`repository_authorizer`]); that is
+/// only an error if `acl_config_path` is *also* set, selecting
+/// [`ConfiguredGrantsAuthorizer`] (see
+/// [`RepositoryAuthorizerError::AclConfigRequiresStores`]) — every other
+/// branch ignores both parameters entirely, so passing `None` is free for
+/// them.
+///
+/// The full decision tree:
+///
+/// - No `[server.auth]` at all: [`AllowAllRepositoryAuthorizer`].
+/// - A legacy `auth_url` configured: [`AuthClientAuthorizer`],
+///   unconditionally, regardless of what else is set.
+/// - `[server.auth]` present, no legacy `auth_url`, `resource_claim` set:
+///   Tier 2, not implemented — see [`RepositoryAuthorizerError::ResourceGrantsNotImplemented`].
+/// - `[server.auth]` present, no legacy `auth_url`, no `resource_claim`,
+///   `acl_config_path` set (GOALS fork,
+///   `docs/proposals/2026-09-09-goals-repository-acl-config.md`):
+///   [`ConfiguredGrantsAuthorizer`], loading and parsing the named file via
+///   [`acl_config::load_from_path`]. `Settings::load`'s `validate_auth_config`
+///   already parses this file once at startup as a fail-fast check (see its
+///   doc comment); this is that same defense-in-depth pattern, parsing it
+///   again where the authorizer is actually built.
+/// - Otherwise: Tier 1's [`GlobalGrantsAuthorizer`], reading
+///   `permission_claim`.
+pub fn repository_authorizer_with_stores(
+    auth_url: Option<String>,
+    auth_settings: Option<&AuthSettings>,
+    immutable_store: Option<Arc<dyn lore_storage::ImmutableStore>>,
+    mutable_store: Option<Arc<dyn lore_storage::MutableStore>>,
 ) -> Result<Arc<dyn RepositoryAuthorizer>, RepositoryAuthorizerError> {
     if let Some(url) = auth_url {
         return Ok(Arc::new(AuthClientAuthorizer::new(url)));
@@ -584,6 +667,20 @@ pub fn repository_authorizer(
 
     if auth.resource_claim.is_some() {
         return Err(RepositoryAuthorizerError::ResourceGrantsNotImplemented);
+    }
+
+    if let Some(acl_config_path) = auth.acl_config_path.as_deref() {
+        let (immutable_store, mutable_store) = match (immutable_store, mutable_store) {
+            (Some(immutable_store), Some(mutable_store)) => (immutable_store, mutable_store),
+            _ => return Err(RepositoryAuthorizerError::AclConfigRequiresStores),
+        };
+        let config = acl_config::load_from_path(Path::new(acl_config_path))?;
+        return Ok(Arc::new(ConfiguredGrantsAuthorizer::new(
+            auth.permission_claim.clone(),
+            config,
+            immutable_store,
+            mutable_store,
+        )));
     }
 
     Ok(Arc::new(GlobalGrantsAuthorizer::new(
@@ -630,12 +727,43 @@ pub struct ReachabilityAuthorizer {
 }
 
 impl ReachabilityAuthorizer {
+    /// Stores-less constructor: cannot select `ConfiguredGrantsAuthorizer`
+    /// for a deployment that sets `acl_config_path`, since it has no
+    /// repository-metadata store to hand it (see
+    /// [`repository_authorizer_with_stores`]'s doc comment). Used by every
+    /// call site except server bootstrap — none of them ever configure
+    /// `acl_config_path`.
     pub fn new(
         auth_url: Option<String>,
         auth_settings: Option<&AuthSettings>,
     ) -> Result<Self, RepositoryAuthorizerError> {
         let legacy_resource_claim = auth_url.is_some();
         let authorizer = repository_authorizer(auth_url, auth_settings)?;
+        Ok(Self {
+            authorizer,
+            legacy_resource_claim,
+        })
+    }
+
+    /// Stores-aware constructor, for the one real caller that can select
+    /// `ConfiguredGrantsAuthorizer`: server bootstrap (`server.rs`), which
+    /// has `immutable_store`/`mutable_store` in hand before constructing
+    /// this. See [`repository_authorizer_with_stores`] for the full
+    /// decision tree and why this is a separate entry point rather than a
+    /// signature change to [`Self::new`].
+    pub fn new_with_stores(
+        auth_url: Option<String>,
+        auth_settings: Option<&AuthSettings>,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+    ) -> Result<Self, RepositoryAuthorizerError> {
+        let legacy_resource_claim = auth_url.is_some();
+        let authorizer = repository_authorizer_with_stores(
+            auth_url,
+            auth_settings,
+            Some(immutable_store),
+            Some(mutable_store),
+        )?;
         Ok(Self {
             authorizer,
             legacy_resource_claim,
@@ -1594,7 +1722,126 @@ mod tests {
             match repository_authorizer(None, Some(&settings)) {
                 Err(RepositoryAuthorizerError::ResourceGrantsNotImplemented) => {}
                 Ok(_) => panic!("Tier 2 must fail loudly rather than silently degrade"),
+                Err(other) => panic!("expected ResourceGrantsNotImplemented, got {other:?}"),
             }
+        }
+
+        /// Writes `contents` to a fresh scratch file and returns its path.
+        /// Callers are responsible for cleanup (`std::fs::remove_file`).
+        fn scratch_acl_config(contents: &str) -> std::path::PathBuf {
+            let path = std::env::temp_dir().join(format!(
+                "lore-repository-authorizer-test-{}-{}.toml",
+                std::process::id(),
+                rand::random::<u64>()
+            ));
+            std::fs::write(&path, contents).expect("scratch file should be writable");
+            path
+        }
+
+        /// GOALS fork: `acl_config_path` selects `ConfiguredGrantsAuthorizer`,
+        /// but only through the stores-aware entry point -- the plain,
+        /// stores-less `repository_authorizer` (used here) can never supply
+        /// the repository-metadata store that authorizer needs, so it must
+        /// fail loudly rather than silently falling back to Tier 1. No real
+        /// store is involved at all here, by design: this is exactly the
+        /// case the stores-less entry point cannot handle.
+        #[test]
+        fn acl_config_path_without_stores_is_a_hard_error() {
+            let path = scratch_acl_config(
+                "[[grant]]\ngroup = \"g\"\nrepos = [\"*\"]\npermissions = [\"read\"]\n",
+            );
+            let settings = auth_settings(&format!(r#"acl_config_path = "{}""#, path.display()));
+
+            let result = repository_authorizer(None, Some(&settings));
+            let _ = std::fs::remove_file(&path);
+
+            match result {
+                Err(RepositoryAuthorizerError::AclConfigRequiresStores) => {}
+                Err(other) => panic!("expected AclConfigRequiresStores, got {other:?}"),
+                Ok(_) => panic!(
+                    "acl_config_path must not silently construct without a store to resolve \
+                     names against"
+                ),
+            }
+        }
+
+        /// A malformed (or missing) `acl_config_path` file is a hard
+        /// construction error, not a silent fallback -- matching the design
+        /// doc's "a malformed config file refuses server startup"
+        /// requirement, made again here (see `validate_auth_config`'s
+        /// earlier check) where the authorizer is actually built. Stores are
+        /// supplied so this specifically isolates the parse failure, not
+        /// `AclConfigRequiresStores` from the previous test.
+        #[tokio::test]
+        async fn acl_config_path_with_stores_but_missing_file_fails_to_construct() {
+            let settings = auth_settings(r#"acl_config_path = "/nonexistent/does-not-exist.toml""#);
+            let (immutable, mutable, _) = crate::store::test_store_create().await.expect("stores");
+
+            match repository_authorizer_with_stores(
+                None,
+                Some(&settings),
+                Some(immutable),
+                Some(mutable),
+            ) {
+                Err(RepositoryAuthorizerError::AclConfig(_)) => {}
+                Err(other) => panic!("expected AclConfig, got {other:?}"),
+                Ok(_) => panic!("a missing ACL config file must not construct successfully"),
+            }
+        }
+
+        /// The full happy path: `acl_config_path` set, stores supplied,
+        /// valid file -- selects `ConfiguredGrantsAuthorizer`, whose grants
+        /// then actually govern the outcome (as opposed to merely
+        /// constructing without error, and unlike Tier 1/AllowAll, which
+        /// would not require a matching group at all or would treat a
+        /// missing token as allow, respectively).
+        #[tokio::test(flavor = "multi_thread")]
+        async fn acl_config_path_with_stores_selects_configured_grants_authorizer() {
+            let (immutable, mutable, execution) =
+                crate::store::test_store_create().await.expect("stores");
+            let path = scratch_acl_config(
+                "[[grant]]\ngroup = \"engineering\"\nrepos = [\"**\"]\npermissions = [\"read\"]\n",
+            );
+            let settings = auth_settings(&format!(
+                "acl_config_path = \"{}\"\npermission_claim = \"groups\"",
+                path.display()
+            ));
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    seed_repository(immutable.clone(), mutable.clone(), repository(), "any-name")
+                        .await;
+                    let authorizer = repository_authorizer_with_stores(
+                        None,
+                        Some(&settings),
+                        Some(immutable),
+                        Some(mutable),
+                    )
+                    .expect("valid acl_config_path with stores should construct");
+                    let _ = std::fs::remove_file(&path);
+
+                    let claims = AuthorizationToken {
+                        groups: Some(vec!["engineering".to_string()]),
+                        ..Default::default()
+                    };
+                    let token = VerifiedToken::new("raw", &claims);
+                    authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .await
+                        .expect(
+                            "ConfiguredGrantsAuthorizer's own grants govern the outcome, not \
+                             AllowAll/GlobalGrants",
+                        );
+                    let err = authorizer
+                        .check_repository_access(None, repository(), None)
+                        .await
+                        .expect_err(
+                            "ConfiguredGrantsAuthorizer treats a missing token as unauthenticated, \
+                             unlike AllowAllRepositoryAuthorizer",
+                        );
+                    assert_eq!(err.code(), tonic::Code::Unauthenticated);
+                })
+                .await;
         }
     }
 
