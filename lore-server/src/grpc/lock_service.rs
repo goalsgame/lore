@@ -36,6 +36,8 @@ use super::get_authorization;
 use super::get_repository;
 use super::get_user_id;
 use super::timeout_grpc;
+use crate::authnz::repository_authorizer::PUSH_ACTION;
+use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::handlers::repository_delete::DELETE_ACTIONS;
 use crate::util::setup_execution;
@@ -190,6 +192,8 @@ impl LoreLockService {
         let repository = get_repository(request.metadata())?;
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let raw_token = extract_authorization_header(&request);
+        let claims = get_authorization(request.extensions()).ok();
         let lock_request = request.into_inner();
 
         self.locking_histogram.record(
@@ -209,6 +213,18 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
+                // Baseline `push` requirement (closing the Tier 1 gap where
+                // any authenticated caller could lock resources with no
+                // group membership at all).
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.repository_authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+                    .await
+                    .map_err(|_err| {
+                        warn!("Attempt to lock resources, but user does not have the correct permissions");
+                        Status::permission_denied("Permission denied")
+                    })?;
+
                 self.lock_as_user(repository, resources, &user_id)
                     .await
                     .map(|locks| Response::new(LockResponse { locks }))
@@ -223,6 +239,8 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let repository = get_repository(request.metadata())?;
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+        let raw_token = extract_authorization_header(&request);
+        let claims = get_authorization(request.extensions()).ok();
         let query_request = request.get_ref();
 
         let query =
@@ -232,6 +250,15 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
+                // Baseline `read` requirement (closing the Tier 1 gap where
+                // any authenticated caller could query locks with no group
+                // membership at all).
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.repository_authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 self.lock_store
                     .query_locks(query)
                     .await
@@ -252,6 +279,8 @@ impl LoreLockService {
         let user_id = get_user_id(request.extensions());
         let correlation_id = extract_correlation_id(&request).unwrap_or_default();
         let repository = get_repository(request.metadata())?;
+        let raw_token = extract_authorization_header(&request);
+        let claims = get_authorization(request.extensions()).ok();
         let status_request = request.into_inner();
 
         if status_request.resources.len() > STATUS_MAX_RESOURCE_LEN {
@@ -284,6 +313,15 @@ impl LoreLockService {
 
         LORE_CONTEXT
             .scope(execution, async move {
+                // Baseline `read` requirement (closing the Tier 1 gap where
+                // any authenticated caller could check lock status with no
+                // group membership at all).
+                let verified_token = crate::grpc::verified_token(&claims, &raw_token);
+                self.repository_authorizer
+                    .check_repository_access(verified_token.as_ref(), repository, Some(READ_ACTION))
+                    .await
+                    .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
                 let locks = self
                     .lock_store
                     .check_locks_status(repository, &resources)
@@ -350,6 +388,28 @@ impl LoreLockService {
                     }
                 }
                 let validate_user = !holds_owner_or_admin;
+
+                // Baseline `push` requirement (closing the Tier 1 gap where
+                // any authenticated caller could unlock resources with no
+                // group membership at all). Holding `owner` or `admin`
+                // already stays a strictly stronger alternative to ordinary
+                // `push` — those actions already gate a caller's ability to
+                // *force*-unlock someone else's lock (above), so requiring
+                // `push` as well here would gain nothing and would make an
+                // owner/admin force-unlock unusable for a principal that
+                // was granted those two actions without also being granted
+                // ordinary `push`.
+                if !holds_owner_or_admin {
+                    self.repository_authorizer
+                        .check_repository_access(verified_token.as_ref(), repository, Some(PUSH_ACTION))
+                        .await
+                        .map_err(|_err| {
+                            warn!(
+                                "Attempt to unlock resources, but user does not have the correct permissions"
+                            );
+                            Status::permission_denied("Permission denied")
+                        })?;
+                }
 
                 let resources = self
                     .lock_store
@@ -600,6 +660,7 @@ mod test {
     mod unlock {
         use lore_proto::lock::AdminLockRequest;
         use lore_proto::lock::LockRequest;
+        use lore_proto::lock::QueryRequest;
         use lore_proto::lock::Resource;
         use lore_proto::lock::StatusRequest;
         use lore_proto::lock::UnlockRequest;
@@ -872,13 +933,13 @@ mod test {
         }
 
         /// A Tier 1 token (LEP 2026-08-20-oidc-oauth2-authentication, D8)
-        /// that holds neither `owner` nor `admin`: `unlock_resources` must
-        /// still be called with `validate_user = true`, the ordinary
-        /// self-unlock path. Before this fix, the legacy `is_owner_or_admin`
-        /// reader looked at a `resources` claim this token never carries —
-        /// which happened to also produce `validate_user = true` here, so
-        /// this specific case was not itself broken, only the override
-        /// below was.
+        /// that holds neither `owner` nor `admin`, but does hold the new
+        /// baseline `push` action: `unlock_resources` must still be called
+        /// with `validate_user = true`, the ordinary self-unlock path.
+        /// Before this fix, the legacy `is_owner_or_admin` reader looked at
+        /// a `resources` claim this token never carries — which happened to
+        /// also produce `validate_user = true` here, so this specific case
+        /// was not itself broken, only the override below was.
         #[tokio::test]
         async fn unlock_validates_user_when_caller_lacks_owner_or_admin_action() {
             let mut lock_store = super::store::MockMockLockStore::new();
@@ -908,7 +969,7 @@ mod test {
                 tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
             );
             request.extensions_mut().insert(AuthorizationToken {
-                groups: Some(vec!["read".to_string()]),
+                groups: Some(vec!["read".to_string(), "push".to_string()]),
                 ..Default::default()
             });
 
@@ -916,6 +977,94 @@ mod test {
                 .unlock(request)
                 .await
                 .expect("Unlock did not return ok status");
+        }
+
+        /// A Tier 1 token holding neither `owner`/`admin` NOR the new
+        /// baseline `push` action is denied outright — `push` is now
+        /// required for ordinary self-unlock, closing the Tier 1 gap where
+        /// any authenticated caller could unlock with no group membership
+        /// at all.
+        #[tokio::test]
+        async fn unlock_denies_caller_lacking_both_push_and_owner_or_admin() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store.expect_unlock_resources().never();
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(UnlockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            let error_status = lock_service
+                .unlock(request)
+                .await
+                .expect_err("a caller with neither push nor owner/admin must be denied");
+            assert_eq!(error_status.code(), Code::PermissionDenied);
+        }
+
+        /// Holding `owner` or `admin` alone — with no `push` at all — still
+        /// suffices to force-unlock someone else's lock: the two admin
+        /// actions are a strictly stronger alternative to `push`, not an
+        /// addition to it. This is the mirror image of
+        /// `unlock_skips_validation_when_caller_holds_admin_action`, made
+        /// explicit now that a baseline `push` gate exists to potentially
+        /// stack with it.
+        #[tokio::test]
+        async fn unlock_admin_alone_without_push_still_succeeds() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store
+                .expect_unlock_resources()
+                .withf(|_owner_id, validate_user, _repository, _resources| !*validate_user)
+                .return_once(|_, _, _, _| Ok(vec![]));
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(UnlockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["owner".to_string()]),
+                ..Default::default()
+            });
+
+            let _ = lock_service
+                .unlock(request)
+                .await
+                .expect("owner alone, without push, still force-unlocks");
         }
 
         /// A Tier 1 token that holds the `admin` action: `unlock_resources`
@@ -962,6 +1111,192 @@ mod test {
                 .unlock(request)
                 .await
                 .expect("Unlock did not return ok status");
+        }
+
+        /// `Lock` now requires the baseline `push` action, closing the
+        /// Tier 1 gap where any authenticated caller could lock resources
+        /// with no group membership at all.
+        #[tokio::test]
+        async fn lock_denies_caller_without_push_action() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store.expect_lock_resources().never();
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(LockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            let error_status = lock_service
+                .lock(request)
+                .await
+                .expect_err("a caller without push must be denied");
+            assert_eq!(error_status.code(), Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn lock_allows_caller_with_push_action() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store
+                .expect_lock_resources()
+                .return_once(|_, _, _| Ok(vec![]));
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(LockRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["push".to_string()]),
+                ..Default::default()
+            });
+
+            let _ = lock_service
+                .lock(request)
+                .await
+                .expect("a caller holding push should be allowed to lock");
+        }
+
+        /// `Query` now requires the baseline `read` action, closing the
+        /// same Tier 1 gap for reads.
+        #[tokio::test]
+        async fn query_denies_caller_without_read_action() {
+            let lock_store = super::store::MockMockLockStore::new();
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(QueryRequest {
+                branch: None,
+                owner: None,
+                description: None,
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["push".to_string()]),
+                ..Default::default()
+            });
+
+            let error_status = lock_service
+                .query(request)
+                .await
+                .expect_err("a caller without read must be denied");
+            assert_eq!(error_status.code(), Code::PermissionDenied);
+        }
+
+        #[tokio::test]
+        async fn query_allows_caller_with_read_action() {
+            let mut lock_store = super::store::MockMockLockStore::new();
+            lock_store.expect_query_locks().return_once(|_| Ok(vec![]));
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(QueryRequest {
+                branch: None,
+                owner: None,
+                description: None,
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["read".to_string()]),
+                ..Default::default()
+            });
+
+            let _ = lock_service
+                .query(request)
+                .await
+                .expect("a caller holding read should be allowed to query");
+        }
+
+        /// `Status` now requires the baseline `read` action, matching
+        /// `Query`.
+        #[tokio::test]
+        async fn status_denies_caller_without_read_action() {
+            let lock_store = super::store::MockMockLockStore::new();
+
+            let notification_sender = Arc::new(NotificationSender::default());
+            let lock_service = LoreLockService::new(
+                Arc::new(lock_store),
+                notification_sender,
+                Duration::from_secs(60),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+            );
+
+            let mut request = Request::new(StatusRequest {
+                resources: vec![Resource {
+                    branch: Default::default(),
+                    hash: Default::default(),
+                    description: "".to_string(),
+                }],
+            });
+            let repository = random::<RepositoryId>();
+            request.metadata_mut().insert_bin(
+                REPOSITORY_ID_KEY,
+                tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+            );
+            request.extensions_mut().insert(AuthorizationToken {
+                groups: Some(vec!["push".to_string()]),
+                ..Default::default()
+            });
+
+            let error_status = lock_service
+                .status(request)
+                .await
+                .expect_err("a caller without read must be denied");
+            assert_eq!(error_status.code(), Code::PermissionDenied);
         }
     }
 }
