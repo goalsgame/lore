@@ -11,8 +11,11 @@ use lore_base::runtime::core_runtime;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
+use lore_revision::event::EventError;
+use lore_revision::interface::LoreError;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::repository::RepositoryError;
 use thiserror::Error;
 use tokio::task;
 use tonic::Code;
@@ -24,7 +27,9 @@ use super::auth::grpc_get_auth_client;
 use super::common::create_request_with_authorization;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::verify_authorization;
+use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
+use crate::grpc::warn_error_to_status;
 use crate::settings::AuthSettings;
 
 /// The baseline actions every partition-scoped read and write now requires
@@ -436,22 +441,30 @@ impl ConfiguredGrantsAuthorizer {
     /// this never depends on network I/O beyond the local store's own
     /// latency.
     ///
-    /// A repository that cannot be resolved (unknown id, or a store error)
-    /// is reported as [`Status::permission_denied`], not
-    /// [`Status::not_found`]: from an authorization function's perspective
-    /// this is a "no" like any other -- there is nothing to grant access
-    /// to -- and [`action_held`] (relied on by every once-per-connection
-    /// caller that resolves `read`/`push` up front, e.g.
-    /// `resolve_baseline_actions`) only recognizes
-    /// `PermissionDenied`/`Unauthenticated` as a genuine denial, folding
-    /// anything else into "the check itself failed." Reporting
-    /// `NotFound` here would misclassify an ordinary, expected denial (a
-    /// client referencing a repository that was never created, or a stale
-    /// id) as an infrastructure failure -- the same misclassification class
-    /// the `AuthClientAuthorizer` "resource absent from response" fix
-    /// (`interpret_check_user_permission_response_tests`) exists to
-    /// prevent. The real cause is still logged for operators before being
-    /// collapsed into the generic denial.
+    /// A repository that genuinely does not exist is reported as
+    /// [`Status::permission_denied`], not [`Status::not_found`]: from an
+    /// authorization function's perspective this is a "no" like any
+    /// other -- there is nothing to grant access to -- and
+    /// [`action_held`] (relied on by every once-per-connection caller that
+    /// resolves `read`/`push` up front, e.g. `resolve_baseline_actions`)
+    /// only recognizes `PermissionDenied`/`Unauthenticated` as a genuine
+    /// denial, folding anything else into "the check itself failed".
+    /// Reporting `NotFound` here would misclassify an ordinary, expected
+    /// denial (a client referencing a repository that was never created,
+    /// or a stale id) as an infrastructure failure -- the same
+    /// misclassification class the `AuthClientAuthorizer` "resource absent
+    /// from response" fix (`interpret_check_user_permission_response_tests`)
+    /// exists to prevent.
+    ///
+    /// Crucially, this distinction is made on the *classified* error
+    /// (`RepositoryError::translated()`, which separates `NotFound`-style
+    /// variants from `Disconnected`/`SlowDown`/`Maintenance`/`NotConnected`/
+    /// etc.), not blindly on "any `Err` from resolution": a transient store
+    /// hiccup or timeout is not the same event as a nonexistent repository,
+    /// and folding it into the same `PermissionDenied` would be the exact
+    /// inverse bug -- a legitimate caller silently denied access during a
+    /// transient outage instead of getting a retryable error. See
+    /// [`Self::resolution_error_to_status`].
     async fn resolve_name(&self, repository: RepositoryId) -> Result<String, Status> {
         if let Some(name) = self.name_cache.get(&repository) {
             return Ok(name.clone());
@@ -462,22 +475,65 @@ impl ConfiguredGrantsAuthorizer {
             self.mutable_store.clone(),
             repository,
         ));
-        let resolved = async {
-            let metadata_hash = repository::metadata_hash(repository_context.clone()).await?;
-            repository::metadata(repository_context, metadata_hash)
-                .await
-                .map(|metadata| metadata.name)
-        }
-        .await
-        .map_err(|err| {
-            debug!(%repository, %err, "failed to resolve repository name for authorization");
-            Status::permission_denied(format!(
-                "caller does not hold any grant on repository {repository}"
-            ))
-        })?;
+        let metadata_hash = repository::metadata_hash(repository_context.clone())
+            .await
+            .filter_slow_down()?
+            .map_err(|err| Self::resolution_error_to_status(repository, err))?;
+        let resolved = repository::metadata(repository_context, metadata_hash)
+            .await
+            .filter_slow_down()?
+            .map_err(|err| Self::resolution_error_to_status(repository, err))?
+            .name;
 
         self.name_cache.insert(repository, resolved.clone());
         Ok(resolved)
+    }
+
+    /// Classifies a [`RepositoryError`] encountered while resolving a
+    /// repository's name for authorization: only a genuine not-found --
+    /// `RepositoryError::translated()` mapping to [`LoreError::NotFound`],
+    /// [`LoreError::AddressNotFound`] or [`LoreError::PayloadNotFound`] --
+    /// becomes [`Status::permission_denied`], see [`Self::resolve_name`]'s
+    /// doc comment for why. All three are genuinely "does not exist," not
+    /// just the generically-named `NotFound`/`RepositoryNotFound` variants:
+    /// `metadata_hash`'s mutable-store lookup reports a missing key as
+    /// `AddressNotFound` specifically (confirmed against
+    /// `MutableStore::load`'s contract and implementation), and
+    /// `metadata`'s immutable-store read can equally surface as
+    /// `AddressNotFound` or `PayloadNotFound`.
+    ///
+    /// Everything else (`Disconnected`, `Maintenance`, `NotConnected`, or
+    /// any other variant `translated()` maps to
+    /// [`LoreError::Internal`]/[`LoreError::Connection`]) is a real
+    /// infrastructure failure and surfaces as one via
+    /// [`warn_error_to_status`], so [`action_held`] treats it as
+    /// retryable rather than as a clean denial. `SlowDown` is peeled off by
+    /// [`FilterSlowDownExt::filter_slow_down`] before this is even reached,
+    /// matching every other `RepositoryError`-to-`Status` conversion in
+    /// this codebase.
+    fn resolution_error_to_status(repository: RepositoryId, err: RepositoryError) -> Status {
+        // `metadata_hash`'s mutable-store lookup reports a missing key as
+        // `AddressNotFound` (confirmed via `MutableStore::load`'s own doc
+        // comment and implementation), not the generic `NotFound`/
+        // `RepositoryNotFound` variants -- an immutable-store miss inside
+        // `metadata`'s `Metadata::deserialize` can equally surface as
+        // `AddressNotFound` or `PayloadNotFound`. All three are "genuinely
+        // does not exist," the same as `NotFound`/`RepositoryNotFound`;
+        // nothing else is.
+        if matches!(
+            err.translated(),
+            LoreError::NotFound | LoreError::AddressNotFound | LoreError::PayloadNotFound
+        ) {
+            debug!(%repository, %err, "repository not found while resolving name for authorization");
+            return Status::permission_denied(format!(
+                "caller does not hold any grant on repository {repository}"
+            ));
+        }
+        warn_error_to_status(&err, |err| {
+            Status::internal(format!(
+                "failed to resolve repository {repository} for authorization: {err}"
+            ))
+        })
     }
 
     /// Shared by both [`RepositoryAuthorizer`] methods once each has settled
@@ -1428,6 +1484,124 @@ mod tests {
                  infra failure",
             );
             assert!(!held, "an unresolvable repository holds no action");
+        }
+
+        /// `MutableStore` wrapper that fails `load` unconditionally with a
+        /// `Disconnected`-shaped error, delegating everything else to
+        /// `inner`. Used to distinguish a genuine store outage from a
+        /// genuinely nonexistent repository -- the two must not be
+        /// classified the same way (see
+        /// `unresolvable_repository_is_a_clean_denial_not_an_infra_failure`
+        /// for the not-found case, and
+        /// `store_outage_is_an_infra_failure_not_a_clean_denial` below for
+        /// this one). Mirrors
+        /// `grpc/revision/v1/revision_list.rs`'s `FailingMutableStore`.
+        struct FailingMutableStore {
+            inner: Arc<dyn lore_storage::MutableStore>,
+        }
+
+        #[async_trait::async_trait]
+        impl lore_storage::MutableStore for FailingMutableStore {
+            async fn load(
+                self: Arc<Self>,
+                _partition: lore_storage::Partition,
+                _key: lore_storage::Hash,
+                _key_type: lore_storage::KeyType,
+            ) -> Result<lore_storage::Hash, lore_storage::StoreError> {
+                Err(lore_storage::StoreError::from(
+                    lore_storage::errors::Disconnected,
+                ))
+            }
+
+            async fn store(
+                self: Arc<Self>,
+                partition: lore_storage::Partition,
+                key: lore_storage::Hash,
+                value: lore_storage::Hash,
+                key_type: lore_storage::KeyType,
+            ) -> Result<(), lore_storage::StoreError> {
+                self.inner
+                    .clone()
+                    .store(partition, key, value, key_type)
+                    .await
+            }
+
+            async fn compare_and_swap(
+                self: Arc<Self>,
+                partition: lore_storage::Partition,
+                key: lore_storage::Hash,
+                expected: lore_storage::Hash,
+                value: lore_storage::Hash,
+                key_type: lore_storage::KeyType,
+            ) -> Result<lore_storage::Hash, lore_storage::StoreError> {
+                self.inner
+                    .clone()
+                    .compare_and_swap(partition, key, expected, value, key_type)
+                    .await
+            }
+
+            async fn list(
+                self: Arc<Self>,
+                partition: lore_storage::Partition,
+                key_type: lore_storage::KeyType,
+            ) -> Result<lore_storage::KeyValueStream, lore_storage::StoreError> {
+                self.inner.clone().list(partition, key_type).await
+            }
+
+            async fn flush(
+                self: Arc<Self>,
+                sync_data: bool,
+            ) -> Result<(), lore_storage::StoreError> {
+                self.inner.clone().flush(sync_data).await
+            }
+        }
+
+        /// The other half of the distinction `resolution_error_to_status`
+        /// exists to make: a store read that fails with a genuine
+        /// infrastructure error (`Disconnected`, translated to
+        /// `LoreError::Connection`, unlike the `AddressNotFound`/
+        /// `PayloadNotFound`/`NotFound` trio that means "genuinely does not
+        /// exist") must surface as a real error -- so `action_held`
+        /// classifies it as retryable -- and must NOT be collapsed into
+        /// `Status::permission_denied`. Getting this wrong would silently
+        /// deny a legitimate caller during a transient store outage instead
+        /// of giving them a retryable error: the exact inverse of the bug
+        /// `unresolvable_repository_is_a_clean_denial_not_an_infra_failure`
+        /// guards against.
+        #[tokio::test]
+        async fn store_outage_is_an_infra_failure_not_a_clean_denial() {
+            let (authorizer, immutable, mutable, _execution) =
+                authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
+            let failing_mutable: Arc<dyn lore_storage::MutableStore> =
+                Arc::new(FailingMutableStore { inner: mutable });
+            // Rebuild against the failing store: `ConfiguredGrantsAuthorizer`
+            // takes its stores at construction, so a fresh instance is
+            // needed to point `metadata_hash`'s lookup at the fake.
+            let authorizer = ConfiguredGrantsAuthorizer::new(
+                authorizer.permission_claim,
+                authorizer.config,
+                immutable,
+                failing_mutable,
+            );
+
+            let claims = token_in_groups(&["engineering"]);
+            let token = VerifiedToken::new("raw", &claims);
+            let err = authorizer
+                .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                .await
+                .expect_err("a store outage must not silently succeed either");
+            assert_ne!(
+                err.code(),
+                tonic::Code::PermissionDenied,
+                "a transient store outage must not be classified as a clean denial"
+            );
+
+            let held = action_held(Err(err));
+            assert!(
+                held.is_err(),
+                "action_held must propagate a store outage as an infra failure (Err), not fold \
+                 it into Ok(false) as if it were a clean denial"
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
