@@ -4,14 +4,20 @@ use std::collections::HashSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use dashmap::DashMap;
 use futures::FutureExt;
+use lore_base::runtime::runtime;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
+use lore_revision::repository;
+use lore_revision::repository::RepositoryContext;
 use thiserror::Error;
+use tokio::task;
 use tonic::Code;
 use tonic::Status;
 
+use super::acl_config;
 use super::auth::grpc_get_auth_client;
 use super::common::create_request_with_authorization;
 use crate::auth::jwt::AuthorizationToken;
@@ -84,6 +90,34 @@ pub trait RepositoryAuthorizer: Send + Sync {
         repository: RepositoryId,
         action: Option<&str>,
     ) -> Result<(), Status>;
+
+    /// Checks access against an already-known repository *name* rather than
+    /// a [`RepositoryId`] to resolve one from. Exists for `RepositoryCreate`
+    /// specifically: at that call site there is no `RepositoryMetadata` to
+    /// resolve yet -- the repository does not exist -- so the *requested*
+    /// name, the one thing a name-pattern-matching authorizer can actually
+    /// check, has to be threaded through directly instead of resolved from
+    /// an id (see `docs/proposals/2026-09-09-goals-repository-acl-config.md`,
+    /// Security Considerations).
+    ///
+    /// The default implementation delegates to [`Self::check_repository_access`]
+    /// with [`RepositoryId::default()`] as an inert sentinel. This is a
+    /// no-op change for every authorizer that does not consult the
+    /// repository parameter for this call
+    /// ([`AllowAllRepositoryAuthorizer`] ignores it unconditionally;
+    /// [`GlobalGrantsAuthorizer`] and [`AuthClientAuthorizer`] both ignore it
+    /// for exactly this call site -- see `RepositoryCreate`'s own doc
+    /// comments for why), so only [`ConfiguredGrantsAuthorizer`], which
+    /// genuinely pattern-matches on the name, needs to override it.
+    async fn check_repository_access_by_name(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        _repository_name: &str,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        self.check_repository_access(token, RepositoryId::default(), action)
+            .await
+    }
 }
 
 /// Always allows access. Used when no `[server.auth]` is configured at all,
@@ -292,6 +326,206 @@ impl RepositoryAuthorizer for GlobalGrantsAuthorizer {
                 "caller does not hold the '{action}' action"
             )))
         }
+    }
+}
+
+/// GOALS-fork authorizer implementing
+/// `docs/proposals/2026-09-09-goals-repository-acl-config.md`: config-driven,
+/// per-repository group grants, as an alternative to
+/// [`GlobalGrantsAuthorizer`]'s flat, repository-unaware ones. See
+/// [`acl_config`] for the pure grant-resolution engine this wraps.
+///
+/// **The sync/async bridge.** [`ReachabilityAuthorizer::check_reachability_sync`]
+/// polls [`RepositoryAuthorizer::check_repository_access`]'s future exactly
+/// once (`now_or_never()`) and panics if it is not immediately ready. This
+/// type resolves a repository's name -- the one piece of async I/O it
+/// needs -- via [`Self::resolve_name_sync`], entirely *before* doing
+/// anything else in the async fn body, using the same cache-then-
+/// `block_in_place`/`block_on` bridge [`crate::auth::jwt_interceptor::authorize`]
+/// already uses for the identical problem (a sync call site needing a value
+/// backed by async I/O). Because that resolution happens synchronously
+/// inside the function body rather than via an `.await` the returned future
+/// suspends on, the future never actually reaches a `Pending` state when
+/// polled -- see the design doc's "the load-bearing open question" section,
+/// and this module's tests
+/// (`tests::configured_grants::check_reachability_sync_does_not_panic_cold_or_warm_cache`)
+/// for the property proven directly against `check_reachability_sync`.
+pub struct ConfiguredGrantsAuthorizer {
+    /// Reused verbatim from [`GlobalGrantsAuthorizer`]: the dotted claim
+    /// path naming the caller's FoxIDs groups (the design doc directs
+    /// reusing this claim-extraction mechanism as-is; only what the claim is
+    /// interpreted as changes -- group membership matched against the ACL
+    /// config's `group` field, rather than a flat, directly-held action
+    /// set).
+    permission_claim: Option<String>,
+    /// The parsed, static grant list. Loaded once at startup (see
+    /// [`crate::settings::validate_auth_config`] and
+    /// [`repository_authorizer_with_stores`]) and held read-only thereafter
+    /// -- no hot reload, per the design doc's Non-Goals.
+    config: acl_config::AclConfig,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    /// `RepositoryId -> name`, populated on first resolution and never
+    /// invalidated: repository renaming is not a supported operation
+    /// (`NAME` is a `READ_ONLY_KEY` in `lore-revision`'s metadata layer, and
+    /// there is no `RepositoryRename` RPC), so a populated entry is valid
+    /// for the life of the process. Unbounded, matching the design doc's own
+    /// assessment that grant/repository counts stay in the tens-to-hundreds
+    /// range for this deployment; revisit with an LRU cap (mirroring
+    /// `lore-server/src/auth/jwk.rs`'s JWK cache) if that assumption ever
+    /// stops holding.
+    name_cache: DashMap<RepositoryId, String>,
+}
+
+impl ConfiguredGrantsAuthorizer {
+    pub fn new(
+        permission_claim: Option<String>,
+        config: acl_config::AclConfig,
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+    ) -> Self {
+        Self {
+            permission_claim,
+            config,
+            immutable_store,
+            mutable_store,
+            name_cache: DashMap::new(),
+        }
+    }
+
+    /// Identical extraction to [`GlobalGrantsAuthorizer::held_actions`] --
+    /// same claim shapes accepted (a JSON array of strings, or a single bare
+    /// string), same fail-closed behavior on anything else -- just returning
+    /// every value found rather than testing membership, since the caller
+    /// needs the whole group set to hand to [`acl_config::resolve`].
+    fn caller_groups(&self, claims: &AuthorizationToken) -> Vec<String> {
+        let Some(path) = self.permission_claim.as_deref() else {
+            return Vec::new();
+        };
+        match claims.claim_at(path) {
+            Some(serde_json::Value::Array(items)) => items
+                .into_iter()
+                .filter_map(|item| match item {
+                    serde_json::Value::String(s) => Some(s),
+                    _ => None,
+                })
+                .collect(),
+            Some(serde_json::Value::String(single)) => vec![single],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Resolves `repository`'s human-readable name, synchronously from the
+    /// caller's perspective: a cache hit returns without ever touching the
+    /// async runtime; a miss falls back to `task::block_in_place` +
+    /// `runtime().block_on`, mirroring
+    /// [`crate::auth::jwt_interceptor::authorize`]'s cache-miss fallback
+    /// exactly, and for the same reason -- this can be reached from
+    /// [`ReachabilityAuthorizer::check_reachability_sync`]'s two genuinely
+    /// synchronous call sites (the gRPC interceptor and the cross-partition
+    /// link-read closure), neither of which can await anything themselves.
+    ///
+    /// Two async store reads on a miss (`metadata_hash` then `metadata`,
+    /// per `lore_revision::repository`), confirmed local-only: a server
+    /// context's `remote` is always `RemoteState::Offline`
+    /// (`RepositoryContext::new_server_context`), so this never depends on
+    /// network I/O beyond the local store's own latency.
+    fn resolve_name_sync(&self, repository: RepositoryId) -> Result<String, Status> {
+        if let Some(name) = self.name_cache.get(&repository) {
+            return Ok(name.clone());
+        }
+
+        let immutable_store = self.immutable_store.clone();
+        let mutable_store = self.mutable_store.clone();
+
+        // See the doc comment above: identical shape to
+        // `jwt_interceptor::authorize`'s `Ok(None) => task::block_in_place(...)`
+        // fallback, and required for the same reason -- this can be reached
+        // from a plain synchronous call site that cannot await anything.
+        #[allow(clippy::disallowed_methods)]
+        let name = task::block_in_place(|| {
+            runtime().block_on(async move {
+                let repository_context = Arc::new(RepositoryContext::new_server_context(
+                    immutable_store,
+                    mutable_store,
+                    repository,
+                ));
+                let metadata_hash = repository::metadata_hash(repository_context.clone())
+                    .await
+                    .map_err(|err| {
+                        Status::not_found(format!(
+                            "failed to resolve name for repository {repository}: {err}"
+                        ))
+                    })?;
+                let metadata = repository::metadata(repository_context, metadata_hash)
+                    .await
+                    .map_err(|err| {
+                        Status::not_found(format!(
+                            "failed to resolve name for repository {repository}: {err}"
+                        ))
+                    })?;
+                Ok::<String, Status>(metadata.name)
+            })
+        })?;
+
+        self.name_cache.insert(repository, name.clone());
+        Ok(name)
+    }
+
+    /// Shared by both [`RepositoryAuthorizer`] methods once each has settled
+    /// on the repository name to check against: unions the caller's grants
+    /// via [`acl_config::resolve`] and turns the answer into the same
+    /// `Result<(), Status>` shape every authorizer returns.
+    fn authorize_against(
+        &self,
+        caller_groups: &[String],
+        repository_name: &str,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        if acl_config::resolve(&self.config, repository_name, caller_groups, action) {
+            Ok(())
+        } else {
+            Err(Status::permission_denied(format!(
+                "caller does not hold the '{}' action on repository '{repository_name}'",
+                action.unwrap_or("<reachability>")
+            )))
+        }
+    }
+}
+
+#[async_trait]
+impl RepositoryAuthorizer for ConfiguredGrantsAuthorizer {
+    async fn check_repository_access(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(token) = token else {
+            return Err(Status::unauthenticated(
+                "authentication required for configured-grants authorization",
+            ));
+        };
+
+        let repository_name = self.resolve_name_sync(repository)?;
+        let caller_groups = self.caller_groups(token.claims);
+        self.authorize_against(&caller_groups, &repository_name, action)
+    }
+
+    async fn check_repository_access_by_name(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_name: &str,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        let Some(token) = token else {
+            return Err(Status::unauthenticated(
+                "authentication required for configured-grants authorization",
+            ));
+        };
+
+        let caller_groups = self.caller_groups(token.claims);
+        self.authorize_against(&caller_groups, repository_name, action)
     }
 }
 
@@ -574,7 +808,9 @@ pub(crate) async fn resolve_baseline_actions(
 
 #[cfg(test)]
 mod tests {
+    use lore_base::runtime::LORE_CONTEXT;
     use lore_base::types::Context;
+    use lore_revision::repository::RepositoryMetadata;
     use serde_json::json;
 
     use super::*;
@@ -592,6 +828,38 @@ mod tests {
             extra,
             ..Default::default()
         }
+    }
+
+    /// Stores `name` as `repository`'s `RepositoryMetadata`, the same two
+    /// writes `RepositoryCreate` performs
+    /// (`metadata_store`/`metadata_store_hash`) -- enough for
+    /// `ConfiguredGrantsAuthorizer::resolve_name_sync` (via
+    /// `repository::metadata_hash`/`metadata`) to resolve `repository` back
+    /// to `name`. Must run inside a `LORE_CONTEXT::scope` matching the
+    /// stores' own execution context, same as every other test that seeds
+    /// repository metadata in this codebase (see
+    /// `grpc/handlers/repository_metadata_get.rs`'s `seed_metadata`).
+    async fn seed_repository(
+        immutable: Arc<dyn lore_storage::ImmutableStore>,
+        mutable: Arc<dyn lore_storage::MutableStore>,
+        repository: RepositoryId,
+        name: &str,
+    ) {
+        let repo_ctx = Arc::new(RepositoryContext::new_server_context(
+            immutable, mutable, repository,
+        ));
+        let hash = lore_revision::repository::metadata_store(
+            repo_ctx.clone(),
+            RepositoryMetadata {
+                name: name.to_string(),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("metadata_store should succeed against an in-memory test store");
+        lore_revision::repository::metadata_store_hash(repo_ctx, hash)
+            .await
+            .expect("metadata_store_hash should succeed against an in-memory test store");
     }
 
     mod allow_all {
@@ -824,6 +1092,285 @@ mod tests {
                 .await
                 .expect_err("the claim does not name push");
             assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+    }
+
+    /// `ConfiguredGrantsAuthorizer` (GOALS fork): claim extraction, name
+    /// resolution, and grant matching exercised end to end through the real
+    /// `RepositoryAuthorizer` trait methods -- not re-testing
+    /// `acl_config::resolve` itself, which already has its own extensive
+    /// coverage in `acl_config.rs`, but proving the *wrapper* around it
+    /// (claim extraction, the `RepositoryId -> name` cache, the sync
+    /// bridge) actually wires up correctly.
+    mod configured_grants {
+        use super::*;
+
+        fn config_with(grants: Vec<acl_config::Grant>) -> acl_config::AclConfig {
+            acl_config::AclConfig { grants }
+        }
+
+        fn grant(group: &str, repos: &[&str], permissions: &[&str]) -> acl_config::Grant {
+            acl_config::Grant {
+                group: group.to_string(),
+                repos: repos.iter().map(|s| s.to_string()).collect(),
+                permissions: permissions.iter().map(|s| s.to_string()).collect(),
+            }
+        }
+
+        async fn authorizer_with(
+            grants: Vec<acl_config::Grant>,
+        ) -> (
+            ConfiguredGrantsAuthorizer,
+            Arc<dyn lore_storage::ImmutableStore>,
+            Arc<dyn lore_storage::MutableStore>,
+            Arc<lore_revision::interface::ExecutionContext>,
+        ) {
+            let (immutable, mutable, execution) =
+                crate::store::test_store_create().await.expect("stores");
+            let authorizer = ConfiguredGrantsAuthorizer::new(
+                Some("groups".to_string()),
+                config_with(grants),
+                immutable.clone(),
+                mutable.clone(),
+            );
+            (authorizer, immutable, mutable, execution)
+        }
+
+        fn token_in_groups(groups: &[&str]) -> AuthorizationToken {
+            AuthorizationToken {
+                groups: Some(groups.iter().map(|s| s.to_string()).collect()),
+                ..Default::default()
+            }
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn end_to_end_claim_extraction_name_resolution_and_grant_matching() {
+            let (authorizer, immutable, mutable, execution) =
+                authorizer_with(vec![grant("art-leads", &["art/*"], &["read", "push"])]).await;
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    seed_repository(immutable, mutable, repository(), "art/characters").await;
+
+                    let claims = token_in_groups(&["art-leads"]);
+                    let token = VerifiedToken::new("raw", &claims);
+
+                    authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .await
+                        .expect("art-leads holds read on art/characters via the art/* pattern");
+                    authorizer
+                        .check_repository_access(Some(&token), repository(), Some(PUSH_ACTION))
+                        .await
+                        .expect("art-leads also holds push");
+                    let err = authorizer
+                        .check_repository_access(Some(&token), repository(), Some("admin"))
+                        .await
+                        .expect_err("admin was never granted");
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+
+                    // A caller not in the granted group is denied even
+                    // though the repository name matches.
+                    let other_claims = token_in_groups(&["qa"]);
+                    let other_token = VerifiedToken::new("raw", &other_claims);
+                    let err = authorizer
+                        .check_repository_access(
+                            Some(&other_token),
+                            repository(),
+                            Some(READ_ACTION),
+                        )
+                        .await
+                        .expect_err("qa holds no grant on this repository");
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+                })
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn denies_when_the_resolved_name_does_not_match_any_pattern() {
+            let (authorizer, immutable, mutable, execution) =
+                authorizer_with(vec![grant("art-leads", &["art/*"], &["read"])]).await;
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    // Same group, but the resolved name falls outside every
+                    // pattern this group holds a grant for.
+                    seed_repository(immutable, mutable, repository(), "backend").await;
+
+                    let claims = token_in_groups(&["art-leads"]);
+                    let token = VerifiedToken::new("raw", &claims);
+                    let err = authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .await
+                        .expect_err("the resolved name does not match art/*");
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+                })
+                .await;
+        }
+
+        #[tokio::test(flavor = "multi_thread")]
+        async fn reachability_none_succeeds_on_any_grant_but_is_not_a_specific_action() {
+            let (authorizer, immutable, mutable, execution) =
+                authorizer_with(vec![grant("engineering", &["**"], &["push"])]).await;
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    seed_repository(immutable, mutable, repository(), "any/name").await;
+                    let claims = token_in_groups(&["engineering"]);
+                    let token = VerifiedToken::new("raw", &claims);
+
+                    authorizer
+                        .check_repository_access(Some(&token), repository(), None)
+                        .await
+                        .expect("the caller holds *something* here (push)");
+                    let err = authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .await
+                        .expect_err(
+                            "reachability succeeding must not be treated as authorizing read",
+                        );
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+                })
+                .await;
+        }
+
+        #[tokio::test]
+        async fn no_token_is_unauthenticated() {
+            let (authorizer, _immutable, _mutable, _execution) = authorizer_with(vec![]).await;
+            let err = authorizer
+                .check_repository_access(None, repository(), None)
+                .await
+                .expect_err("a missing token must not be treated as allow");
+            assert_eq!(err.code(), tonic::Code::Unauthenticated);
+        }
+
+        /// `check_repository_access_by_name`: the `RepositoryCreate`
+        /// name-threading path. No `RepositoryId` is resolved at all here --
+        /// the override goes straight from the caller-supplied name to
+        /// `acl_config::resolve`, which is exactly what makes it usable for
+        /// a repository that does not exist yet (no store lookup involved,
+        /// so no store is even seeded in this test).
+        #[tokio::test]
+        async fn check_repository_access_by_name_matches_directly_with_no_store_lookup() {
+            let (authorizer, ..) =
+                authorizer_with(vec![grant("art-leads", &["art/*"], &["push"])]).await;
+
+            let claims = token_in_groups(&["art-leads"]);
+            let token = VerifiedToken::new("raw", &claims);
+
+            authorizer
+                .check_repository_access_by_name(
+                    Some(&token),
+                    "art/newly-created",
+                    Some(PUSH_ACTION),
+                )
+                .await
+                .expect("the requested name matches art/* for a group the caller belongs to");
+
+            let err = authorizer
+                .check_repository_access_by_name(
+                    Some(&token),
+                    "unrelated/newly-created",
+                    Some(PUSH_ACTION),
+                )
+                .await
+                .expect_err("the requested name does not match any pattern this group holds");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }
+
+        /// The sync/no-panic property from the design doc's "load-bearing
+        /// open question": `ReachabilityAuthorizer::check_reachability_sync`
+        /// polls `check_repository_access`'s future exactly once via
+        /// `now_or_never()` and panics if it is not immediately ready. This
+        /// exercises that real synchronous entry point -- not
+        /// `ConfiguredGrantsAuthorizer` directly -- against a
+        /// `ConfiguredGrantsAuthorizer` backed by a real store, on both a
+        /// cold cache (first call, forces the `block_in_place`/`block_on`
+        /// fallback in `resolve_name_sync`) and a warm cache (second call,
+        /// hits the cache and never touches the runtime at all). Neither
+        /// call may panic, and both must resolve to the same, correct
+        /// answer.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn check_reachability_sync_does_not_panic_cold_or_warm_cache() {
+            let (authorizer, immutable, mutable, execution) =
+                authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    seed_repository(immutable, mutable, repository(), "backend").await;
+
+                    let reachability = ReachabilityAuthorizer {
+                        authorizer: Arc::new(authorizer),
+                        legacy_resource_claim: false,
+                    };
+                    let claims = token_in_groups(&["engineering"]);
+
+                    // Cold cache: `resolve_name_sync` has never seen this
+                    // `RepositoryId` before, so this call goes through the
+                    // `block_in_place`/`block_on` fallback. This must not
+                    // panic (the historical failure mode: an async,
+                    // I/O-bound authorizer plugged into `now_or_never()`
+                    // unchanged panics here on first real use) and must
+                    // answer correctly.
+                    reachability
+                        .check_reachability_sync(&claims, repository())
+                        .expect("cold-cache resolution must not panic and must grant reachability");
+
+                    // Warm cache: the same call again must still not panic,
+                    // and must now be answered purely from the cache with
+                    // no store I/O at all.
+                    reachability
+                        .check_reachability_sync(&claims, repository())
+                        .expect("warm-cache resolution must not panic either");
+
+                    // A denied caller on the same (now warm) cache entry
+                    // also must not panic, proving the property holds for
+                    // the deny path too, not just the allow path.
+                    let denied_claims = token_in_groups(&["qa"]);
+                    let err = reachability
+                        .check_reachability_sync(&denied_claims, repository())
+                        .expect_err("qa holds no grant here");
+                    assert_eq!(err.code(), tonic::Code::PermissionDenied);
+                })
+                .await;
+        }
+
+        /// Same property, proven directly against
+        /// `check_repository_access`'s returned future rather than through
+        /// `check_reachability_sync`: `now_or_never()` must return `Some`,
+        /// never `None` (`Pending`), on both a cold and a warm cache.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn check_repository_access_future_never_suspends_when_polled() {
+            let (authorizer, immutable, mutable, execution) =
+                authorizer_with(vec![grant("engineering", &["**"], &["read"])]).await;
+
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    seed_repository(immutable, mutable, repository(), "backend").await;
+                    let claims = token_in_groups(&["engineering"]);
+                    let token = VerifiedToken::new("raw", &claims);
+
+                    // Cold cache.
+                    let result = authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .now_or_never();
+                    assert!(
+                        result.is_some(),
+                        "the future must resolve on first poll even on a cache miss"
+                    );
+                    result.unwrap().expect("engineering holds read");
+
+                    // Warm cache.
+                    let result = authorizer
+                        .check_repository_access(Some(&token), repository(), Some(READ_ACTION))
+                        .now_or_never();
+                    assert!(
+                        result.is_some(),
+                        "the future must resolve on first poll on a cache hit too"
+                    );
+                    result.unwrap().expect("engineering still holds read");
+                })
+                .await;
         }
     }
 

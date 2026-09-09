@@ -15,10 +15,13 @@
 //! function operating on already-resolved plain values (a repository name, a
 //! caller's group list, an optional action string). It has no dependency on
 //! `RepositoryAuthorizer`, `RepositoryId`, `VerifiedToken`, or any tonic/async
-//! type, and is not yet wired into the `repository_authorizer()` factory --
-//! that wiring, along with the `RepositoryId -> name` cache described in the
-//! design doc's "the load-bearing open question" section, is a deferred
-//! follow-up.
+//! type. The type that wraps it into a real [`RepositoryAuthorizer`] --
+//! `ConfiguredGrantsAuthorizer`, including the `RepositoryId -> name` cache
+//! and the sync/async bridge described in the design doc's "the load-bearing
+//! open question" section -- lives in `repository_authorizer.rs`, and is
+//! selected by that module's `repository_authorizer_with_stores` factory.
+//!
+//! [`RepositoryAuthorizer`]: super::repository_authorizer::RepositoryAuthorizer
 
 use std::path::Path;
 
