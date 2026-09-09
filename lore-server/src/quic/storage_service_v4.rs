@@ -91,12 +91,16 @@ fn quic_error_v4(error: &MessageHandleError) -> QuicServiceError {
 
 pub struct StorageServiceV4 {
     jwt_verifier: Arc<Option<JwtVerifier>>,
-    /// Answers the session-start reachability question directly (LEP
+    /// Answers the session-start `read`/`push` questions directly (LEP
     /// 2026-08-20-oidc-oauth2-authentication, D9): "once per session rather
     /// than per operation", so — unlike the gRPC interceptor's per-request
     /// check — going through the configured authorizer unconditionally,
     /// `AuthClientAuthorizer`'s online check included, costs no more than
-    /// one check per connection, which is the granularity it was built for.
+    /// two checks per connection (one for each baseline action), which is
+    /// the granularity this was built for. The two booleans this resolves
+    /// are cached on the `SessionEntry` (see `SessionMap::start`) and
+    /// consulted per `StorageCommand` from then on, never re-asked of this
+    /// authorizer for the life of the session.
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     immutable_store: Arc<dyn ImmutableStore>,
     local_store: Arc<dyn ImmutableStore>,
@@ -196,6 +200,11 @@ impl QuicService for StorageServiceV4 {
                 auth_token,
             } => {
                 let mut user_id = String::new();
+                // No `[server.auth]` configured at all: matches
+                // `AllowAllRepositoryAuthorizer`'s semantics everywhere
+                // else — every session holds both baseline actions.
+                let mut holds_read = true;
+                let mut holds_push = true;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
                     let token_str = String::from_utf8(auth_token).map_err(|err| {
@@ -214,21 +223,60 @@ impl QuicService for StorageServiceV4 {
                         .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
 
                     let verified_token = VerifiedToken::new(&token_str, &authorization);
-                    self.repository_authorizer
-                        .check_repository_access(Some(&verified_token), repository, None)
+                    // Resolves and caches `read`/`push` once here, at
+                    // session-authorize time — matching the "once per
+                    // session rather than per operation" principle this
+                    // service already used for plain reachability (see
+                    // `Self::repository_authorizer`'s doc comment) — rather
+                    // than asking the authorizer again for every
+                    // `StorageCommand` this session goes on to issue.
+                    // `read`/`push` together subsume the old, plain
+                    // reachability question: a legacy `AuthClientAuthorizer`
+                    // deployment answers both from the same "listed among
+                    // the allowed resources at all" check reachability
+                    // used (see `RepositoryAuthorizer`'s doc comment on
+                    // `read`/`push` having no legacy equivalent), so a
+                    // caller who is reachable at all under a legacy
+                    // deployment holds both; a caller who holds neither was
+                    // never reachable either way.
+                    holds_read = self
+                        .repository_authorizer
+                        .check_repository_access(
+                            Some(&verified_token),
+                            repository,
+                            Some(crate::authnz::repository_authorizer::READ_ACTION),
+                        )
                         .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                        .is_ok();
+                    holds_push = self
+                        .repository_authorizer
+                        .check_repository_access(
+                            Some(&verified_token),
+                            repository,
+                            Some(crate::authnz::repository_authorizer::PUSH_ACTION),
+                        )
+                        .await
+                        .is_ok();
+
+                    if !holds_read && !holds_push {
+                        return Err(MessageHandleError::AuthorizationFailure(
+                            "caller holds neither read nor push".to_string(),
+                        ));
+                    }
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id) {
+                match session_map.start(repository, correlation_id, user_id, holds_read, holds_push)
+                {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
                             repository = %repository,
                             correlation_id,
+                            holds_read,
+                            holds_push,
                             "Authorized session"
                         );
                         let response_data = vec![Bytes::copy_from_slice(&session_id.to_le_bytes())];
@@ -264,6 +312,8 @@ impl QuicService for StorageServiceV4 {
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();
+                let holds_read = session.holds_read;
+                let holds_push = session.holds_push;
                 drop(session);
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
@@ -272,6 +322,48 @@ impl QuicService for StorageServiceV4 {
                     tracing::warn!("Failed to parse v4 storage command: {err}");
                     MessageHandleError::InternalError
                 })?;
+
+                // Per-command action check, against the `read`/`push` this
+                // session cached at `AuthorizeStart` — not a fresh
+                // authorizer call, per that field's own doc comment. This
+                // is what actually gates each operation: `AuthorizeStart`
+                // establishing the session is necessary but not
+                // sufficient, since a session can hold `read` xor `push`
+                // rather than both. `Copy`'s destination is this session's
+                // own repository (`push`, checked here); its cross-
+                // partition *source* gets its own `read` check inside
+                // `handle_copy` via `SessionMap::has_read_access`, since the
+                // source may be a different repository than this session's.
+                use crate::quic::storage_service::ParsedStorageRequest;
+                match &parsed {
+                    ParsedStorageRequest::Get(_)
+                    | ParsedStorageRequest::GetMetadata(_)
+                    | ParsedStorageRequest::GetResolved(_)
+                    | ParsedStorageRequest::Query(_)
+                    | ParsedStorageRequest::Verify(_)
+                    | ParsedStorageRequest::MutableLoad(_) => {
+                        if !holds_read {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "caller does not hold the read action".to_string(),
+                            ));
+                        }
+                    }
+                    ParsedStorageRequest::Put(_)
+                    | ParsedStorageRequest::PutResolved(_)
+                    | ParsedStorageRequest::MutableStoreOp(_)
+                    | ParsedStorageRequest::MutableCas(_)
+                    | ParsedStorageRequest::Copy(_) => {
+                        if !holds_push {
+                            return Err(MessageHandleError::AuthorizationFailure(
+                                "caller does not hold the push action".to_string(),
+                            ));
+                        }
+                    }
+                    // v2-only, handled as reserved opcodes before parsing is
+                    // ever reached for a v4 StorageCommand — never actually
+                    // produced by `parse_message_for_opcode_v4`.
+                    ParsedStorageRequest::Connect(_) | ParsedStorageRequest::Correlate(_) => {}
+                }
 
                 // Dispatch to standalone handler functions with explicit session context
                 let response = match parsed {
@@ -657,5 +749,220 @@ mod tests {
         assert_eq!(error_info.message_handle_label, "SessionLimitReached");
         assert!(!error_info.is_internal_error);
         assert!(!error_info.is_appropriate_for_logging);
+    }
+
+    /// Exercises the fix for the gap where `AuthorizeStart` checked plain
+    /// reachability once and every subsequent `StorageCommand` on the
+    /// session went unchecked: a per-command `read`/`push` gate against
+    /// the flags cached on the session at authorize time.
+    mod baseline_action_gating {
+        use std::ops::Add;
+        use std::time::Duration;
+        use std::time::SystemTime;
+        use std::time::UNIX_EPOCH;
+
+        use async_trait::async_trait;
+        use jsonwebtoken::Algorithm;
+        use jsonwebtoken::DecodingKey;
+        use jsonwebtoken::EncodingKey;
+        use jsonwebtoken::Header;
+        use jsonwebtoken::encode;
+        use lore_transport::quic::storage_service::Command;
+
+        use super::*;
+        use crate::auth::jwk::JWKService;
+        use crate::auth::jwk::JWKServiceError;
+        use crate::auth::jwt::AuthorizationToken;
+        use crate::auth::jwt::JwtVerifier;
+        use crate::authnz::repository_authorizer::GlobalGrantsAuthorizer;
+
+        const ALGORITHM: Algorithm = Algorithm::HS256;
+        const SIGNING_SECRET: &str = "storage-v4-baseline-action-test-secret";
+        const TEST_AUDIENCE: &str = "lore-test";
+
+        mockall::mock! {
+            TestJWKService {}
+
+            #[async_trait]
+            impl JWKService for TestJWKService {
+                async fn get_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<(DecodingKey, jsonwebtoken::Algorithm), JWKServiceError>;
+
+                fn get_cached_key(
+                    &self,
+                    kid: &str,
+                ) -> Option<(DecodingKey, jsonwebtoken::Algorithm)>;
+
+                async fn refresh_key(
+                    &self,
+                    kid: &str,
+                ) -> Result<Option<(DecodingKey, jsonwebtoken::Algorithm)>, JWKServiceError>;
+            }
+        }
+
+        fn make_jwt(groups: Vec<String>) -> Vec<u8> {
+            let claims = AuthorizationToken {
+                user_id: "test-user".to_string(),
+                issuer: "test-issuer".to_string(),
+                issued_at: 1,
+                expires: SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .add(Duration::from_secs(60))
+                    .as_secs(),
+                audience: vec![TEST_AUDIENCE.to_string()],
+                groups: Some(groups),
+                ..Default::default()
+            };
+            let key = EncodingKey::from_secret(SIGNING_SECRET.as_ref());
+            let mut header = Header::new(ALGORITHM);
+            header.kid = Some("test-kid".to_string());
+            encode(&header, &claims, &key).unwrap().into_bytes()
+        }
+
+        fn make_tier1_service(
+            immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+            mutable_store: Arc<dyn lore_storage::MutableStore>,
+        ) -> StorageServiceV4 {
+            let mut jwk_service = MockTestJWKService::new();
+            jwk_service
+                .expect_get_key()
+                .returning(|_| Ok((DecodingKey::from_secret(SIGNING_SECRET.as_ref()), ALGORITHM)));
+            let verifier = JwtVerifier {
+                jwk_service: Arc::new(jwk_service),
+                jwt_issuer: None,
+                jwt_audience: Some(vec![TEST_AUDIENCE.to_string()]),
+            };
+            StorageServiceV4::new(
+                Arc::new(Some(verifier)),
+                Arc::new(GlobalGrantsAuthorizer::new(Some("groups".to_string()))),
+                immutable_store.clone(),
+                immutable_store,
+                mutable_store,
+                Arc::new(UserAgentFilter::default()),
+            )
+        }
+
+        async fn authorize(
+            service: &StorageServiceV4,
+            repository: lore_revision::lore::RepositoryId,
+            groups: Vec<String>,
+        ) -> u32 {
+            let response = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository,
+                        correlation_id: "corr".into(),
+                        auth_token: make_jwt(groups),
+                    },
+                )
+                .await
+                .expect("AuthorizeStart should succeed for a caller holding read or push");
+            u32::from_le_bytes(response[0][..4].try_into().unwrap())
+        }
+
+        fn valid_mutable_store_payload() -> Bytes {
+            // key Hash (32 zero bytes) ++ value Hash (32 zero bytes) ++ KeyType::Untyped (0)
+            Bytes::from(vec![0u8; 65])
+        }
+
+        #[tokio::test]
+        async fn authorize_start_fails_when_caller_holds_neither_action() {
+            let (immutable_store, mutable_store, _exec) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = make_tier1_service(immutable_store, mutable_store);
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::AuthorizeStart {
+                        repository: random(),
+                        correlation_id: "corr".into(),
+                        auth_token: make_jwt(vec!["obliterate".to_string()]),
+                    },
+                )
+                .await
+                .expect_err("a caller holding neither read nor push must be denied a session");
+            assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+        }
+
+        #[tokio::test]
+        async fn push_only_session_denies_query_but_allows_mutable_store() {
+            let (immutable_store, mutable_store, _exec) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = make_tier1_service(immutable_store, mutable_store);
+            let repository = random();
+
+            let session_id = authorize(&service, repository, vec!["push".to_string()]).await;
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::Query as u8,
+                        payload: Bytes::new(),
+                    },
+                )
+                .await
+                .expect_err("a push-only session must be denied a read command");
+            assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+
+            let result = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: valid_mutable_store_payload(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+                "a push-only session must be allowed to issue a push command, got {result:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn read_only_session_allows_query_but_denies_mutable_store() {
+            let (immutable_store, mutable_store, _exec) =
+                test_store_create().await.expect("Failed to create stores");
+            let service = make_tier1_service(immutable_store, mutable_store);
+            let repository = random();
+
+            let session_id = authorize(&service, repository, vec!["read".to_string()]).await;
+
+            let result = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::Query as u8,
+                        payload: Bytes::new(),
+                    },
+                )
+                .await;
+            assert!(
+                !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+                "a read-only session must be allowed to issue a read command, got {result:?}"
+            );
+
+            let err = service
+                .run_request_handler(
+                    AttributeMap::default().into(),
+                    ParsedStorageRequestV4::StorageCommand {
+                        session_id,
+                        opcode: Command::MutableStore as u8,
+                        payload: valid_mutable_store_payload(),
+                    },
+                )
+                .await
+                .expect_err("a read-only session must be denied a push command");
+            assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+        }
     }
 }

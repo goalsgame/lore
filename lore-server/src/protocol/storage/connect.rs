@@ -92,13 +92,39 @@ impl Message for Connect {
                     // afford to go through the configured authorizer
                     // unconditionally, `AuthClientAuthorizer`'s online check
                     // included, at the granularity that authorizer was built
-                    // for.
+                    // for. Resolves both baseline actions rather than plain
+                    // reachability: together they subsume it (a legacy
+                    // deployment answers both from the same "listed among
+                    // the allowed resources at all" check reachability used
+                    // — see `RepositoryAuthorizer`'s doc comment on
+                    // `read`/`push` having no legacy equivalent), and the
+                    // central dispatcher (`quic/storage_service.rs`) checks
+                    // the cached result on every subsequent request on this
+                    // connection instead of asking again.
                     let verified_token = VerifiedToken::new(auth_token, &authorization);
-                    reachability_authorizer
+                    let holds_read = reachability_authorizer
                         .authorizer
-                        .check_repository_access(Some(&verified_token), self.repository, None)
+                        .check_repository_access(
+                            Some(&verified_token),
+                            self.repository,
+                            Some(crate::authnz::repository_authorizer::READ_ACTION),
+                        )
                         .await
-                        .map_err(|err| MessageHandleError::AuthorizationFailure(err.to_string()))?;
+                        .is_ok();
+                    let holds_push = reachability_authorizer
+                        .authorizer
+                        .check_repository_access(
+                            Some(&verified_token),
+                            self.repository,
+                            Some(crate::authnz::repository_authorizer::PUSH_ACTION),
+                        )
+                        .await
+                        .is_ok();
+                    if !holds_read && !holds_push {
+                        return Err(MessageHandleError::AuthorizationFailure(
+                            "caller holds neither read nor push".to_string(),
+                        ));
+                    }
                     if let Some(span) = context.get::<tracing::Span>() {
                         span.record(USER_ID, get_user_id_from_token(Some(authorization.clone())));
                     }
@@ -113,6 +139,8 @@ impl Message for Connect {
                     context.insert(ConnectionAuthorization::Verified {
                         token: Box::new(authorization),
                         reachability_authorizer,
+                        holds_read,
+                        holds_push,
                     });
                 }
                 None => {

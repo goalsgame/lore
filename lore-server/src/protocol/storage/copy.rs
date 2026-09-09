@@ -74,9 +74,11 @@ impl Copy {
 }
 
 /// Source-repo authorization check for v4 sessions.
-/// When `session_map` is provided (v4 path), checks that the source repository has been
-/// authorized (had at least one session started) on this connection.
-/// When `None` (urc/0.2 path), uses the legacy `AuthorizationToken` check.
+/// When `session_map` is provided (v4 path), checks that the source repository was authorized
+/// *for `read`* by some `AuthorizeStart` on this connection — not merely that a session exists
+/// for it, which would also admit a repository the caller can only `push` to.
+/// When `None` (urc/0.2 path), the caller (`Copy::handle`) has already checked `read` on the
+/// source via `ConnectionAuthorization` before reaching here.
 ///
 /// `destination_context` selects the destination tuple's dedup tag — destination address is
 /// `(destination_repository, source_address.hash, destination_context)`. Legacy urc/0.2 callers
@@ -95,7 +97,7 @@ pub async fn handle_copy(
     immutable_store: Arc<dyn ImmutableStore>,
 ) -> Result<LoreResponse, MessageHandleError> {
     if let Some(session_map) = session_map
-        && !session_map.is_repository_authorized(source_repository)
+        && !session_map.has_read_access(source_repository)
     {
         return Err(MessageHandleError::AuthorizationFailure(
             "source repository not authorized".to_string(),
@@ -157,6 +159,7 @@ impl Message for Copy {
             ConnectionAuthorization::Verified {
                 token,
                 reachability_authorizer,
+                ..
             } => {
                 // `read` on the source, not plain reachability: a caller
                 // holding `push` on the destination repository (checked
@@ -538,6 +541,8 @@ mod tests {
         context_map.insert(ConnectionAuthorization::Verified {
             token: Box::new(token),
             reachability_authorizer: legacy_reachability(),
+            holds_read: true,
+            holds_push: true,
         });
 
         let (immutable_store, _mutable_store, execution) =
@@ -574,6 +579,8 @@ mod tests {
         context_map.insert(ConnectionAuthorization::Verified {
             token: Box::new(token),
             reachability_authorizer: tier1_reachability(),
+            holds_read: true,
+            holds_push: true,
         });
 
         let (immutable_store, _mutable_store, execution) =
@@ -607,6 +614,8 @@ mod tests {
         context_map.insert(ConnectionAuthorization::Verified {
             token: Box::new(token),
             reachability_authorizer: tier1_reachability(),
+            holds_read: true,
+            holds_push: true,
         });
 
         let (immutable_store, _mutable_store, execution) =

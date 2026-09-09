@@ -22,10 +22,13 @@ use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::storage::responses;
 
 /// The connection's authorization state, established once by `Connect`
-/// (`protocol/storage/connect.rs`) and read per-fragment by `Copy`
-/// (`protocol/storage/copy.rs`), which needs its own check because a copy's
-/// source repository may differ from the one this connection authorized
-/// against.
+/// (`protocol/storage/connect.rs`) and read:
+/// - per-request, by the central dispatcher (`quic/storage_service.rs`'s
+///   `run_request_handler`), which checks `holds_read`/`holds_push` before
+///   dispatching to any message other than `Connect` itself;
+/// - per-fragment, by `Copy` (`protocol/storage/copy.rs`), which needs its
+///   own `read` check because a copy's source repository may differ from
+///   the one this connection authorized against.
 ///
 /// A successful `Connect` always inserts this into the connection's
 /// `AttributeMap` — `Open` when no verifier is configured, `Verified`
@@ -39,7 +42,8 @@ use crate::protocol::storage::responses;
 #[derive(Clone)]
 pub enum ConnectionAuthorization {
     /// No verifier is configured for this deployment: matches
-    /// `AllowAllRepositoryAuthorizer`'s semantics everywhere else.
+    /// `AllowAllRepositoryAuthorizer`'s semantics everywhere else — every
+    /// request holds both baseline actions.
     Open,
     /// A caller was verified at connect time. `token` is boxed because
     /// `AuthorizationToken` is much larger than `Open`'s no-data variant
@@ -48,6 +52,15 @@ pub enum ConnectionAuthorization {
     Verified {
         token: Box<AuthorizationToken>,
         reachability_authorizer: ReachabilityAuthorizer,
+        /// Whether `Connect` found this connection's caller holding the
+        /// baseline `read`/`push` actions on the repository it connected
+        /// to, resolved once here (LEP 2026-08-20-oidc-oauth2-authentication,
+        /// D9's "once per session/connection rather than per operation"
+        /// principle, the same one already applied to plain reachability)
+        /// rather than asking the authorizer again for every subsequent
+        /// request on this connection.
+        holds_read: bool,
+        holds_push: bool,
     },
 }
 

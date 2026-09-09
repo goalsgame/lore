@@ -144,6 +144,8 @@ mod tests {
             }),
             reachability_authorizer: ReachabilityAuthorizer::new(None, None)
                 .expect("no config never fails to construct"),
+            holds_read: true,
+            holds_push: true,
         });
 
         assert_eq!(get_user_id_from_context(&context), "alice");

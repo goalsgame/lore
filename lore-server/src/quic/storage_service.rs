@@ -35,6 +35,7 @@ use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::UserAgentValue;
+use crate::protocol::storage::messages::ConnectionAuthorization;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -487,6 +488,65 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        // Baseline `read`/`push` gate, centralized here rather than
+        // duplicated across each `Message::handle`/`handle_mutable`
+        // implementation — the same approach `StorageServiceV4` takes
+        // against its session-cached flags, applied here against the
+        // connection-cached flags `Connect` establishes (see
+        // `ConnectionAuthorization`). `Connect` itself is exempt: it is
+        // what produces this state, checked separately inside
+        // `handle_auth`. `Correlate` (stream-linking metadata, no
+        // repository data) needs neither action.
+        //
+        // `Copy`'s own `push` (destination) and `read` (per-fragment
+        // source, which may differ from this connection's repository) are
+        // both layered on top of this, not replaced by it: `push` here is
+        // what makes reaching `Copy::handle` possible at all, and its
+        // separate source check inside `handle_copy`/`Copy::handle` still
+        // runs afterward.
+        if !matches!(
+            request,
+            ParsedStorageRequest::Connect(_) | ParsedStorageRequest::Correlate(_)
+        ) {
+            let (holds_read, holds_push) = match context.get::<ConnectionAuthorization>() {
+                Some(auth) => match auth.as_ref() {
+                    ConnectionAuthorization::Open => (true, true),
+                    ConnectionAuthorization::Verified {
+                        holds_read,
+                        holds_push,
+                        ..
+                    } => (*holds_read, *holds_push),
+                },
+                // Always present on an established connection (`Connect`
+                // inserts it unconditionally) — see `ConnectionAuthorization`'s
+                // doc comment on why absence here is a wiring bug, not a
+                // legitimate "no auth" state, and must fail closed rather
+                // than be read as "everything permitted".
+                None => return Err(MessageHandleError::MissingToken),
+            };
+            let required_action_held = match &request {
+                ParsedStorageRequest::Get(_)
+                | ParsedStorageRequest::GetMetadata(_)
+                | ParsedStorageRequest::GetResolved(_)
+                | ParsedStorageRequest::Query(_)
+                | ParsedStorageRequest::Verify(_)
+                | ParsedStorageRequest::MutableLoad(_) => holds_read,
+                ParsedStorageRequest::Put(_)
+                | ParsedStorageRequest::PutResolved(_)
+                | ParsedStorageRequest::MutableStoreOp(_)
+                | ParsedStorageRequest::MutableCas(_)
+                | ParsedStorageRequest::Copy(_) => holds_push,
+                ParsedStorageRequest::Connect(_) | ParsedStorageRequest::Correlate(_) => {
+                    unreachable!("excluded by the outer match above")
+                }
+            };
+            if !required_action_held {
+                return Err(MessageHandleError::AuthorizationFailure(
+                    "caller does not hold the required action".to_string(),
+                ));
+            }
+        }
+
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
@@ -562,5 +622,169 @@ impl QuicService for StorageService {
                 .as_ref()
                 .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use lore_transport::quic::command_header::CommandHeader;
+    use rand::random;
+
+    use super::*;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
+    use crate::quic::QuicService;
+    use crate::store::test_store_create;
+
+    /// Exercises the fix for the gap where `Connect` checked plain
+    /// reachability once and every subsequent request on the connection
+    /// went unchecked: a per-request `read`/`push` gate, centralized in
+    /// `run_request_handler`, against the flags `Connect` caches on
+    /// `ConnectionAuthorization`.
+    fn make_service(
+        immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+        mutable_store: Arc<dyn lore_storage::MutableStore>,
+    ) -> StorageService {
+        StorageService::new(
+            Arc::new(None),
+            ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct"),
+            immutable_store.clone(),
+            immutable_store,
+            mutable_store,
+        )
+    }
+
+    fn context_with_authorization(
+        repository: RepositoryId,
+        holds_read: bool,
+        holds_push: bool,
+    ) -> Arc<AttributeMap> {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(repository);
+        context.insert(ConnectionAuthorization::Verified {
+            token: Box::new(AuthorizationToken::default()),
+            reachability_authorizer: ReachabilityAuthorizer::new(None, None)
+                .expect("no config never fails to construct"),
+            holds_read,
+            holds_push,
+        });
+        context
+    }
+
+    #[tokio::test]
+    async fn denies_read_command_when_connection_lacks_read() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+        let context = context_with_authorization(random(), false, true);
+
+        let header = CommandHeader {
+            cmd: Command::Query as u8,
+            ..CommandHeader::default()
+        };
+        let parsed = service
+            .parse_request_bytes(&header, Bytes::new())
+            .expect("an empty Query payload parses");
+
+        let err = service
+            .run_request_handler(context, parsed)
+            .await
+            .expect_err("a push-only connection must be denied a read command");
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn allows_read_command_when_connection_holds_read() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+        let context = context_with_authorization(random(), true, false);
+
+        let header = CommandHeader {
+            cmd: Command::Query as u8,
+            ..CommandHeader::default()
+        };
+        let parsed = service
+            .parse_request_bytes(&header, Bytes::new())
+            .expect("an empty Query payload parses");
+
+        let result = service.run_request_handler(context, parsed).await;
+        assert!(
+            !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+            "a read-holding connection must be allowed a read command, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denies_push_command_when_connection_lacks_push() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+        let context = context_with_authorization(random(), true, false);
+
+        let header = CommandHeader {
+            cmd: Command::MutableStore as u8,
+            ..CommandHeader::default()
+        };
+        // key Hash (32 zero bytes) ++ value Hash (32 zero bytes) ++ KeyType::Untyped (0)
+        let payload = Bytes::from(vec![0u8; 65]);
+        let parsed = service
+            .parse_request_bytes(&header, payload)
+            .expect("a valid MutableStore payload parses");
+
+        let err = service
+            .run_request_handler(context, parsed)
+            .await
+            .expect_err("a read-only connection must be denied a push command");
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn allows_push_command_when_connection_holds_push() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+        let context = context_with_authorization(random(), false, true);
+
+        let header = CommandHeader {
+            cmd: Command::MutableStore as u8,
+            ..CommandHeader::default()
+        };
+        let payload = Bytes::from(vec![0u8; 65]);
+        let parsed = service
+            .parse_request_bytes(&header, payload)
+            .expect("a valid MutableStore payload parses");
+
+        let result = service.run_request_handler(context, parsed).await;
+        assert!(
+            !matches!(result, Err(MessageHandleError::AuthorizationFailure(_))),
+            "a push-holding connection must be allowed a push command, got {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn denies_any_command_when_connection_authorization_missing() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+
+        // No ConnectionAuthorization or RepositoryId inserted: a message
+        // handled before Connect, or a future transport that forgets to
+        // call it.
+        let context = Arc::new(AttributeMap::default());
+
+        let header = CommandHeader {
+            cmd: Command::Query as u8,
+            ..CommandHeader::default()
+        };
+        let parsed = service
+            .parse_request_bytes(&header, Bytes::new())
+            .expect("an empty Query payload parses");
+
+        let err = service
+            .run_request_handler(context, parsed)
+            .await
+            .expect_err("a connection with no established authorization must be denied");
+        assert!(matches!(err, MessageHandleError::MissingToken));
     }
 }
