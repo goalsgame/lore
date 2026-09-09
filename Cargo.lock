@@ -3590,6 +3590,7 @@ dependencies = [
  "dashmap",
  "enum_dispatch",
  "futures",
+ "glob-match",
  "hex",
  "http 1.4.0",
  "http-body 1.1.0",
