@@ -21,8 +21,10 @@ use tracing::debug;
 use tracing::info;
 use tracing::warn;
 
+use crate::authnz::repository_authorizer::READ_ACTION;
 use crate::authnz::repository_authorizer::ReachabilityAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_authorization;
 use crate::grpc::get_repository;
@@ -43,6 +45,7 @@ pub async fn handler(
     let repository_id = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let authorization = get_authorization(request.extensions()).ok();
+    let raw_token = extract_authorization_header(&request);
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let req = request.into_inner().clone();
     let branch_source = BranchId::from(req.branch_source);
@@ -57,9 +60,23 @@ pub async fn handler(
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
 
+    // Explicit `read` check on the primary requested repository, separate
+    // from `link_read_authorizer` below (which answers a different
+    // question — plain reachability, `action: None`, for each linked
+    // partition visited while walking the diff).
+    let verified_token = crate::grpc::verified_token(&authorization, &raw_token);
+    reachability_authorizer
+        .authorizer
+        .check_repository_access(verified_token.as_ref(), repository_id, Some(READ_ACTION))
+        .await
+        .map_err(|_err| Status::permission_denied("Permission denied"))?;
+
     let repository = Arc::new(
         RepositoryContext::new_server_context(immutable_store, mutable_store, repository_id)
-            .with_link_read(link_read_authorizer(reachability_authorizer, authorization)),
+            .with_link_read(link_read_authorizer(
+                reachability_authorizer,
+                authorization,
+            )),
     );
     LORE_CONTEXT
         .scope(execution, async move {
@@ -220,6 +237,19 @@ mod test {
     /// works here.
     fn no_auth_reachability_authorizer() -> ReachabilityAuthorizer {
         ReachabilityAuthorizer::new(None, None).expect("no config never fails to construct")
+    }
+
+    /// A Tier 1 deployment reading a `groups` claim, for the dedicated
+    /// `read`-action tests below.
+    fn groups_reachability_authorizer() -> ReachabilityAuthorizer {
+        ReachabilityAuthorizer {
+            authorizer: Arc::new(
+                crate::authnz::repository_authorizer::GlobalGrantsAuthorizer::new(Some(
+                    "groups".to_string(),
+                )),
+            ),
+            legacy_resource_claim: false,
+        }
     }
 
     async fn commit_revision_on_branch(
@@ -1011,5 +1041,48 @@ mod test {
             !base.is_zero(),
             "A zero base is the empty tree, which conflicts on every path in both branches"
         );
+    }
+
+    /// A caller whose token does not hold `read` is denied outright, before
+    /// any branch lookup — the new explicit check on the primary
+    /// repository, separate from `link_read_authorizer`'s per-linked-item
+    /// reachability closure.
+    #[tokio::test]
+    async fn denies_caller_without_read_action() {
+        let repository = random::<Context>();
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let mut request = Request::new(BranchDiffRequest {
+                    branch_target: BranchId::from(uuid::Uuid::now_v7()).into(),
+                    branch_source: BranchId::from(uuid::Uuid::now_v7()).into(),
+                    revision_target: None,
+                    revision_source: None,
+                    autoresolve: false,
+                });
+                request.metadata_mut().insert_bin(
+                    REPOSITORY_ID_KEY,
+                    tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+                );
+                request
+                    .extensions_mut()
+                    .insert(crate::auth::jwt::AuthorizationToken {
+                        groups: Some(vec!["push".to_string()]),
+                        ..Default::default()
+                    });
+
+                let err = handler(
+                    request,
+                    groups_reachability_authorizer(),
+                    immutable_store,
+                    mutable_store,
+                )
+                .await
+                .expect_err("a caller without read must be denied");
+                assert_eq!(err.code(), tonic::Code::PermissionDenied);
+            })
+            .await;
     }
 }
