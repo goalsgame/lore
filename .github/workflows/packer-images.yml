@@ -85,10 +85,15 @@ jobs:
         with:
           key: packer-lore-server-build
           # CARGO_TARGET_DIR above moves the build output off the runner's
-          # small root disk; the action's own defaults don't know to cache
-          # it, so every run was recompiling from scratch (confirmed: the
-          # saved cache was ~100MB, just the registry index, never target/).
-          cache-directories: /mnt/cargo-target
+          # small root disk. `cache-directories` doesn't redirect the
+          # action's own workspace/target tracking -- it only adds unrelated
+          # extra paths -- so this still recompiled from scratch every run
+          # (confirmed: the saved cache was still the same stale ~104MB
+          # registry-index-only entry from before that fix, untouched by
+          # either build since). `workspaces` is the actual
+          # "$workspace -> $target" mapping the action's README documents
+          # for a relocated target dir.
+          workspaces: ". -> /mnt/cargo-target"
 
       - name: Build loreserver (release, x86_64-unknown-linux-gnu)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p lore-server --bin loreserver
