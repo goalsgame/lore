@@ -27,6 +27,13 @@
 #                       secrets.env as ENV_VAR_NAME=<value>. Any LORE__-prefixed
 #                       name here overrides the matching field in local.toml
 #                       (environment variables win over every file layer).
+#   lore-cert-secret-refs  Same secret-ref convention as above, but for
+#                       secrets that must land as files rather than
+#                       environment variables (TLS certificate/key/chain
+#                       PEMs: local.toml's [server.*.certificate] blocks take
+#                       file paths, not inline values). One
+#                       `filename=secret-ref` pair per line; each is resolved
+#                       and written to config/tls/<filename>.
 set -euo pipefail
 
 CONFIG_DIR=/etc/lore/config
@@ -83,6 +90,26 @@ if [[ -n "$secret_refs" ]]; then
     fi
     printf '%s=%s\n' "$name" "$value" >>"$secrets_file"
   done <<<"$secret_refs"
+fi
+
+# config/tls/<filename> — resolved from Secret Manager, same as secrets.env,
+# but as files: TLS certificate/key/chain PEMs are referenced by path from
+# local.toml, not inlined.
+cert_secret_refs="$(fetch_metadata lore-cert-secret-refs)"
+if [[ -n "$cert_secret_refs" ]]; then
+  tls_dir="$CONFIG_DIR/tls"
+  install -d -m 0750 -o lore -g lore "$tls_dir"
+  while IFS='=' read -r filename ref; do
+    [[ -z "$filename" || -z "$ref" ]] && continue
+    value="$(gcloud secrets versions access --secret="$ref" 2>/dev/null || true)"
+    if [[ -z "$value" ]]; then
+      echo "lore-bootstrap: WARNING: could not resolve cert secret ref for ${filename} (${ref}), skipping" >&2
+      continue
+    fi
+    printf '%s' "$value" >"$tls_dir/$filename"
+    chown lore:lore "$tls_dir/$filename"
+    chmod 0640 "$tls_dir/$filename"
+  done <<<"$cert_secret_refs"
 fi
 
 echo "lore-bootstrap: done (environment=${environment:-<unset>})"
