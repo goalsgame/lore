@@ -1859,11 +1859,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // plain `new`) is what lets `acl_config_path` (GOALS fork) select
     // `ConfiguredGrantsAuthorizer`, which needs read access to the
     // repository-metadata store already constructed above.
-    let legacy_auth_url = settings
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.endpoint.as_ref())
-        .and_then(|endpoint| endpoint.auth_url.clone());
+    // Only an `auth_url` naming the legacy `UrcAuthApi` service selects the
+    // legacy authorizer. An `oidc://` one is advertised to clients so they know
+    // how to log in, while authorization keeps coming from the token's claims;
+    // see `settings::legacy_auth_url`.
+    let legacy_auth_url = crate::settings::legacy_auth_url(&settings);
     let reachability_authorizer = ReachabilityAuthorizer::new_with_stores(
         legacy_auth_url,
         settings.server.auth.as_ref(),

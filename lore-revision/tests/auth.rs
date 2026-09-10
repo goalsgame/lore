@@ -52,6 +52,8 @@ mod tests {
                 is_service_account: None,
                 expires: 1,
                 audience,
+                root_domains: Vec::new(),
+                namespaced_root_domains: Vec::new(),
             }
         }
 

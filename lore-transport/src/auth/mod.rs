@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 pub mod exchange;
+pub mod oidc;
 pub mod ucs_auth;
 
 use std::collections::HashMap;
@@ -46,6 +47,11 @@ pub mod authentication {
             let ucs_auth = Arc::new(ucs_auth::UcsAuthentication);
             let _ = add("ucs-auth", ucs_auth.clone());
             let _ = add("https", ucs_auth); // transition fallback
+            // Standards-only OpenID Connect (GOALS fork). Named for the
+            // protocol rather than for one provider: nothing in the
+            // implementation is provider-specific, and everything that is --
+            // issuer, client ID, scopes -- travels in the auth URL itself.
+            let _ = add(oidc::SCHEME, Arc::new(oidc::OidcAuthentication));
         });
 
         let scheme = parse_scheme(auth_url)?;
