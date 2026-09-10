@@ -44,6 +44,19 @@ fetch_metadata() {
   curl -fsS -H "Metadata-Flavor: Google" "${METADATA_BASE}/${key}" 2>/dev/null || true
 }
 
+# `gcloud secrets versions access` takes the version and the bare secret name
+# as separate arguments -- passing the fully-qualified
+# projects/<p>/secrets/<s>/versions/<v> path as --secret 404s, it does not
+# parse that form itself. Splits one before calling it.
+resolve_secret_ref() {
+  local ref="$1"
+  if [[ "$ref" =~ ^projects/([^/]+)/secrets/([^/]+)/versions/([^/]+)$ ]]; then
+    gcloud secrets versions access "${BASH_REMATCH[3]}" \
+      --secret="${BASH_REMATCH[2]}" \
+      --project="${BASH_REMATCH[1]}" 2>/dev/null || true
+  fi
+}
+
 install -d -m 0750 -o lore -g lore "$CONFIG_DIR"
 
 # LORE_ENV
@@ -83,7 +96,7 @@ secret_refs="$(fetch_metadata lore-secret-refs)"
 if [[ -n "$secret_refs" ]]; then
   while IFS='=' read -r name ref; do
     [[ -z "$name" || -z "$ref" ]] && continue
-    value="$(gcloud secrets versions access --secret="$ref" 2>/dev/null || true)"
+    value="$(resolve_secret_ref "$ref")"
     if [[ -z "$value" ]]; then
       echo "lore-bootstrap: WARNING: could not resolve secret ref for ${name} (${ref}), skipping" >&2
       continue
@@ -101,7 +114,7 @@ if [[ -n "$cert_secret_refs" ]]; then
   install -d -m 0750 -o lore -g lore "$tls_dir"
   while IFS='=' read -r filename ref; do
     [[ -z "$filename" || -z "$ref" ]] && continue
-    value="$(gcloud secrets versions access --secret="$ref" 2>/dev/null || true)"
+    value="$(resolve_secret_ref "$ref")"
     if [[ -z "$value" ]]; then
       echo "lore-bootstrap: WARNING: could not resolve cert secret ref for ${filename} (${ref}), skipping" >&2
       continue
