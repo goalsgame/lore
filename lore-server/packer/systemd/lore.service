@@ -28,7 +28,15 @@ RestartSec=2s
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
-ProtectHome=yes
+# Not `yes`: that makes even a *nonexistent* path under $HOME return EACCES
+# rather than ENOENT, which crash-loops the GCP client's ADC file-probing
+# step (Application Default Credentials checks $HOME/.config/gcloud/... before
+# falling back to the metadata server, and treats a permission error there as
+# fatal rather than "try the next credential source"). `lore` has no home
+# directory at all (useradd --no-create-home), so read-only still means
+# nothing under /home is ever actually readable -- it just fails the way ADC
+# expects.
+ProtectHome=read-only
 ReadOnlyPaths=/etc/lore
 ReadWritePaths=/var/lib/lore/cache
 
