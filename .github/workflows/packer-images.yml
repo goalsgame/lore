@@ -84,6 +84,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: packer-lore-server-build
+          # CARGO_TARGET_DIR above moves the build output off the runner's
+          # small root disk; the action's own defaults don't know to cache
+          # it, so every run was recompiling from scratch (confirmed: the
+          # saved cache was ~100MB, just the registry index, never target/).
+          cache-directories: /mnt/cargo-target
 
       - name: Build loreserver (release, x86_64-unknown-linux-gnu)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p lore-server --bin loreserver
