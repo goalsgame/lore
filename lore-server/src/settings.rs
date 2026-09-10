@@ -97,6 +97,45 @@ const DEFAULT_CONFIG_TOML: &str = include_str!("../config/default.toml");
 /// directory just leaves the server running on its built-in defaults.
 const DEFAULT_CONFIG_DIR: &str = "lore-server/config";
 
+/// Auth-URL schemes that name the legacy `UrcAuthApi` service.
+///
+/// `[environment.endpoint].auth_url` is a client-facing advertisement — it
+/// tells the CLI which login mechanism to use — but its mere presence is also
+/// what selects [`AuthClientAuthorizer`] server-side, because until now the
+/// only thing it could name was that legacy service. It can now also name an
+/// OIDC provider (`oidc://…`, see `lore-transport/src/auth/oidc.rs`), which is
+/// not an authorization service at all: a deployment advertising one still
+/// authorizes from the token's own claims, through `GlobalGrantsAuthorizer` or
+/// `ConfiguredGrantsAuthorizer`. Reading every `auth_url` as legacy would
+/// silently swap a GOALS deployment's configured authorizer for a gRPC client
+/// pointed at a service that does not exist.
+///
+/// [`AuthClientAuthorizer`]: crate::authnz::repository_authorizer::AuthClientAuthorizer
+const LEGACY_AUTH_URL_SCHEMES: [&str; 2] = ["ucs-auth://", "https://"];
+
+/// The advertised `auth_url`, when it names the legacy `UrcAuthApi` service.
+///
+/// This is the value that selects the legacy authorizer; see
+/// [`LEGACY_AUTH_URL_SCHEMES`] for why an `auth_url` on another scheme is
+/// advertised to clients without selecting it. A scheme-less value counts as
+/// legacy: that is how the setting was written before any other scheme
+/// existed.
+pub fn legacy_auth_url(settings: &Settings) -> Option<String> {
+    let auth_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.auth_url.clone())
+        .filter(|auth_url| !auth_url.is_empty())?;
+
+    let names_a_scheme = auth_url.contains("://");
+    let is_legacy = !names_a_scheme
+        || LEGACY_AUTH_URL_SCHEMES
+            .iter()
+            .any(|scheme| auth_url.starts_with(scheme));
+    is_legacy.then_some(auth_url)
+}
+
 impl Settings {
     /// Load settings, layering optional on-disk overrides over the built-in
     /// defaults baked into the binary.
@@ -209,11 +248,7 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
         ));
     }
 
-    let legacy_auth_url = settings
-        .environment
-        .as_ref()
-        .and_then(|environment| environment.endpoint.as_ref())
-        .and_then(|endpoint| endpoint.auth_url.clone());
+    let legacy_auth_url = legacy_auth_url(settings);
     if legacy_auth_url.is_none() && auth.resource_claim.is_some() {
         return Err(config::ConfigError::Message(
             "server.auth.resource_claim is set, which selects the Tier 2 \
@@ -844,6 +879,93 @@ mod tests {
         "#
         );
         toml::from_str(Box::leak(config.into_boxed_str()))
+    }
+
+    /// Builds settings whose `[environment.endpoint]` advertises `auth_url`
+    /// alongside a `[server.auth]` that would otherwise select
+    /// `ConfiguredGrantsAuthorizer`.
+    fn settings_advertising(auth_url: &str) -> Settings {
+        let config = format!(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+
+            [environment.endpoint]
+            auth_url = "{auth_url}"
+
+            [server.auth]
+            jwt_issuer = "https://idp.example.com/-/"
+            jwt_audience = ["lore-server"]
+        "#
+        );
+        toml::from_str(Box::leak(config.into_boxed_str())).expect("the config parses")
+    }
+
+    #[test]
+    fn a_legacy_auth_url_is_still_read_as_legacy() {
+        assert_eq!(
+            legacy_auth_url(&settings_advertising("ucs-auth://auth.example.com")).as_deref(),
+            Some("ucs-auth://auth.example.com")
+        );
+        assert_eq!(
+            legacy_auth_url(&settings_advertising("https://auth.example.com")).as_deref(),
+            Some("https://auth.example.com"),
+            "the transition fallback scheme is legacy too"
+        );
+        assert_eq!(
+            legacy_auth_url(&settings_advertising("auth.example.com")).as_deref(),
+            Some("auth.example.com"),
+            "a scheme-less value is how the setting was written before any other scheme existed"
+        );
+    }
+
+    /// An `oidc://` auth_url tells clients how to log in. It must not swap the
+    /// deployment's configured authorizer for the legacy gRPC one, which would
+    /// point at a `UrcAuthApi` service that does not exist.
+    #[test]
+    fn an_oidc_auth_url_is_advertised_without_selecting_the_legacy_authorizer() {
+        let settings = settings_advertising("oidc://idp.example.com/-/abc?client_id=lore");
+
+        assert_eq!(
+            legacy_auth_url(&settings),
+            None,
+            "an OIDC auth_url is not a legacy one"
+        );
+        assert_eq!(
+            settings
+                .environment
+                .as_ref()
+                .and_then(|environment| environment.endpoint.as_ref())
+                .and_then(|endpoint| endpoint.auth_url.as_deref()),
+            Some("oidc://idp.example.com/-/abc?client_id=lore"),
+            "it is still advertised to clients"
+        );
+    }
+
+    #[test]
+    fn an_empty_or_absent_auth_url_is_not_a_legacy_one() {
+        assert_eq!(legacy_auth_url(&settings_advertising("")), None);
+
+        let without: Settings = toml::from_str(
+            r#"
+            [server]
+            runtime_shutdown_timeout_seconds = 0
+
+            [immutable_store]
+            mode = "local"
+
+            [mutable_store]
+            mode = "local"
+        "#,
+        )
+        .expect("the config parses");
+        assert_eq!(legacy_auth_url(&without), None);
     }
 
     #[test]

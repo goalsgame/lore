@@ -369,6 +369,40 @@ jwt_issuer = "https://accounts.example.com"
 jwt_audience = ["lore-service"]
 ```
 
+### Interactive client login
+
+`[server.auth]` decides which tokens the server accepts. It says nothing about how a person obtains one. That comes from `[environment.endpoint].auth_url`, which the server advertises to clients through the environment service and which `lore login` reads to pick a login mechanism. The two are configured independently — nothing derives one from the other.
+
+The client selects an implementation by the URL's scheme:
+
+| Scheme | Login mechanism |
+| --- | --- |
+| `oidc://` | OpenID Connect Authorization Code with PKCE, over a loopback redirect (RFC 8252). The browser flow `lore login` uses against a standard identity provider. |
+| `ucs-auth://`, `https://`, or no scheme | The legacy `UrcAuthApi` service. Advertising one of these also selects the server-side `AuthClientAuthorizer`, which calls that service for every authorization decision. |
+
+An `oidc://` auth URL carries everything the client needs, so no client-side configuration or rebuild is required to point a fleet at a different provider:
+
+```text
+oidc://<discovery-host>[:port]/<discovery-path>?client_id=…&scope=…&redirect_port=…&redirect_path=…
+```
+
+| Component | Default | Description |
+| --- | --- | --- |
+| host and path | required | The discovery base. The client fetches `https://<host>[:port]/<path>/.well-known/openid-configuration` and reads `authorization_endpoint` and `token_endpoint` from it, refusing any endpoint on another host or on plain HTTP. Providers that serve a per-client discovery document put that client's path here; providers whose issuer is its own discovery base put the issuer's path. |
+| `client_id` | required | The public client ID registered with the provider. No client secret is sent: the binary ships to every developer, so a secret in it would not be one, and PKCE authenticates the exchange instead. |
+| `scope` | `openid profile email offline_access` | Space-separated scopes. `offline_access` earns a refresh token; a deployment whose authorizer reads a group claim also needs whichever scope releases it. |
+| `redirect_port` | `8765` | Loopback port the redirect lands on. Must match the redirect URI registered with the provider, which is why it is fixed rather than ephemeral. |
+| `redirect_path` | `/callback` | Path component of that redirect URI. |
+
+The resulting redirect URI is `http://127.0.0.1:<redirect_port><redirect_path>`, and it must be registered with the provider verbatim. `lore login` fails before opening a browser if that port is already bound.
+
+**The access token must name a domain it may be sent to.** Before storing a token or sending it anywhere, the client checks the token's own claims for the domains it may reach, and refuses to send it to any other host. A conforming provider's access token usually carries neither — its `iss` is the provider's URL and its `aud` is an opaque resource name such as `lore-server` — so the provider has to be configured to say so, in one of two ways:
+
+- Mint a `root_domains` claim (or `https://lore.org/claims/root_domains`) listing the deployment's domains, for example `[".lore.example.com"]`. A leading dot matches the apex and every subdomain.
+- Or set the access token's audience to the deployment's canonical URL, for example `https://lore.example.com`, whose host is then read as the domain. Remember to add that value to `jwt_audience`.
+
+Without either, login fails with an error naming both fixes rather than storing a token that could never be used.
+
 ## Store settings
 
 Lore Server keeps three stores: an immutable store for content-addressed fragments, a mutable store for branch pointers, and a lock store for distributed locking. Each is configured by a top-level table — `[immutable_store]`, `[mutable_store]`, `[lock_store]` — whose `mode` field selects the backend.

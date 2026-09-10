@@ -1,0 +1,97 @@
+# Lore Server Configuration Example: OIDC login and authorization
+# =====================================================================
+# Two independent halves, both needed for a deployment where people log in
+# with an identity provider:
+#
+#   [server.auth]              which tokens this server accepts
+#   [environment.endpoint]     how a client obtains one in the first place
+#
+# Nothing derives one from the other. A server with only the first verifies
+# tokens but leaves `lore login` with nowhere to go; a server with only the
+# second hands out logins for tokens it will not check.
+#
+# See docs/reference/lore-server-config.md ("Authentication") for the full
+# field reference.
+
+# ---------------------------------------------------------------------
+# What this server accepts
+# ---------------------------------------------------------------------
+# Presence of [server.auth] enables JWT verification. Signing keys are
+# resolved through OIDC discovery against jwt_issuer unless
+# [server.auth.jwk].endpoint overrides it.
+[server.auth]
+# The `iss` value the provider actually mints, which is not necessarily the
+# URL its discovery document is served from.
+jwt_issuer = "https://foxids.playgoals.com/-/"
+# The resource this server is, as the provider names it in `aud`.
+jwt_audience = ["lore-server"]
+# The claim carrying the caller's groups. ConfiguredGrantsAuthorizer maps
+# those to per-repository permissions through acl_config_path below.
+permission_claim = "groups"
+# GOALS fork: config-driven `group -> repository pattern -> permission`
+# grants. See docs/proposals/2026-09-09-goals-repository-acl-config.md.
+acl_config_path = "/etc/lore/config/acl.toml"
+
+# ---------------------------------------------------------------------
+# How a client logs in
+# ---------------------------------------------------------------------
+# Advertised to clients through the environment service. `lore login` reads
+# the scheme to pick a login mechanism: `oidc://` is OpenID Connect
+# Authorization Code with PKCE over a loopback redirect (RFC 8252).
+#
+# Host and path are the discovery *base*: the client fetches
+#   https://foxids.playgoals.com/-/zsk4ra29(*)/.well-known/openid-configuration
+# and takes the authorization and token endpoints from it, refusing any
+# endpoint served from another host or over plain HTTP. Some providers serve
+# a distinct discovery document per client, at a path the `issuer` value
+# above does not name -- that path goes here, verbatim, punctuation and all.
+#
+# Query parameters carry the rest of the client configuration, so pointing a
+# fleet at a different provider is a server config change rather than a
+# client release:
+#
+#   client_id      required; a public client, no secret is ever sent
+#   scope          default "openid profile email offline_access"
+#   redirect_port  default 8765
+#   redirect_path  default "/callback"
+#
+# The redirect URI the client builds from those -- here
+# `http://127.0.0.1:8765/callback` -- must be registered with the provider
+# exactly. It is a fixed port rather than an ephemeral one for that reason.
+#
+# `offline_access` earns a refresh token. `groups` is what releases the claim
+# `permission_claim` above reads, and `lore-server:access` is the scope for
+# this server as a resource.
+[environment.endpoint]
+auth_url = "oidc://foxids.playgoals.com/-/zsk4ra29(*)?client_id=zsk4ra29&scope=openid+profile+email+groups+offline_access+lore-server%3Aaccess"
+
+# ---------------------------------------------------------------------
+# Required provider-side configuration
+# ---------------------------------------------------------------------
+# The client refuses to send a token to a host the token itself does not
+# name, so that a client holding tokens for several deployments cannot hand
+# the wrong one to the wrong host. That list has to come from the issuer:
+# reading it from this file would be worthless, since a rogue server serving
+# a forged environment response is exactly what the check defends against.
+#
+# A conforming access token carries no such list by default -- `iss` is the
+# provider's URL and `aud` is an opaque resource name -- so configure the
+# provider to supply one, either way:
+#
+#   1. Mint a `root_domains` claim (or the namespaced spelling
+#      `https://lore.org/claims/root_domains`) on the access token, listing
+#      the deployment's domains:
+#
+#          root_domains = [".playgoals.com"]
+#
+#      A leading dot matches the apex and every subdomain.
+#
+#   2. Or set the access token's audience to the deployment's canonical URL,
+#      whose host is then read as the domain:
+#
+#          aud = ["lore-server", "https://lore.playgoals.com"]
+#
+#      Add that second value to `jwt_audience` above as well.
+#
+# With neither, `lore login` fails with an error naming both fixes rather
+# than storing a token that could never be used.
