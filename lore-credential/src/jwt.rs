@@ -52,10 +52,13 @@ pub struct JWTUserInfo {
     #[serde(rename = "aud")]
     pub audience: Vec<String>,
     /// The issuer's own statement of where this token may be sent, read from
-    /// [`ROOT_DOMAINS_CLAIM`].
+    /// [`ROOT_DOMAINS_CLAIM`]. `OneOrMany`, same as `audience` above: some
+    /// providers' claim editors only accept a bare string, not an array.
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default, rename = "root_domains")]
     pub root_domains: Vec<String>,
     /// The same statement under [`NAMESPACED_ROOT_DOMAINS_CLAIM`].
+    #[serde_as(as = "OneOrMany<_, PreferMany>")]
     #[serde(default, rename = "https://lore.org/claims/root_domains")]
     pub namespaced_root_domains: Vec<String>,
 }
@@ -324,6 +327,23 @@ mod tests {
             vec!["idp.example.com", "lore.example.com"]
         );
         verify_jwt_usage_for_remote(&token, "lore.example.com").expect("the deployment matches");
+    }
+
+    /// At least one real provider's claim editor has no array-valued field,
+    /// only a single string -- a claim minted that way must parse exactly
+    /// like a one-element array would.
+    #[test]
+    fn a_bare_string_root_domains_claim_parses_the_same_as_a_one_element_array() {
+        let token = claims(
+            r#"{"iss":"https://idp.example.com/-/","sub":"alice","exp":2000000000,
+                "aud":"lore-server","root_domains":".playgoals.com"}"#,
+        );
+        assert_eq!(
+            token.acceptable_root_domains(),
+            vec![".playgoals.com", "idp.example.com"]
+        );
+        verify_jwt_usage_for_remote(&token, "lore.playgoals.com")
+            .expect("the granted suffix matches");
     }
 
     /// The dedicated claim is the provider-configured answer, and it composes
