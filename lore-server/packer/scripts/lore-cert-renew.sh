@@ -124,7 +124,39 @@ read -r pkey_project pkey_secret <<<"$(secret_project_and_id "$pkey_ref")"
 gcloud secrets versions add "$cert_secret" --project="$cert_project" --data-file="$cert_file"
 gcloud secrets versions add "$pkey_secret" --project="$pkey_project" --data-file="$pkey_file"
 
+# Also land the fresh material at the same local paths lore-bootstrap.sh
+# writes them to (same ownership/permissions), unconditionally -- not just
+# on first boot. lore-bootstrap.service only ever runs once per boot, so a
+# later, timer-triggered renewal has nothing else that would refresh these
+# files: without this, uploading a new Secret Manager version would do
+# nothing locally, and a restart below would just reload the same stale
+# on-disk cert. install -d is idempotent, safe whether or not
+# lore-bootstrap.sh has run yet.
+tls_dir=/etc/lore/config/tls
+install -d -m 0750 -o lore -g lore /etc/lore/config
+install -d -m 0750 -o lore -g lore "$tls_dir"
+install -m 0640 -o lore -g lore "$cert_file" "$tls_dir/cert.pem"
+install -m 0640 -o lore -g lore "$pkey_file" "$tls_dir/pkey.pem"
+
 rm -rf "$LEGO_PATH"
 
-echo "lore-cert-renew: new certificate uploaded, restarting lore.service"
-systemctl restart lore.service
+# Only restart if lore.service has actually run before. lore.service
+# Requires=lore-bootstrap.service (hard dependency), and lore-bootstrap.service
+# is ordered After=lore-acme.service (this unit) -- so on first boot, while
+# this script is still running as lore-acme.service's own foreground
+# process, calling `systemctl restart lore.service` here would transitively
+# try to start lore-bootstrap.service too, which can't start until
+# lore-acme.service reaches a terminal state, which can't happen until the
+# restart call returns: a genuine deadlock, confirmed live (systemctl
+# restart hung until lore-acme.service's own TimeoutStartSec eventually
+# killed it). On first boot, lore.service hasn't started even once yet, so
+# no restart is needed at all -- lore-bootstrap.service runs next in the
+# normal boot sequence and lore.service starts fresh, already reading the
+# files just written above. This only actually restarts on a later,
+# timer-triggered renewal, where lore.service is genuinely already active.
+if systemctl is-active --quiet lore.service; then
+  echo "lore-cert-renew: new certificate uploaded, restarting lore.service"
+  systemctl restart lore.service
+else
+  echo "lore-cert-renew: new certificate uploaded; lore.service not active yet (first boot), skipping restart"
+fi
