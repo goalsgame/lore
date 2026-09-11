@@ -1073,23 +1073,44 @@ impl GcpImmutableStore {
         hash: Hash,
     ) -> Result<GetGcsObjectContentsOutput, StoreError> {
         let object_name = hex_hash(hash);
-        let mut response = bounded(
-            self.gcs_timeout,
-            self.gcs_slow_threshold,
-            "read_object.send",
-            self.storage
-                .read_object(&self.bucket_resource, &object_name)
-                .send(),
-        )
-        .await?
-        .map_err(|error| {
+
+        // GCS's JSON API media (`alt=media`) download never returns `x-goog-meta-*`
+        // custom-metadata headers -- confirmed live against a real object: the XML API and the
+        // JSON metadata-only endpoint both return its `lore-fragment` custom metadata, but the
+        // JSON media endpoint `read_object` hits below does not, so
+        // `ReadObjectResponse::object().metadata` is always empty and every load() treated every
+        // object as if it carried no fragment metadata. Fetch the fragment from the same
+        // metadata-only `get_object` call `head_fragment` uses instead, run concurrently with the
+        // body download so this doesn't add a second round trip's worth of latency.
+        let object_map_err = |error| {
             if is_not_found(&error) {
                 debug!(%hash, "get_gcs_object_contents: object not found");
                 StoreError::from(AddressNotFound::from(Address::zero_context_hash(hash)))
             } else {
                 to_store_error_gcs(error, "GCS get object failed")
             }
-        })?;
+        };
+        let metadata_call = bounded(
+            self.gcs_timeout,
+            self.gcs_slow_threshold,
+            "get_object",
+            self.control
+                .get_object()
+                .set_bucket(&self.bucket_resource)
+                .set_object(&object_name)
+                .send(),
+        );
+        let read_call = bounded(
+            self.gcs_timeout,
+            self.gcs_slow_threshold,
+            "read_object.send",
+            self.storage
+                .read_object(&self.bucket_resource, &object_name)
+                .send(),
+        );
+        let (metadata_object, read_response) = tokio::join!(metadata_call, read_call);
+        let metadata_object = metadata_object?.map_err(object_map_err)?;
+        let mut response = read_response?.map_err(object_map_err)?;
 
         let object = response.object();
 
@@ -1117,7 +1138,7 @@ impl GcpImmutableStore {
             }));
         }
 
-        let fragment = from_object_metadata(&object.metadata);
+        let fragment = from_object_metadata(&metadata_object.metadata);
         if let Ok(fragment) = &fragment {
             lore_storage::validate_fragment_size(fragment)?;
         }
