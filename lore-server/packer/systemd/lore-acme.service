@@ -3,6 +3,8 @@ Description=Obtain/renew lore-server's Let's Encrypt certificate (ACME HTTP-01)
 After=network-online.target
 Wants=network-online.target
 Before=lore-bootstrap.service
+StartLimitIntervalSec=1800
+StartLimitBurst=5
 
 [Service]
 Type=oneshot
@@ -10,8 +12,6 @@ RemainAfterExit=yes
 ExecStart=/usr/local/sbin/lore-cert-renew.sh
 Restart=on-failure
 RestartSec=30s
-StartLimitIntervalSec=1800
-StartLimitBurst=5
 TimeoutStartSec=600
 
 [Install]
