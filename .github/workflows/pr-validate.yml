@@ -67,6 +67,15 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: unit-${{ matrix.name }}
+          # CARGO_TARGET_DIR above moves the real build output to /mnt,
+          # outside the checkout -- the action's own default target tracking
+          # only ever sees "<checkout>/target", which stays empty, so every
+          # run recompiled from scratch. `cache-directories` takes the path
+          # verbatim (unlike `workspaces`' target half, which the action's
+          # source always resolves relative to the workspace root even for
+          # an apparently-absolute path -- confirmed live in
+          # packer-images.yml, see that file's own fix for the same bug).
+          cache-directories: /mnt/cargo-target
 
       - name: cargo test
         run: cargo test --workspace --verbose
@@ -98,6 +107,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: integration
+          # See the unit job's own rust-cache step for why this is needed.
+          cache-directories: /mnt/cargo-target
 
       - name: Start backing services (MinIO, DynamoDB Local, Consul)
         run: >
@@ -183,6 +194,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: gcp-integration
+          # See the unit job's own rust-cache step for why this is needed.
+          cache-directories: /mnt/cargo-target
 
       # Both gcloud-sdk and google-cloud-auth query their configured metadata host on port 80
       # unconditionally, and default that host to metadata.google.internal. Routing that name to
@@ -297,6 +310,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: smoke-${{ matrix.name }}
+          # See the unit job's own rust-cache step for why this is needed.
+          cache-directories: /mnt/cargo-target
 
       - uses: astral-sh/setup-uv@v5
 

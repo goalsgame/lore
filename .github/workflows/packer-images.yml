@@ -85,15 +85,25 @@ jobs:
         with:
           key: packer-lore-server-build
           # CARGO_TARGET_DIR above moves the build output off the runner's
-          # small root disk. `cache-directories` doesn't redirect the
-          # action's own workspace/target tracking -- it only adds unrelated
-          # extra paths -- so this still recompiled from scratch every run
-          # (confirmed: the saved cache was still the same stale ~104MB
-          # registry-index-only entry from before that fix, untouched by
-          # either build since). `workspaces` is the actual
-          # "$workspace -> $target" mapping the action's README documents
-          # for a relocated target dir.
-          workspaces: ". -> /mnt/cargo-target"
+          # small root disk, to an absolute path outside the checkout.
+          # `workspaces`' own README says its `$target` half is "a directory
+          # relative to $workspace" -- and the action's source confirms this
+          # literally, unconditionally: `target = path.join(root, target)`
+          # (src/config.ts), which does NOT treat a leading "/" as absolute
+          # the way path.resolve would. The earlier `workspaces: ". ->
+          # /mnt/cargo-target"` therefore actually cached
+          # "<checkout>/mnt/cargo-target" -- a path nothing ever wrote to --
+          # confirmed live via the action's own "Cache Paths" log output.
+          # Real build output at the literal /mnt/cargo-target was never
+          # cached or restored by that setting at all, on any run.
+          # `cache-directories` pushes its entries verbatim with no path
+          # resolution (src/config.ts's cacheDirectories loop), so it's the
+          # correct way to point at an absolute, outside-the-workspace
+          # target dir. Left `workspaces` at its default (". -> target"):
+          # that still tracks the real, but always-empty, "<checkout>/target"
+          # -- harmless, and safer than a custom workspaces mapping given the
+          # resolution behavior above.
+          cache-directories: /mnt/cargo-target
 
       - name: Build loreserver (release, x86_64-unknown-linux-gnu)
         run: cargo build --release --target x86_64-unknown-linux-gnu -p lore-server --bin loreserver
