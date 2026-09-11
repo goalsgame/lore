@@ -91,12 +91,16 @@ impl LoreRepositoryV1Service {
     /// Auth-service URL extracted from the environment, if configured. Used
     /// only by the legacy paths (`repository_create`, `repository_delete`'s
     /// rebac-resource cleanup, `repository_list`) that predate
-    /// `RepositoryAuthorizer` and still speak to the auth service directly.
+    /// `RepositoryAuthorizer` and still speak to the auth service directly --
+    /// so an OIDC `auth_url` (not a legacy one) must not come back `Some`
+    /// here, or those paths try to dial it as a ReBAC gRPC endpoint.
     fn auth_url(&self) -> Option<String> {
         self.environment
             .endpoint
             .clone()
             .and_then(|endpoint| endpoint.auth_url)
+            .filter(|auth_url| !auth_url.is_empty())
+            .filter(|auth_url| crate::settings::is_legacy_auth_url(auth_url))
     }
 }
 

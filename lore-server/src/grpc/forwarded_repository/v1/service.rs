@@ -78,11 +78,15 @@ impl LoreForwardedRepositoryV1Service {
         }
     }
 
+    /// See `RepositoryService::auth_url`'s doc comment (grpc/repository_service.rs) --
+    /// an OIDC `auth_url` must not come back `Some` here either.
     fn auth_url(&self) -> Option<String> {
         self.environment
             .endpoint
             .as_ref()
             .and_then(|endpoint| endpoint.auth_url.clone())
+            .filter(|auth_url| !auth_url.is_empty())
+            .filter(|auth_url| crate::settings::is_legacy_auth_url(auth_url))
     }
 }
 

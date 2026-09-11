@@ -113,13 +113,31 @@ const DEFAULT_CONFIG_DIR: &str = "lore-server/config";
 /// [`AuthClientAuthorizer`]: crate::authnz::repository_authorizer::AuthClientAuthorizer
 const LEGACY_AUTH_URL_SCHEMES: [&str; 2] = ["ucs-auth://", "https://"];
 
+/// Whether an `auth_url` value names the legacy `UrcAuthApi` service, per
+/// [`LEGACY_AUTH_URL_SCHEMES`]. A scheme-less value counts as legacy: that is
+/// how the setting was written before any other scheme existed.
+///
+/// Shared by every call site that branches on this, not just
+/// [`legacy_auth_url`] -- `RepositoryService`/`ForwardedRepositoryService`'s
+/// `auth_url()` (used to gate the legacy ReBAC-resource-registration call in
+/// `repository_create`/`repository_delete`/`repository_list`) only have the
+/// raw `EnvironmentConfig`, not a full `Settings`, so they can't call
+/// `legacy_auth_url` itself -- but they still need the identical
+/// legacy-vs-OIDC classification, or an OIDC deployment's `auth_url` gets
+/// misread as a legacy service endpoint the same way it would here.
+pub fn is_legacy_auth_url(auth_url: &str) -> bool {
+    let names_a_scheme = auth_url.contains("://");
+    !names_a_scheme
+        || LEGACY_AUTH_URL_SCHEMES
+            .iter()
+            .any(|scheme| auth_url.starts_with(scheme))
+}
+
 /// The advertised `auth_url`, when it names the legacy `UrcAuthApi` service.
 ///
 /// This is the value that selects the legacy authorizer; see
 /// [`LEGACY_AUTH_URL_SCHEMES`] for why an `auth_url` on another scheme is
-/// advertised to clients without selecting it. A scheme-less value counts as
-/// legacy: that is how the setting was written before any other scheme
-/// existed.
+/// advertised to clients without selecting it.
 pub fn legacy_auth_url(settings: &Settings) -> Option<String> {
     let auth_url = settings
         .environment
@@ -128,12 +146,7 @@ pub fn legacy_auth_url(settings: &Settings) -> Option<String> {
         .and_then(|endpoint| endpoint.auth_url.clone())
         .filter(|auth_url| !auth_url.is_empty())?;
 
-    let names_a_scheme = auth_url.contains("://");
-    let is_legacy = !names_a_scheme
-        || LEGACY_AUTH_URL_SCHEMES
-            .iter()
-            .any(|scheme| auth_url.starts_with(scheme));
-    is_legacy.then_some(auth_url)
+    is_legacy_auth_url(&auth_url).then_some(auth_url)
 }
 
 impl Settings {
