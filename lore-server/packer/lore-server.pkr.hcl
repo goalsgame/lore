@@ -22,12 +22,15 @@
 // typical stateful daemon image, there's no data disk to provision here.
 // The boot disk only needs to hold the OS, the binary, and config.
 //
-// TLS: lore-server terminates its own TLS (required for QUIC) and there's
-// no established org pattern for that on a bare VM yet. lore-bootstrap.sh
-// (see scripts/) is where a fetched cert/key would land once that's
-// decided — /etc/lore/certs exists and is owned by the `lore` user, but
-// nothing populates it today. Config layering and the systemd unit are
-// otherwise fully wired.
+// TLS: lore-server terminates its own TLS (required for QUIC), so no GCP-
+// managed certificate can be used (Google never exposes the private key for
+// one) -- lore-cert-renew.sh (see scripts/, run by lore-acme.service before
+// lore-bootstrap.service) obtains a real Let's Encrypt certificate via ACME
+// HTTP-01 (using the `lego` binary this file installs) and writes it to
+// Secret Manager, which lore-bootstrap.sh then reads like any other
+// cert-secret-ref. Self-signed and bring-your-own certs remain available as
+// alternatives at the Terraform module level (generate_self_signed_tls /
+// tls_cert_secret_ref / enable_acme_tls).
 
 packer {
   required_plugins {
@@ -219,6 +222,26 @@ build {
   provisioner "file" {
     source      = "scripts/lore-cache-storage-init.sh"
     destination = "/tmp/lore-cache-storage-init.sh"
+  }
+
+  provisioner "file" {
+    source      = "systemd/lore-acme.service"
+    destination = "/tmp/lore-acme.service"
+  }
+
+  provisioner "file" {
+    source      = "systemd/lore-acme.timer"
+    destination = "/tmp/lore-acme.timer"
+  }
+
+  provisioner "file" {
+    source      = "scripts/lore-cert-renew.sh"
+    destination = "/tmp/lore-cert-renew.sh"
+  }
+
+  # Installs the `lego` ACME client binary lore-cert-renew.sh uses.
+  provisioner "shell" {
+    script = "scripts/install-lego.sh"
   }
 
   # Install everything. Deliberately does NOT `systemctl start lore` —

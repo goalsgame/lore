@@ -25,15 +25,21 @@ sudo install -d -m 0700 -o lore -g lore /etc/lore/certs
 sudo install -m 0755 -o root -g root /tmp/lore-server-release/loreserver /usr/local/bin/loreserver
 sudo install -m 0755 -o root -g root /tmp/lore-bootstrap.sh /usr/local/sbin/lore-bootstrap.sh
 sudo install -m 0755 -o root -g root /tmp/lore-cache-storage-init.sh /usr/local/sbin/lore-cache-storage-init.sh
+sudo install -m 0755 -o root -g root /tmp/lore-cert-renew.sh /usr/local/sbin/lore-cert-renew.sh
 
 sudo install -m 0644 -o root -g root /tmp/lore.service /etc/systemd/system/lore.service
 sudo install -m 0644 -o root -g root /tmp/lore-bootstrap.service /etc/systemd/system/lore-bootstrap.service
 sudo install -m 0644 -o root -g root /tmp/lore-cache-storage.service /etc/systemd/system/lore-cache-storage.service
+sudo install -m 0644 -o root -g root /tmp/lore-acme.service /etc/systemd/system/lore-acme.service
+sudo install -m 0644 -o root -g root /tmp/lore-acme.timer /etc/systemd/system/lore-acme.timer
 
 sudo systemctl daemon-reload
 sudo systemctl enable lore-cache-storage.service
+sudo systemctl enable lore-acme.service
+sudo systemctl enable lore-acme.timer
 sudo systemctl enable lore-bootstrap.service
 sudo systemctl enable lore.service
 
 rm -rf /tmp/lore-server-release /tmp/lore.service /tmp/lore-bootstrap.service /tmp/lore-bootstrap.sh \
-  /tmp/lore-cache-storage.service /tmp/lore-cache-storage-init.sh
+  /tmp/lore-cache-storage.service /tmp/lore-cache-storage-init.sh /tmp/lore-acme.service /tmp/lore-acme.timer \
+  /tmp/lore-cert-renew.sh
