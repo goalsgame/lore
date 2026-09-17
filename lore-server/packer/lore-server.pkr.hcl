@@ -252,12 +252,11 @@ build {
     script = "scripts/install-lore.sh"
   }
 
-  # Ops Agent binary already ships in proxy-base; this just points it at
-  # lore-server's journal (matching nomad-server's journal-only setup — see
-  # scripts/install-lore-ops-agent.sh for why metrics scraping isn't wired
-  # up here). Journal access for non-root SSH users (pam_group ->
-  # systemd-journal) is also already configured by proxy-base — nothing
-  # lore-specific needed there.
+  # Ops Agent binary already ships in proxy-base; this points it at
+  # lore-server's journal and its OTLP metrics/traces (see
+  # scripts/install-lore-ops-agent.sh). Journal access for non-root SSH users
+  # (pam_group -> systemd-journal) is also already configured by proxy-base —
+  # nothing lore-specific needed there.
   provisioner "shell" {
     script = "scripts/install-lore-ops-agent.sh"
   }

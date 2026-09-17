@@ -4,16 +4,20 @@
 # this only writes the per-daemon config.yaml, mirroring nomad-server's
 # install-nomad-ops-agent.sh.
 #
-# Journal-only for now, same call nomad-server made: lore-server's telemetry
-# is OTLP-push based (see lore-server/src/telemetry/), not a Prometheus
-# `/metrics` endpoint, so there's nothing local for Ops Agent to scrape.
-# Metrics/traces should point at the org's OTel collector directly via
-# [telemetry] config, independent of this file. Revisit if lore-server ever
-# grows a Prometheus exporter.
+# Journal logging, plus an OTLP receiver (localhost:4317) for lore-server's
+# own metrics/traces (see lore-server/src/telemetry/) -- the OTLP receiver
+# doesn't carry logs, so those stay on the journald pipeline. lore-server
+# only exports over OTLP when its own [telemetry.exporter] config points at
+# this receiver; see the terraform-gcp-modules lore module's enable_telemetry
+# variable.
 set -euo pipefail
 
-echo "=== Configuring Ops Agent for lore-server (journal only) ==="
+echo "=== Configuring Ops Agent for lore-server ==="
 sudo tee /etc/google-cloud-ops-agent/config.yaml > /dev/null <<'EOF'
+combined:
+  receivers:
+    otlp:
+      type: otlp
 logging:
   receivers:
     lore_journal:
@@ -30,6 +34,18 @@ logging:
           - lore_journal
         processors:
           - filter_lore
+metrics:
+  service:
+    pipelines:
+      otlp:
+        receivers:
+          - otlp
+traces:
+  service:
+    pipelines:
+      otlp:
+        receivers:
+          - otlp
 EOF
 
 echo "=== Ops Agent configured for lore-server ==="
