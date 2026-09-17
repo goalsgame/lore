@@ -18,10 +18,7 @@ LimitNOFILE=1048576
 Restart=always
 RestartSec=2s
 
-# Lets the unprivileged `lore` user bind a privileged port (e.g. 443) for
-# [server.quic]/[server.grpc] -- harmless when the configured port isn't
-# privileged. Survives NoNewPrivileges=yes below; ambient capabilities are
-# designed to.
+# Lets lore.service bind a privileged port (e.g. 443).
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
