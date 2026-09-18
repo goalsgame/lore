@@ -974,6 +974,29 @@ impl ReachabilityAuthorizer {
             }
         }
     }
+
+    /// [`Self::check_read`]'s sync bridge, for the cross-partition
+    /// link-read closure -- the same shape as [`Self::check_reachability_sync`],
+    /// but for the baseline `read` action specifically. A caller reaching a
+    /// linked repository must hold `read` there, not merely any grant at
+    /// all: reachability alone (a `push`-only grant, say) is not read
+    /// access, even though [`Self::check_action`] treats them identically
+    /// for a legacy deployment.
+    pub fn check_read_sync(
+        &self,
+        claims: &AuthorizationToken,
+        repository: RepositoryId,
+    ) -> Result<(), Status> {
+        match self.check_read(claims, repository).now_or_never() {
+            Some(result) => result,
+            None => {
+                #[allow(clippy::disallowed_methods)]
+                task::block_in_place(|| {
+                    core_runtime().block_on(self.check_read(claims, repository))
+                })
+            }
+        }
+    }
 }
 
 /// Distinguishes a genuine "denied" answer from a failure of the check

@@ -305,10 +305,14 @@ pub async fn verify_forwarded_caller(
 /// Gates cross-partition link reads during revision-graph traversal, which
 /// may call the returned closure many times per request (LEP
 /// 2026-08-20-oidc-oauth2-authentication, D9), so it must answer without
-/// awaiting anything. `ReachabilityAuthorizer::check_reachability_sync`
-/// does exactly that for every configured authorizer, legacy
+/// awaiting anything. `ReachabilityAuthorizer::check_read_sync` does
+/// exactly that for every configured authorizer, legacy
 /// `AuthClientAuthorizer` included (see its docs for why that one reads the
 /// token's own embedded claim here rather than making an online call).
+///
+/// Checks `read` specifically, not plain reachability: a linked repository
+/// is being read from, so a caller holding only `push` there (reachable,
+/// but not for reading) must not pass this gate.
 ///
 /// `None` mirrors the previous behavior: it means no token was ever
 /// inserted into the request, i.e. no verifier is configured at all, so
@@ -321,7 +325,7 @@ pub fn link_read_authorizer(
     match authorization {
         Some(token) => Arc::new(move |repository_id| {
             reachability_authorizer
-                .check_reachability_sync(&token, repository_id)
+                .check_read_sync(&token, repository_id)
                 .is_ok()
         }),
         None => lore_revision::state::allow_all_repositories(),

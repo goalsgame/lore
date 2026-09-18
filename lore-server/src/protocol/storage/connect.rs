@@ -79,6 +79,16 @@ impl Message for Connect {
             span.record("repository_id", self.repository.to_string());
         }
 
+        // Checked before any token verification or context mutation below:
+        // a rejected Connect must never have side effects on a connection
+        // already bound to a different repository.
+        if let Some(id) = context.get::<RepositoryId>()
+            && *id != self.repository
+        {
+            warn!("Attempted to set repository id for connection, but it was already set!");
+            return Err(MessageHandleError::AlreadyConnected);
+        }
+
         debug!("Handling connect request");
 
         if let Some(jwt_verifier) = jwt_verifier.as_ref() {
@@ -157,17 +167,10 @@ impl Message for Connect {
             context.insert(ConnectionAuthorization::Open);
         }
 
-        if let Some(id) = context.get::<RepositoryId>() {
-            if *id != self.repository {
-                warn!("Attempted to set repository id for connection, but it was already set!");
-                Err(MessageHandleError::AlreadyConnected)
-            } else {
-                Ok(LoreResponse::Connect(ConnectResponse::default()))
-            }
-        } else {
-            context.insert(self.repository);
-            Ok(LoreResponse::Connect(ConnectResponse::default()))
-        }
+        // Either a first connect or a same-repository reconnect (the
+        // mismatched case already returned above) -- safe to (re)set.
+        context.insert(self.repository);
+        Ok(LoreResponse::Connect(ConnectResponse::default()))
     }
 }
 
@@ -455,6 +458,33 @@ mod tests {
                 .expect_err("expected error"),
             MessageHandleError::AlreadyConnected,
         ));
+    }
+
+    /// A rejected reconnect must have no side effects: it must not
+    /// overwrite the `ConnectionAuthorization` an earlier, successful
+    /// `Connect` on this same connection already established.
+    #[tokio::test]
+    async fn a_rejected_reconnect_does_not_mutate_connection_authorization() {
+        let message = Connect {
+            repository: random::<RepositoryId>(),
+            auth_token: None,
+        };
+
+        let context = Arc::new(AttributeMap::default());
+        context.insert(random::<RepositoryId>());
+
+        assert!(matches!(
+            message
+                .handle_auth(context.clone(), Arc::new(None), no_auth_reachability())
+                .await
+                .expect_err("expected error"),
+            MessageHandleError::AlreadyConnected,
+        ));
+
+        assert!(
+            context.get::<ConnectionAuthorization>().is_none(),
+            "a rejected reconnect must not touch the connection's authorization state"
+        );
     }
 
     #[tokio::test]
