@@ -5,7 +5,15 @@ all-features = true
 feature-depth = 1
 
 [advisories]
-ignore = []
+ignore = [
+    # No safe upgrade exists: firestore 0.53.0/0.54.0 (latest) still depends
+    # on backoff 0.4. Tracked upstream: https://github.com/ihrwein/backoff/issues/66
+    "RUSTSEC-2025-0012", # backoff unmaintained
+    "RUSTSEC-2024-0384", # instant unmaintained (backoff's own dependency)
+    # rsa 0.9.10 is the latest stable release; the advisory's own tracking
+    # (RustCrypto/RSA#626, #680, #702) confirms no patched version exists yet.
+    "RUSTSEC-2023-0071", # rsa Marvin timing sidechannel
+]
 
 [licenses]
 version = 2
