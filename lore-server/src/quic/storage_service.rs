@@ -509,14 +509,26 @@ impl QuicService for StorageService {
             ParsedStorageRequest::Connect(_) | ParsedStorageRequest::Correlate(_)
         ) {
             let (holds_read, holds_push) = match context.get::<ConnectionAuthorization>() {
-                Some(auth) => match auth.as_ref() {
-                    ConnectionAuthorization::Open => (true, true),
-                    ConnectionAuthorization::Verified {
-                        holds_read,
-                        holds_push,
-                        ..
-                    } => (*holds_read, *holds_push),
-                },
+                Some(auth) => {
+                    // The connection's cached read/push below is trusted
+                    // for as long as the connection lives, not re-checked
+                    // against the authorizer per request (see
+                    // `ConnectionAuthorization::Verified`'s doc comment) --
+                    // but that must not outlive the JWT that produced it.
+                    if auth.is_expired() {
+                        return Err(MessageHandleError::AuthorizationFailure(
+                            "connection's authorization token has expired".to_string(),
+                        ));
+                    }
+                    match auth.as_ref() {
+                        ConnectionAuthorization::Open => (true, true),
+                        ConnectionAuthorization::Verified {
+                            holds_read,
+                            holds_push,
+                            ..
+                        } => (*holds_read, *holds_push),
+                    }
+                }
                 // Always present on an established connection (`Connect`
                 // inserts it unconditionally) — see `ConnectionAuthorization`'s
                 // doc comment on why absence here is a wiring bug, not a
@@ -662,7 +674,13 @@ mod tests {
         let context = Arc::new(AttributeMap::default());
         context.insert(repository);
         context.insert(ConnectionAuthorization::Verified {
-            token: Box::new(AuthorizationToken::default()),
+            // Not `AuthorizationToken::default()`'s `expires: 0`: these
+            // tests are about the holds_read/holds_push gate, not expiry,
+            // and a zero `exp` would trip the new expiry check first.
+            token: Box::new(AuthorizationToken {
+                expires: u64::MAX,
+                ..Default::default()
+            }),
             reachability_authorizer: ReachabilityAuthorizer::new(None, None)
                 .expect("no config never fails to construct"),
             holds_read,
@@ -690,6 +708,44 @@ mod tests {
             .run_request_handler(context, parsed)
             .await
             .expect_err("a push-only connection must be denied a read command");
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+
+    /// The connection's cached `holds_read`/`holds_push` must not outlive
+    /// the JWT that produced them: even a connection that holds both is
+    /// denied once its token's `exp` has passed.
+    #[tokio::test]
+    async fn denies_command_once_the_connection_token_has_expired() {
+        let (immutable_store, mutable_store, _exec) =
+            test_store_create().await.expect("Failed to create stores");
+        let service = make_service(immutable_store, mutable_store);
+        let repository = random::<RepositoryId>();
+
+        let context = Arc::new(AttributeMap::default());
+        context.insert(repository);
+        context.insert(ConnectionAuthorization::Verified {
+            token: Box::new(AuthorizationToken {
+                expires: 1,
+                ..Default::default()
+            }),
+            reachability_authorizer: ReachabilityAuthorizer::new(None, None)
+                .expect("no config never fails to construct"),
+            holds_read: true,
+            holds_push: true,
+        });
+
+        let header = CommandHeader {
+            cmd: Command::Query as u8,
+            ..CommandHeader::default()
+        };
+        let parsed = service
+            .parse_request_bytes(&header, Bytes::new())
+            .expect("an empty Query payload parses");
+
+        let err = service
+            .run_request_handler(context, parsed)
+            .await
+            .expect_err("an expired connection must be denied even holding read and push");
         assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
     }
 

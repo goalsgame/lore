@@ -64,6 +64,27 @@ pub enum ConnectionAuthorization {
     },
 }
 
+impl ConnectionAuthorization {
+    /// Whether the JWT `Connect` verified has since passed its own `exp`.
+    /// `holds_read`/`holds_push` are resolved once at connect time and
+    /// trusted for every subsequent request on the connection (see their
+    /// doc comment) — this catches the case where the connection outlives
+    /// the token that authorized it, which that caching does not itself
+    /// bound. `Open` (no verifier configured) never expires.
+    pub fn is_expired(&self) -> bool {
+        match self {
+            ConnectionAuthorization::Open => false,
+            ConnectionAuthorization::Verified { token, .. } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                token.expires <= now
+            }
+        }
+    }
+}
+
 #[derive(Debug, Error, PartialEq)]
 pub enum MessageParseError {
     #[error("Failed to parse branch name: {0}")]
@@ -197,4 +218,52 @@ pub enum LoreResponse {
     MutableLoad(responses::MutableLoadResponse),
     MutableStore(responses::MutableStoreResponse),
     MutableCas(responses::MutableCasResponse),
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::*;
+
+    fn verified_with_expiry(expires: u64) -> ConnectionAuthorization {
+        ConnectionAuthorization::Verified {
+            token: Box::new(AuthorizationToken {
+                expires,
+                ..Default::default()
+            }),
+            reachability_authorizer: ReachabilityAuthorizer::new(None, None)
+                .expect("no config never fails to construct"),
+            holds_read: true,
+            holds_push: true,
+        }
+    }
+
+    fn now_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs()
+    }
+
+    #[test]
+    fn open_never_expires() {
+        assert!(!ConnectionAuthorization::Open.is_expired());
+    }
+
+    #[test]
+    fn verified_with_a_future_expiry_is_not_expired() {
+        assert!(!verified_with_expiry(now_secs() + 3600).is_expired());
+    }
+
+    #[test]
+    fn verified_with_a_past_expiry_is_expired() {
+        assert!(verified_with_expiry(now_secs() - 1).is_expired());
+    }
+
+    #[test]
+    fn verified_at_exactly_its_expiry_second_is_expired() {
+        assert!(verified_with_expiry(now_secs()).is_expired());
+    }
 }
