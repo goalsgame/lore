@@ -1305,27 +1305,27 @@ mod tests {
     use super::*;
 
     /// The GOALS deployment's auth URL, in the shape an operator writes it.
-    const GOALS_AUTH_URL: &str = "oidc://foxids.playgoals.com/-/zsk4ra29(*)\
-?client_id=zsk4ra29\
+    const TEST_AUTH_URL: &str = "oidc://idp.example.com/-/tenant-id\
+?client_id=lore-cli\
 &scope=openid+profile+email+groups+offline_access+lore-server%3Aaccess";
 
     fn goals_config() -> OidcConfig {
-        parse_auth_url(GOALS_AUTH_URL).expect("the GOALS auth URL parses")
+        parse_auth_url(TEST_AUTH_URL).expect("the test auth URL parses")
     }
 
     fn goals_discovery() -> Discovery {
-        serde_json::from_str(GOALS_DISCOVERY).expect("the discovery document parses")
+        serde_json::from_str(TEST_DISCOVERY).expect("the discovery document parses")
     }
 
     /// Verbatim from the deployment's provider, trimmed to the keys read here
     /// plus a few that are not.
-    const GOALS_DISCOVERY: &str = r#"{
-        "issuer": "https://foxids.playgoals.com/-/",
-        "authorization_endpoint": "https://foxids.playgoals.com/-/zsk4ra29(*)/oauth/authorize",
-        "token_endpoint": "https://foxids.playgoals.com/-/zsk4ra29(*)/oauth/token",
-        "userinfo_endpoint": "https://foxids.playgoals.com/-/zsk4ra29(*)/oauth/userinfo",
-        "end_session_endpoint": "https://foxids.playgoals.com/-/zsk4ra29(*)/oauth/endsession",
-        "jwks_uri": "https://foxids.playgoals.com/-/zsk4ra29(*)/.well-known/openid-configuration/keys",
+    const TEST_DISCOVERY: &str = r#"{
+        "issuer": "https://idp.example.com/-/",
+        "authorization_endpoint": "https://idp.example.com/-/tenant-id/oauth/authorize",
+        "token_endpoint": "https://idp.example.com/-/tenant-id/oauth/token",
+        "userinfo_endpoint": "https://idp.example.com/-/tenant-id/oauth/userinfo",
+        "end_session_endpoint": "https://idp.example.com/-/tenant-id/oauth/endsession",
+        "jwks_uri": "https://idp.example.com/-/tenant-id/.well-known/openid-configuration/keys",
         "scopes_supported": ["openid", "email", "lore-server:access", "offline_access", "profile"],
         "response_types_supported": ["code"],
         "code_challenge_methods_supported": ["plain", "S256"]
@@ -1338,10 +1338,10 @@ mod tests {
         let config = goals_config();
         assert_eq!(
             config.discovery_url,
-            "https://foxids.playgoals.com/-/zsk4ra29(*)/.well-known/openid-configuration"
+            "https://idp.example.com/-/tenant-id/.well-known/openid-configuration"
         );
-        assert_eq!(config.host, "foxids.playgoals.com");
-        assert_eq!(config.client_id, "zsk4ra29");
+        assert_eq!(config.host, "idp.example.com");
+        assert_eq!(config.client_id, "lore-cli");
     }
 
     /// The provider serves its per-client discovery path with a literal `(*)`
@@ -1351,7 +1351,7 @@ mod tests {
     fn a_parenthesised_path_segment_is_not_escaped() {
         let config = goals_config();
         assert!(
-            config.discovery_url.contains("zsk4ra29(*)"),
+            config.discovery_url.contains("tenant-id"),
             "the literal path segment survives: {}",
             config.discovery_url
         );
@@ -1421,8 +1421,8 @@ mod tests {
     #[test]
     fn the_auth_url_yields_the_providers_domain_to_the_token_store() {
         assert_eq!(
-            lore_credential::get_domain_or_empty(GOALS_AUTH_URL),
-            "foxids.playgoals.com"
+            lore_credential::get_domain_or_empty(TEST_AUTH_URL),
+            "idp.example.com"
         );
     }
 
@@ -1431,10 +1431,10 @@ mod tests {
     #[test]
     fn the_auth_url_routes_to_this_implementation() {
         assert_eq!(
-            crate::auth::authentication::parse_scheme(GOALS_AUTH_URL).expect("it has a scheme"),
+            crate::auth::authentication::parse_scheme(TEST_AUTH_URL).expect("it has a scheme"),
             SCHEME
         );
-        crate::auth::authentication::find(GOALS_AUTH_URL)
+        crate::auth::authentication::find(TEST_AUTH_URL)
             .expect("the scheme is registered as a builtin");
     }
 
@@ -1464,10 +1464,10 @@ mod tests {
     #[test]
     fn the_discovery_document_parses_into_the_endpoints_used() {
         let discovery = goals_discovery();
-        assert_eq!(discovery.issuer, "https://foxids.playgoals.com/-/");
+        assert_eq!(discovery.issuer, "https://idp.example.com/-/");
         assert_eq!(
             discovery.token_endpoint,
-            "https://foxids.playgoals.com/-/zsk4ra29(*)/oauth/token"
+            "https://idp.example.com/-/tenant-id/oauth/token"
         );
         validate_discovery(&discovery, &goals_config()).expect("the real document validates");
     }
@@ -1485,7 +1485,7 @@ mod tests {
     fn a_discovery_document_downgrading_to_http_is_refused() {
         let mut discovery = goals_discovery();
         discovery.authorization_endpoint =
-            "http://foxids.playgoals.com/-/zsk4ra29(*)/oauth/authorize".to_string();
+            "http://idp.example.com/-/tenant-id/oauth/authorize".to_string();
         let error = validate_discovery(&discovery, &goals_config())
             .expect_err("a plaintext endpoint must be refused");
         assert!(error.to_string().contains("non-HTTPS"), "{error}");
@@ -1566,10 +1566,10 @@ mod tests {
         let parsed = Url::parse(&url).expect("it is a URL");
         let query: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
 
-        assert_eq!(parsed.host_str(), Some("foxids.playgoals.com"));
-        assert_eq!(parsed.path(), "/-/zsk4ra29(*)/oauth/authorize");
+        assert_eq!(parsed.host_str(), Some("idp.example.com"));
+        assert_eq!(parsed.path(), "/-/tenant-id/oauth/authorize");
         assert_eq!(query.get("response_type").map(String::as_str), Some("code"));
-        assert_eq!(query.get("client_id").map(String::as_str), Some("zsk4ra29"));
+        assert_eq!(query.get("client_id").map(String::as_str), Some("lore-cli"));
         assert_eq!(
             query.get("redirect_uri").map(String::as_str),
             Some("http://127.0.0.1:8765/callback")
@@ -1593,7 +1593,7 @@ mod tests {
     fn the_authorization_url_keeps_the_endpoints_literal_path() {
         let url = authorization_url(&goals_discovery(), &goals_config(), "s", "c")
             .expect("the authorization URL builds");
-        assert!(url.contains("/-/zsk4ra29(*)/oauth/authorize"), "{url}");
+        assert!(url.contains("/-/tenant-id/oauth/authorize"), "{url}");
     }
 
     // -- callback parsing ---------------------------------------------------
@@ -1682,12 +1682,12 @@ mod tests {
     fn goals_access_token() -> String {
         test_jwt(
             r#"{
-                "iss": "https://foxids.playgoals.com/-/",
+                "iss": "https://idp.example.com/-/",
                 "aud": "lore-server",
                 "sub": "user-0001",
                 "exp": 2000000000,
                 "scope": "lore-server:access",
-                "email": "dev@playgoals.com",
+                "email": "dev@example.com",
                 "given_name": "Dev",
                 "family_name": "Eloper",
                 "groups": ["horde-admins", "horde-users"]
@@ -1699,7 +1699,7 @@ mod tests {
     fn claims_are_read_out_of_an_access_token() {
         let claims = decode_claims(&goals_access_token()).expect("the token decodes");
         assert_eq!(claims.sub.as_deref(), Some("user-0001"));
-        assert_eq!(claims.email.as_deref(), Some("dev@playgoals.com"));
+        assert_eq!(claims.email.as_deref(), Some("dev@example.com"));
         assert_eq!(claims.exp, Some(2_000_000_000));
     }
 
@@ -1804,7 +1804,7 @@ mod tests {
     async fn the_repository_exchange_passes_the_access_token_through() {
         let token = goals_access_token();
         let authz = OidcAuthentication
-            .exchange_for_repository(GOALS_AUTH_URL, &token, RepositoryId::default(), "corr")
+            .exchange_for_repository(TEST_AUTH_URL, &token, RepositoryId::default(), "corr")
             .await
             .expect("a Tier 1 exchange succeeds");
         assert_eq!(authz.token, token, "the same bearer comes back");
@@ -1815,7 +1815,7 @@ mod tests {
     async fn the_custom_resource_exchange_passes_the_access_token_through() {
         let token = goals_access_token();
         let authz = OidcAuthentication
-            .exchange_for_custom_resource(GOALS_AUTH_URL, &token, "anything-at-all", "corr")
+            .exchange_for_custom_resource(TEST_AUTH_URL, &token, "anything-at-all", "corr")
             .await
             .expect("a Tier 1 exchange succeeds");
         assert_eq!(authz.token, token);
@@ -1824,7 +1824,7 @@ mod tests {
     #[tokio::test]
     async fn an_external_token_exchange_reports_not_supported() {
         let error = OidcAuthentication
-            .exchange_external_token(GOALS_AUTH_URL, "some-token", "epic", "corr")
+            .exchange_external_token(TEST_AUTH_URL, "some-token", "epic", "corr")
             .await
             .expect_err("there is no broker to exchange against");
         assert!(error.is_not_supported(), "{error}");
@@ -1835,7 +1835,7 @@ mod tests {
         let token = goals_access_token();
         let resolved = OidcAuthentication
             .get_user_info(
-                GOALS_AUTH_URL,
+                TEST_AUTH_URL,
                 &token,
                 RepositoryId::default(),
                 &["user-0001".to_string(), "someone-else".to_string()],
@@ -1852,10 +1852,10 @@ mod tests {
     async fn a_user_id_resolves_from_the_bearers_own_names() {
         let token = goals_access_token();
         let auth = OidcAuthentication;
-        for name in ["Dev Eloper", "dev@playgoals.com", "user-0001"] {
+        for name in ["Dev Eloper", "dev@example.com", "user-0001"] {
             let resolved = auth
                 .get_user_id(
-                    GOALS_AUTH_URL,
+                    TEST_AUTH_URL,
                     &token,
                     RepositoryId::default(),
                     name,
@@ -1872,7 +1872,7 @@ mod tests {
 
         let stranger = auth
             .get_user_id(
-                GOALS_AUTH_URL,
+                TEST_AUTH_URL,
                 &token,
                 RepositoryId::default(),
                 "Somebody Else",
@@ -1917,7 +1917,7 @@ mod tests {
 
         let error = OidcAuthentication
             .poll_auth_session(
-                GOALS_AUTH_URL,
+                TEST_AUTH_URL,
                 "client-state",
                 "state-mismatch-session",
                 "corr",
@@ -1947,7 +1947,7 @@ mod tests {
 
         let error = OidcAuthentication
             .poll_auth_session(
-                GOALS_AUTH_URL,
+                TEST_AUTH_URL,
                 "a-different-client-state",
                 "client-state-mismatch-session",
                 "corr",
@@ -1975,7 +1975,7 @@ mod tests {
         );
 
         let error = OidcAuthentication
-            .poll_auth_session(GOALS_AUTH_URL, "client-state", "declined-session", "corr")
+            .poll_auth_session(TEST_AUTH_URL, "client-state", "declined-session", "corr")
             .await
             .expect_err("a declined login must be reported");
 
@@ -1996,7 +1996,7 @@ mod tests {
 
         let error = OidcAuthentication
             .poll_auth_session(
-                GOALS_AUTH_URL,
+                TEST_AUTH_URL,
                 "client-state",
                 "listener-failed-session",
                 "corr",
@@ -2026,7 +2026,7 @@ mod tests {
         );
 
         let pending = OidcAuthentication
-            .poll_auth_session(GOALS_AUTH_URL, "client-state", "pending-session", "corr")
+            .poll_auth_session(TEST_AUTH_URL, "client-state", "pending-session", "corr")
             .await
             .expect("an empty mailbox is not an error");
         assert!(pending.is_none(), "not yet");
@@ -2064,7 +2064,7 @@ mod tests {
     #[tokio::test]
     async fn polling_an_unknown_session_is_an_error_not_a_wait() {
         let error = OidcAuthentication
-            .poll_auth_session(GOALS_AUTH_URL, "client-state", "no-such-session", "corr")
+            .poll_auth_session(TEST_AUTH_URL, "client-state", "no-such-session", "corr")
             .await
             .expect_err("an unknown session code must be reported");
         assert!(error.to_string().contains("session"), "{error}");

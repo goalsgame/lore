@@ -22,7 +22,7 @@
 [server.auth]
 # The `iss` value the provider actually mints, which is not necessarily the
 # URL its discovery document is served from.
-jwt_issuer = "https://foxids.playgoals.com/-/"
+jwt_issuer = "https://idp.example.com/-/"
 # The resource this server is, as the provider names it in `aud`.
 jwt_audience = ["lore-server"]
 # The claim carrying the caller's groups. ConfiguredGrantsAuthorizer maps
@@ -40,7 +40,7 @@ acl_config_path = "/etc/lore/config/acl.toml"
 # Authorization Code with PKCE over a loopback redirect (RFC 8252).
 #
 # Host and path are the discovery *base*: the client fetches
-#   https://foxids.playgoals.com/-/zsk4ra29(*)/.well-known/openid-configuration
+#   https://idp.example.com/-/tenant-id/.well-known/openid-configuration
 # and takes the authorization and token endpoints from it, refusing any
 # endpoint served from another host or over plain HTTP. Some providers serve
 # a distinct discovery document per client, at a path the `issuer` value
@@ -63,7 +63,7 @@ acl_config_path = "/etc/lore/config/acl.toml"
 # `permission_claim` above reads, and `lore-server:access` is the scope for
 # this server as a resource.
 [environment.endpoint]
-auth_url = "oidc://foxids.playgoals.com/-/zsk4ra29(*)?client_id=zsk4ra29&scope=openid+profile+email+groups+offline_access+lore-server%3Aaccess"
+auth_url = "oidc://idp.example.com/-/tenant-id?client_id=lore-cli&scope=openid+profile+email+groups+offline_access+lore-server%3Aaccess"
 
 # ---------------------------------------------------------------------
 # Required provider-side configuration
@@ -82,14 +82,14 @@ auth_url = "oidc://foxids.playgoals.com/-/zsk4ra29(*)?client_id=zsk4ra29&scope=o
 #      `https://lore.org/claims/root_domains`) on the access token, listing
 #      the deployment's domains:
 #
-#          root_domains = [".playgoals.com"]
+#          root_domains = [".example.com"]
 #
 #      A leading dot matches the apex and every subdomain.
 #
 #   2. Or set the access token's audience to the deployment's canonical URL,
 #      whose host is then read as the domain:
 #
-#          aud = ["lore-server", "https://lore.playgoals.com"]
+#          aud = ["lore-server", "https://lore.example.com"]
 #
 #      Add that second value to `jwt_audience` above as well.
 #

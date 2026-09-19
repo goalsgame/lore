@@ -336,13 +336,13 @@ mod tests {
     fn a_bare_string_root_domains_claim_parses_the_same_as_a_one_element_array() {
         let token = claims(
             r#"{"iss":"https://idp.example.com/-/","sub":"alice","exp":2000000000,
-                "aud":"lore-server","root_domains":".playgoals.com"}"#,
+                "aud":"lore-server","root_domains":".example.com"}"#,
         );
         assert_eq!(
             token.acceptable_root_domains(),
-            vec![".playgoals.com", "idp.example.com"]
+            vec![".example.com", "idp.example.com"]
         );
-        verify_jwt_usage_for_remote(&token, "lore.playgoals.com")
+        verify_jwt_usage_for_remote(&token, "lore.example.com")
             .expect("the granted suffix matches");
     }
 
@@ -352,23 +352,23 @@ mod tests {
     fn the_root_domains_claim_is_read_under_both_of_its_names() {
         let plain = claims(
             r#"{"iss":"https://idp.example.com/-/","sub":"alice","exp":2000000000,
-                "aud":"lore-server","root_domains":[".playgoals.com"]}"#,
+                "aud":"lore-server","root_domains":[".example.com"]}"#,
         );
         assert_eq!(
             plain.acceptable_root_domains(),
-            vec![".playgoals.com", "idp.example.com"]
+            vec![".example.com", "idp.example.com"]
         );
-        verify_jwt_usage_for_remote(&plain, "lore.playgoals.com")
+        verify_jwt_usage_for_remote(&plain, "lore.example.com")
             .expect("the granted suffix matches");
 
         let namespaced = claims(
             r#"{"iss":"https://idp.example.com/-/","sub":"alice","exp":2000000000,
                 "aud":"lore-server",
-                "https://lore.org/claims/root_domains":[".playgoals.com"]}"#,
+                "https://lore.org/claims/root_domains":[".example.com"]}"#,
         );
         assert_eq!(
             namespaced.acceptable_root_domains(),
-            vec![".playgoals.com", "idp.example.com"]
+            vec![".example.com", "idp.example.com"]
         );
     }
 
