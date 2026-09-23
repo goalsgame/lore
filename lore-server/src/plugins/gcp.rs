@@ -105,6 +105,11 @@ pub struct GcpImmutableStorePluginConfig {
     /// Force write mode (bypasses the existence probe before uploading a payload).
     #[serde(default)]
     pub force_write: bool,
+
+    /// Caps how many `fragment_state` transactions run at once (see
+    /// `FirestoreImmutableStoreSettings::write_concurrency_limit`).
+    #[serde(default = "default_firestore_write_concurrency_limit")]
+    pub firestore_write_concurrency_limit: usize,
 }
 
 /// Configuration for the GCP mutable store plugin.
@@ -154,6 +159,10 @@ fn default_slow_threshold() -> u64 {
 
 fn default_timeout() -> u64 {
     5000
+}
+
+fn default_firestore_write_concurrency_limit() -> usize {
+    32
 }
 
 // =============================================================================
@@ -268,6 +277,7 @@ impl ImmutableStorePluginFactory for GcpImmutableStorePluginFactory {
             slow_operation_threshold_millis: plugin_config
                 .firestore_slow_operation_threshold_millis,
             timeout_millis: plugin_config.timeout_millis,
+            write_concurrency_limit: plugin_config.firestore_write_concurrency_limit,
         };
 
         let store_settings = GcpImmutableStoreSettings::new(

@@ -142,6 +142,7 @@ use opentelemetry::KeyValue;
 use opentelemetry::metrics::Counter;
 use opentelemetry::metrics::Histogram;
 use smallvec::SmallVec;
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tracing::Instrument;
 use tracing::debug;
@@ -296,6 +297,8 @@ pub struct FirestoreImmutableStoreSettings {
     pub fragment_associations_collection: String,
     pub slow_operation_threshold_millis: u64,
     pub timeout_millis: u64,
+    /// Caps how many `fragment_state` transactions (`publish_state`/`advance_state`) run at once.
+    pub write_concurrency_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -348,6 +351,7 @@ pub struct GcpImmutableStore {
     gcs_slow_threshold: Duration,
     firestore_timeout: Duration,
     firestore_slow_threshold: Duration,
+    firestore_write_semaphore: Arc<Semaphore>,
     obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
@@ -397,6 +401,9 @@ impl GcpImmutableStore {
             firestore_slow_threshold: Duration::from_millis(
                 settings.firestore.slow_operation_threshold_millis,
             ),
+            firestore_write_semaphore: Arc::new(Semaphore::new(
+                settings.firestore.write_concurrency_limit.max(1),
+            )),
             obliteration_drain: Duration::from_millis(
                 settings
                     .firestore
@@ -708,6 +715,11 @@ impl GcpImmutableStore {
     async fn publish_state(&self, hash: Hash) -> Result<FragmentState, StoreError> {
         let collection = self.fragment_state_collection.clone();
         let doc_id = hex_hash(hash);
+        let _permit = self
+            .firestore_write_semaphore
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
 
         bounded(
             self.firestore_timeout,
@@ -779,6 +791,11 @@ impl GcpImmutableStore {
     ) -> Result<(), StoreError> {
         let collection = self.fragment_state_collection.clone();
         let doc_id = hex_hash(hash);
+        let _permit = self
+            .firestore_write_semaphore
+            .acquire()
+            .await
+            .expect("semaphore is never closed");
 
         bounded(
             self.firestore_timeout,

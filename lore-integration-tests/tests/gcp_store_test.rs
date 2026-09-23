@@ -68,6 +68,7 @@ mod gcp_store_tests {
                 ),
                 slow_operation_threshold_millis: u64::MAX,
                 timeout_millis: 30_000,
+                write_concurrency_limit: 32,
             },
             false,
         );
