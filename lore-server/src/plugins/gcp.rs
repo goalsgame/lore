@@ -95,12 +95,22 @@ pub struct GcpImmutableStorePluginConfig {
     pub gcs_slow_operation_threshold_millis: u64,
 
     /// Slow operation threshold in milliseconds for Firestore operations.
-    #[serde(default = "default_slow_threshold")]
+    #[serde(default = "default_firestore_slow_threshold")]
     pub firestore_slow_operation_threshold_millis: u64,
 
-    /// Timeout in milliseconds for GCS and Firestore operations.
+    /// Timeout in milliseconds for GCS operations.
     #[serde(default = "default_timeout")]
     pub timeout_millis: u64,
+
+    /// Timeout in milliseconds for Firestore operations, including the full
+    /// `fragment_state.{publish,advance}_transaction` read-modify-write round trip. Separate from
+    /// `timeout_millis`: that read-modify-write can legitimately take longer than a single GCS
+    /// call under `firestore_write_concurrency_limit`-bounded contention, and `bounded()` drops
+    /// the transaction future outright on expiry rather than rolling it back (`firestore`'s own
+    /// "Transaction was neither committed nor rolled back" warning), so an over-tight timeout
+    /// here compounds contention instead of just reporting it.
+    #[serde(default = "default_firestore_timeout")]
+    pub firestore_timeout_millis: u64,
 
     /// Force write mode (bypasses the existence probe before uploading a payload).
     #[serde(default)]
@@ -127,11 +137,11 @@ pub struct GcpMutableStorePluginConfig {
     pub firestore_mutable_store_collection: String,
 
     /// Slow operation threshold in milliseconds for Firestore operations.
-    #[serde(default = "default_slow_threshold")]
+    #[serde(default = "default_firestore_slow_threshold")]
     pub slow_operation_threshold_millis: u64,
 
     /// Timeout in milliseconds for Firestore operations.
-    #[serde(default = "default_timeout")]
+    #[serde(default = "default_firestore_timeout")]
     pub timeout_millis: u64,
 
     /// Force write mode. Kept for config-shape parity with the immutable store's plugin config
@@ -157,8 +167,20 @@ fn default_slow_threshold() -> u64 {
     u64::MAX
 }
 
+/// Unlike GCS's `default_slow_threshold` (off by default), a bounded value: without this,
+/// `firestore_timeout_millis` firing was the first signal a Firestore transaction was
+/// contended at all, with no warning while it was still merely slow.
+fn default_firestore_slow_threshold() -> u64 {
+    2_000
+}
+
 fn default_timeout() -> u64 {
     5000
+}
+
+/// See `GcpImmutableStorePluginConfig::firestore_timeout_millis`'s doc comment.
+fn default_firestore_timeout() -> u64 {
+    30_000
 }
 
 fn default_firestore_write_concurrency_limit() -> usize {
@@ -276,7 +298,7 @@ impl ImmutableStorePluginFactory for GcpImmutableStorePluginFactory {
                 .firestore_fragment_associations_collection,
             slow_operation_threshold_millis: plugin_config
                 .firestore_slow_operation_threshold_millis,
-            timeout_millis: plugin_config.timeout_millis,
+            timeout_millis: plugin_config.firestore_timeout_millis,
             write_concurrency_limit: plugin_config.firestore_write_concurrency_limit,
         };
 
@@ -467,6 +489,7 @@ mod tests {
             gcs_slow_operation_threshold_millis = 1000
             firestore_slow_operation_threshold_millis = 500
             timeout_millis = 3000
+            firestore_timeout_millis = 15000
             force_write = true
         "#;
 
@@ -489,6 +512,7 @@ mod tests {
         assert_eq!(plugin_config.gcs_slow_operation_threshold_millis, 1000);
         assert_eq!(plugin_config.firestore_slow_operation_threshold_millis, 500);
         assert_eq!(plugin_config.timeout_millis, 3000);
+        assert_eq!(plugin_config.firestore_timeout_millis, 15000);
         assert!(plugin_config.force_write);
     }
 
@@ -516,11 +540,9 @@ mod tests {
             "fragment_associations"
         );
         assert_eq!(plugin_config.gcs_slow_operation_threshold_millis, u64::MAX);
-        assert_eq!(
-            plugin_config.firestore_slow_operation_threshold_millis,
-            u64::MAX
-        );
+        assert_eq!(plugin_config.firestore_slow_operation_threshold_millis, 2000);
         assert_eq!(plugin_config.timeout_millis, 5000);
+        assert_eq!(plugin_config.firestore_timeout_millis, 30000);
         assert!(!plugin_config.force_write);
     }
 
@@ -539,8 +561,8 @@ mod tests {
             plugin_config.firestore_mutable_store_collection,
             "mutable_store"
         );
-        assert_eq!(plugin_config.slow_operation_threshold_millis, u64::MAX);
-        assert_eq!(plugin_config.timeout_millis, 5000);
+        assert_eq!(plugin_config.slow_operation_threshold_millis, 2000);
+        assert_eq!(plugin_config.timeout_millis, 30000);
         assert!(!plugin_config.force_write);
     }
 
