@@ -30,9 +30,14 @@ pub struct LoreAuthClientHelper {
 
 impl LoreAuthClientHelper {
     async fn new(auth_url: String) -> Result<LoreAuthClientHelper, Status> {
+        // tonic's own connector only attempts TLS when the URI's scheme is
+        // literally "https" (transport::channel::service::connector),
+        // regardless of whether tls_config below is set -- so ucs-auth must
+        // be rewritten, not just recognized.
+        let auth_url = auth_url.replacen("ucs-auth://", "https://", 1);
         let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
             .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
-        if auth_url.starts_with("https://") || auth_url.starts_with("ucs-auth://") {
+        if auth_url.starts_with("https://") {
             endpoint = endpoint
                 .tls_config(
                     ClientTlsConfig::new()

@@ -44,9 +44,12 @@ pub struct RebacClientHelper {
 
 impl RebacClientHelper {
     async fn new(auth_url: String) -> Result<RebacClientHelper, Status> {
+        // See LoreAuthClientHelper::new: tonic's connector gates TLS on the
+        // URI's literal scheme, not on tls_config being set.
+        let auth_url = auth_url.replacen("ucs-auth://", "https://", 1);
         let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
             .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
-        if auth_url.starts_with("https://") || auth_url.starts_with("ucs-auth://") {
+        if auth_url.starts_with("https://") {
             endpoint = endpoint
                 .tls_config(
                     ClientTlsConfig::new()
