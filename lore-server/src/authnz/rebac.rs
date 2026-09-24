@@ -46,7 +46,7 @@ impl RebacClientHelper {
     async fn new(auth_url: String) -> Result<RebacClientHelper, Status> {
         let mut endpoint = tonic::transport::Endpoint::from_shared(auth_url.clone())
             .warn_map_err(|_| Status::internal("Failed to create rebac endpoint"))?;
-        if auth_url.starts_with("https://") {
+        if auth_url.starts_with("https://") || auth_url.starts_with("ucs-auth://") {
             endpoint = endpoint
                 .tls_config(
                     ClientTlsConfig::new()
