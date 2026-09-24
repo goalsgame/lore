@@ -20,6 +20,7 @@ use crate::grpc::FilterSlowDownExt;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
+use crate::grpc::handlers::branch_push::PUSH_PROTECTED_ACTION;
 use crate::util::setup_execution;
 
 #[tracing::instrument(name = "BranchUnprotect::handle", skip_all)]
@@ -38,6 +39,16 @@ pub async fn handler(
         repository_authorizer.as_ref(),
         repository_id,
         Some(PUSH_ACTION),
+    )
+    .await?;
+
+    // See branch_protect.rs's handler for why this is a hard requirement here,
+    // unlike BranchPush where push-protected only matters on a protected branch.
+    crate::grpc::check_repository_action(
+        &request,
+        repository_authorizer.as_ref(),
+        repository_id,
+        Some(PUSH_PROTECTED_ACTION),
     )
     .await?;
 
