@@ -195,9 +195,17 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
                     return Status::unauthenticated("Query resource failed - unauthenticated");
                 }
                 Status::internal(format!("Failed to call auth check_user_permission: {err}"))
-            })?;
+            })?
+            .into_inner();
+        debug!(
+            requested_resource_id = %resource_id,
+            action,
+            allowed = ?permissions.allowed_resource_permission,
+            denied = ?permissions.denied_resource_permission,
+            "check_user_permission response"
+        );
 
-        interpret_check_user_permission_response(permissions.into_inner(), &resource_id, action)
+        interpret_check_user_permission_response(permissions, &resource_id, action)
     }
 }
 
