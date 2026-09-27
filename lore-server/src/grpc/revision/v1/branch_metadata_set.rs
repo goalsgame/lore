@@ -29,6 +29,7 @@ use crate::grpc::get_user_id;
 use crate::grpc::get_write_token;
 use crate::grpc::handlers::branch_metadata_set::validate_binary_blobs;
 use crate::grpc::handlers::branch_metadata_set::validate_read_only_fields;
+use crate::grpc::handlers::branch_push::PUSH_PROTECTED_ACTION;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -42,7 +43,10 @@ use crate::util::setup_execution;
 ///
 /// `protect` remains writable through this RPC (it is not in the
 /// read-only key set) so clients can continue to toggle branch
-/// protection without dedicated protect/unprotect RPCs.
+/// protection without dedicated protect/unprotect RPCs, but a write
+/// that changes it requires `push-protected` exactly as
+/// BranchProtect/BranchUnprotect do. Gating only those two would leave
+/// this RPC as an unguarded second path to the same field.
 #[tracing::instrument(name = "BranchMetadataSet::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<BranchMetadataSetRequest>,
@@ -61,6 +65,17 @@ pub async fn handler(
         Some(PUSH_ACTION),
     )
     .await?;
+
+    // Resolved before the request is consumed; the toggle itself can only be
+    // detected further down, once both metadata blobs are deserialized.
+    let may_toggle_protection = crate::grpc::check_repository_action(
+        &request,
+        repository_authorizer.as_ref(),
+        repository_id,
+        Some(PUSH_PROTECTED_ACTION),
+    )
+    .await
+    .is_ok();
 
     let req = request.into_inner();
 
@@ -131,6 +146,19 @@ pub async fn handler(
                 })?;
 
             validate_read_only_fields(&current_metadata, &proposed_metadata)?;
+
+            // Absent reads as unprotected, so dropping the key is a toggle too.
+            let protect_before = current_metadata.get_bool(branch::PROTECT).unwrap_or(false);
+            let protect_after = proposed_metadata.get_bool(branch::PROTECT).unwrap_or(false);
+            if protect_before != protect_after && !may_toggle_protection {
+                warn!(
+                    {BRANCH_ID} = %branch_id,
+                    protect_before,
+                    protect_after,
+                    "Rejected branch protection toggle from a caller without push-protected",
+                );
+                return Err(Status::permission_denied("Permission denied"));
+            }
             validate_binary_blobs(repository.clone(), &proposed_metadata).await?;
 
             let (metadata_key, key_type) = branch::mutable_key(
@@ -194,6 +222,29 @@ mod test {
 
     fn allow_all_authorizer() -> Arc<dyn RepositoryAuthorizer> {
         Arc::new(AllowAllRepositoryAuthorizer)
+    }
+
+    /// Grants everything but `push-protected`, the shape of a caller holding
+    /// only baseline push.
+    struct NoPushProtectedAuthorizer;
+
+    #[async_trait::async_trait]
+    impl RepositoryAuthorizer for NoPushProtectedAuthorizer {
+        async fn check_repository_access(
+            &self,
+            _token: Option<&crate::authnz::repository_authorizer::VerifiedToken<'_>>,
+            _repository: RepositoryId,
+            action: Option<&str>,
+        ) -> Result<(), Status> {
+            if action == Some(PUSH_PROTECTED_ACTION) {
+                return Err(Status::permission_denied("Permission denied"));
+            }
+            Ok(())
+        }
+    }
+
+    fn push_only_authorizer() -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(NoPushProtectedAuthorizer)
     }
 
     fn make_request(
@@ -471,6 +522,78 @@ mod test {
             )
             .await
             .expect("protect toggle must succeed");
+            assert_eq!(Hash::from(response.into_inner().metadata), updated);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn rejects_protect_toggle_without_push_protected() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let current = create_branch(repository.clone(), branch_id).await;
+
+            let mut proposed = Metadata::deserialize(repository.clone(), current)
+                .await
+                .expect("deserialize");
+            proposed
+                .set_bool(branch::PROTECT, true)
+                .expect("set protect");
+            let updated = serialize(repository.clone(), &proposed).await;
+
+            let err = handler(
+                make_request(repository_id, branch_id, current, updated),
+                immutable_store,
+                mutable_store,
+                push_only_authorizer(),
+            )
+            .await
+            .expect_err("protect toggle must require push-protected");
+            assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        }))
+        .await;
+    }
+
+    #[tokio::test]
+    async fn allows_non_protect_metadata_without_push_protected() {
+        let repository_id = random::<RepositoryId>();
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let repository = Arc::new(RepositoryContext::new_server_context(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                repository_id,
+            ));
+            let current = create_branch(repository.clone(), branch_id).await;
+
+            let mut proposed = Metadata::deserialize(repository.clone(), current)
+                .await
+                .expect("deserialize");
+            proposed
+                .set_string("p4-shelve/request", "requested")
+                .expect("set key");
+            let updated = serialize(repository.clone(), &proposed).await;
+
+            let response = handler(
+                make_request(repository_id, branch_id, current, updated),
+                immutable_store,
+                mutable_store,
+                push_only_authorizer(),
+            )
+            .await
+            .expect("ordinary metadata must not require push-protected");
             assert_eq!(Hash::from(response.into_inner().metadata), updated);
         }))
         .await;
