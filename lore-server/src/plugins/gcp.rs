@@ -540,7 +540,10 @@ mod tests {
             "fragment_associations"
         );
         assert_eq!(plugin_config.gcs_slow_operation_threshold_millis, u64::MAX);
-        assert_eq!(plugin_config.firestore_slow_operation_threshold_millis, 2000);
+        assert_eq!(
+            plugin_config.firestore_slow_operation_threshold_millis,
+            2000
+        );
         assert_eq!(plugin_config.timeout_millis, 5000);
         assert_eq!(plugin_config.firestore_timeout_millis, 30000);
         assert!(!plugin_config.force_write);
