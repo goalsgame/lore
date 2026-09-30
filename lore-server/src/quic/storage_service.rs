@@ -248,6 +248,30 @@ pub(crate) fn build_storage_protocol_request_span(
     }
 }
 
+/// Refuses a request whose connection's token has passed its own `exp`.
+///
+/// `Connect` verifies the token once and the connection then serves requests
+/// for as long as it stays open, so without this a session outlives the
+/// credential that opened it. Checked per request rather than on a timer:
+/// there is nothing to cancel a QUIC stream from outside.
+fn reject_expired_connection(context: &Arc<AttributeMap>) -> Result<(), MessageHandleError> {
+    let Some(token) = context.get::<AuthorizationToken>() else {
+        // No token on the connection means no verifier was configured, which
+        // `Connect` already decided; expiry is not this function's to invent.
+        return Ok(());
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    if now >= token.expires {
+        return Err(MessageHandleError::AuthorizationFailure(
+            "connection token has expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 fn request_identifiers_from_context(
     context: &Arc<AttributeMap>,
 ) -> (String, String, String, String, Option<Arc<UserAgentValue>>) {
@@ -489,6 +513,9 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if !matches!(request, ParsedStorageRequest::Connect(_)) {
+            reject_expired_connection(&context)?;
+        }
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
@@ -560,5 +587,51 @@ impl QuicService for StorageService {
                 .as_ref()
                 .map_or(crate::quic::NO_USER_AGENT, |v| v.0.as_ref()),
         )
+    }
+}
+
+#[cfg(test)]
+mod expiry_test {
+    use std::sync::Arc;
+    use std::time::SystemTime;
+    use std::time::UNIX_EPOCH;
+
+    use super::reject_expired_connection;
+    use crate::auth::jwt::AuthorizationToken;
+    use crate::protocol::attribute_map::AttributeMap;
+
+    fn now() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock before epoch")
+            .as_secs()
+    }
+
+    fn context_with(expires: u64) -> Arc<AttributeMap> {
+        let context = AttributeMap::default();
+        context.insert(AuthorizationToken {
+            expires,
+            ..Default::default()
+        });
+        Arc::new(context)
+    }
+
+    /// No token means no verifier was configured, which `Connect` already
+    /// decided. Refusing here would break an unauthenticated deployment.
+    #[test]
+    fn allows_a_connection_carrying_no_token() {
+        assert!(reject_expired_connection(&Arc::new(AttributeMap::default())).is_ok());
+    }
+
+    #[test]
+    fn allows_a_token_that_has_not_expired() {
+        assert!(reject_expired_connection(&context_with(now() + 3600)).is_ok());
+    }
+
+    /// The point of the guard: a connection opened with a valid token keeps
+    /// serving requests after that token's own `exp`.
+    #[test]
+    fn refuses_a_token_that_has_expired() {
+        assert!(reject_expired_connection(&context_with(now() - 1)).is_err());
     }
 }
