@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "lore",
     "lore-aws",
+    "lore-gcp",
     "lore-base",
     "lore-chaos-client",
     "lore-client",
@@ -28,6 +29,7 @@ version = "0.10.1-nightly"
 [workspace.dependencies]
 lore = { path = "lore" }
 lore-aws = { path = "lore-aws" }
+lore-gcp = { path = "lore-gcp" }
 lore-base = { path = "lore-base" }
 lore-credential = { path = "lore-credential" }
 lore-error-set = { path = "lore-error-set" }
