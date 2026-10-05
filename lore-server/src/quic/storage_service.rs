@@ -465,6 +465,31 @@ impl StorageService {
     }
 }
 
+/// Refuses a request whose connection's token has passed its own `exp`.
+///
+/// `Connect` verifies the token once and the connection then serves requests
+/// for as long as it stays open, so without this a session outlives the
+/// credential that opened it. Checked per request rather than on a timer:
+/// there is nothing to cancel a QUIC stream from outside.
+#[lore_macro::test_pub]
+fn reject_expired_connection(context: &Arc<AttributeMap>) -> Result<(), MessageHandleError> {
+    let Some(token) = context.get::<AuthorizationToken>() else {
+        // No token on the connection means no verifier was configured, which
+        // `Connect` already decided; expiry is not this function's to invent.
+        return Ok(());
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|since| since.as_secs())
+        .unwrap_or(0);
+    if now >= token.expires {
+        return Err(MessageHandleError::AuthorizationFailure(
+            "connection token has expired".to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[async_trait]
 impl QuicService for StorageService {
     type ParsedRequestType = ParsedStorageRequest;
@@ -488,6 +513,10 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        if !matches!(request, ParsedStorageRequest::Connect(_)) {
+            reject_expired_connection(&context)?;
+        }
+
         let lore_response = match request {
             ParsedStorageRequest::Connect(request) => {
                 request
