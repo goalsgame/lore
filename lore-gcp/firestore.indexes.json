@@ -1,0 +1,45 @@
+{
+  "//": [
+    "Composite indexes required by lore-gcp's Firestore-backed mutable and immutable stores.",
+    "Deploy with `gcloud firestore indexes composite create --database=<db>` (one call per",
+    "entry below, translating the JSON fields), via Terraform `google_firestore_index`",
+    "resources, or `firebase deploy --only firestore:indexes` if this file is adopted into a",
+    "Firebase project config. This repository does not provision live Firestore",
+    "infrastructure; this file documents exactly what the infra workstream needs to create,",
+    "and the collectionGroup names below must be kept in sync with the collection names",
+    "configured in a deployment's [plugins.gcp] section (defaults shown here).",
+    "",
+    "- mutable_store (partition ASC, key ASC): lore_gcp::store::mutable_store's list(partition,",
+    "  key_type) filters on an equality match for `partition` together with a range (>=, <=) on",
+    "  `key`; that combination needs a declared composite index. Corresponds to",
+    "  [plugins.gcp].firestore_mutable_store_collection.",
+    "- fragment_associations (hash ASC, partition ASC): lore_gcp::store::immutable_store's",
+    "  has_partition_association is an equality-only compound filter (hash == X AND",
+    "  partition == Y), used by ImmutableStore::copy's zero-context source resolution.",
+    "  Declared explicitly rather than relying on Firestore's automatic-index support for",
+    "  multi-equality queries. Corresponds to",
+    "  [plugins.gcp].firestore_fragment_associations_collection.",
+    "",
+    "Single-field indexes (equality or range on one field alone) are automatic in Firestore",
+    "and are not listed here."
+  ],
+  "indexes": [
+    {
+      "collectionGroup": "mutable_store",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "partition", "order": "ASCENDING" },
+        { "fieldPath": "key", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "fragment_associations",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "hash", "order": "ASCENDING" },
+        { "fieldPath": "partition", "order": "ASCENDING" }
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

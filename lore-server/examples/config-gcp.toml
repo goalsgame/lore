@@ -1,0 +1,61 @@
+# Lore Server Configuration Example: GCP Storage
+# =====================================================================
+# This configuration demonstrates using GCP services (GCS + Firestore)
+# for storage, suitable for production cloud deployments.
+#
+# Required GCP resources:
+# - GCS bucket for immutable fragment payloads (with object versioning
+#   enabled, so obliterate can remove every generation of an object)
+# - Firestore database (native mode) for fragment lifecycle state,
+#   fragment reference associations, and the mutable store
+# - The two composite indexes documented in lore-gcp/firestore.indexes.json
+#
+# Credentials: both GCS and Firestore use Application Default Credentials
+# (`gcloud auth application-default login`, a service account key via
+# GOOGLE_APPLICATION_CREDENTIALS, or workload identity) -- there is no
+# credential setting in this file.
+#
+# There is no GCP-backed lock store: lock_store.mode stays "local".
+#
+# GCP-specific settings are in the [plugins.gcp] section.
+
+[immutable_store]
+mode = "gcp"
+
+[mutable_store]
+mode = "gcp"
+
+[lock_store]
+mode = "local"
+
+# ---------------------------------------------------------------------
+# GCP Plugin Configuration
+# ---------------------------------------------------------------------
+# Firestore project/database are shared by both stores below and are
+# inherited by [plugins.gcp.immutable_store] / [plugins.gcp.mutable_store]
+# unless overridden there (the same [plugins.aws.http]-style inheritance
+# config-aws.toml relies on for settings shared across its stores).
+[plugins.gcp]
+firestore_project = "my-gcp-project"
+# firestore_database = "my-named-database"  # optional; defaults to "(default)"
+
+# Immutable store settings (GCS + Firestore)
+[plugins.gcp.immutable_store]
+gcs_bucket = "lore-fragments"
+# gcs_project = "my-gcp-project"          # reserved; not required today, see lore-gcp docs
+# gcs_endpoint_url = "http://localhost:9000"  # for a GCS-compatible test double
+gcs_slow_operation_threshold_millis = 5000
+firestore_slow_operation_threshold_millis = 2000
+timeout_millis = 30000
+
+firestore_fragment_state_collection = "fragment_state"
+firestore_fragment_associations_collection = "fragment_associations"
+
+# Force write mode for debugging/profiling purposes, always overwrites data already present
+# force_write = false
+
+# Mutable store settings (Firestore)
+[plugins.gcp.mutable_store]
+firestore_mutable_store_collection = "mutable_store"
+slow_operation_threshold_millis = 2000
+timeout_millis = 15000

@@ -1,0 +1,59 @@
+[package]
+name = "lore-gcp"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+# Pinned to 0.47.x rather than latest (0.53.0): 0.48.0 moved to gcloud-sdk 0.29, which moved to
+# reqwest ^0.13 — whose "rustls" feature bundle hardcodes the aws-lc-rs crypto provider with no
+# ring alternative (unlike reqwest 0.12, which offers `rustls-tls-webpki-roots` -> `__rustls-ring`).
+# aws-lc-rs/aws-lc-sys are denied by this workspace's deny.toml. 0.47.1 (gcloud-sdk ^0.28.4, reqwest
+# >=0.12.7) resolves to the same reqwest 0.12.x the rest of the workspace already uses, and its
+# `tls-webpki-roots` feature maps to reqwest's "no-provider" rustls path, which picks up the `ring`
+# provider `lore_revision::interface::install_crypto_provider` already installs process-wide at
+# startup. See the root Cargo.toml's own rustls comment for the same avoidance on the AWS side.
+firestore = { version = "=0.47.1", default-features = false, features = ["tls-webpki-roots"] }
+futures = { workspace = true }
+google-cloud-gax = { version = "1.14", default-features = false }
+# default-features = false and no features re-enabled: google-cloud-storage's own default feature
+# ("default-rustls-provider") is what pulls aws-lc-rs (via google-cloud-auth's default feature
+# group). Leaving it off does not break TLS: google-cloud-auth's own reqwest edge unconditionally
+# requests reqwest's "rustls-no-provider" feature, which — like firestore's path above — uses
+# whatever crypto provider the process already installed (ring).
+google-cloud-storage = { version = "1.18.0", default-features = false }
+hex = { workspace = true }
+# gcloud-sdk (firestore's transport) depends on jsonwebtoken 10 with no crypto feature selected,
+# so it mints self-signed JWTs (used for Application Default Credentials with a service account
+# key) via a runtime-pluggable `jsonwebtoken::crypto::CryptoProvider` that panics if exactly one of
+# the "rust_crypto"/"aws_lc_rs" crate features is not enabled. Declaring the dependency directly
+# here with "rust_crypto" (pure-Rust, no aws-lc-rs/aws-lc-sys — this workspace's deny.toml denies
+# both) makes jsonwebtoken auto-select that provider at compile time for the one resolved instance
+# gcloud-sdk also links against, via Cargo's feature unification — no runtime install call needed
+# for this crate specifically (unlike rustls's provider; see clients.rs's `ensure_crypto_provider`).
+jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+opentelemetry = { workspace = true }
+# For the defensive rustls CryptoProvider check in clients.rs. Uses the workspace's own pinned
+# version/features (ring, not aws-lc-rs) rather than pulling in a second one.
+rustls = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+smallvec = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+lore-base = { workspace = true }
+lore-storage = { workspace = true }
+lore-revision = { workspace = true }
+lore-error-set = { workspace = true }
+lore-macro = { workspace = true }
+lore-telemetry = { workspace = true }
+
+[dev-dependencies]
+rand = { workspace = true }
+tracing-test = { workspace = true }
+uuid = { workspace = true }
+
+[features]
+default = []
