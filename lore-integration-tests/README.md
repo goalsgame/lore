@@ -48,6 +48,34 @@ the [MinIO client](https://min.io/docs/minio/linux/reference/minio-mc.html) (`mc
 $ MC_HOST_local=http://lorelocal:lorelocal@localhost:9000 mc rb --force --insecure local/lore-immutable-store-test
 ```
 
+## GCP Store Tests
+
+The GCP store's Firestore half is covered by tests that live in `lore-gcp` itself, not in this
+crate: they exercise the fragment state document's lifecycle and the associations a query answers
+from, both of which are private to `lore_gcp::store::immutable_store`. They run against the
+[Firestore emulator](https://cloud.google.com/firestore/docs/emulator) that
+[compose.yaml](./compose.yaml) starts on port 8787, and need no credentials — the GCS clients they
+build are never called.
+
+```shell
+$ docker compose --file lore-integration-tests/compose.yaml up --detach firestore
+$ FIRESTORE_EMULATOR_HOST=127.0.0.1:8787 cargo test --package lore-gcp --features integration_tests
+```
+
+Without Docker, the same emulator comes from the Google Cloud CLI:
+
+```shell
+$ gcloud components install cloud-firestore-emulator
+$ gcloud emulators firestore start --host-port=127.0.0.1:8787
+```
+
+The emulator keeps everything in memory, and each test gives itself collection names of its own,
+so runs do not need cleaning up between them.
+
+The GCS half has no equivalent coverage: the Google Cloud Storage testbench answers this store's
+writes with a 500, for the reason `lore_gcp::store::immutable_store`'s module documentation sets
+out, so there is no local double to test `put`/`get` end to end against.
+
 ## gRPC Integration Tests
 
 There is a suite of integration tests for gRPC Services. These are gated behind a separate feature:
