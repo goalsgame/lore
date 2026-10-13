@@ -103,7 +103,7 @@ pub struct GcpImmutableStorePluginConfig {
     pub timeout_millis: u64,
 
     /// Timeout in milliseconds for Firestore operations, including the full
-    /// `fragment_state.{publish,advance}_transaction` read-modify-write round trip. Separate from
+    /// `fragment_state.advance_transaction` read-modify-write round trip. Separate from
     /// `timeout_millis`: that read-modify-write can legitimately take longer than a single GCS
     /// call under `firestore_write_concurrency_limit`-bounded contention, and `bounded()` drops
     /// the transaction future outright on expiry rather than rolling it back (`firestore`'s own
@@ -116,7 +116,7 @@ pub struct GcpImmutableStorePluginConfig {
     #[serde(default)]
     pub force_write: bool,
 
-    /// Caps how many `fragment_state` transactions run at once (see
+    /// Caps how many `fragment_state` writes run at once (see
     /// `FirestoreImmutableStoreSettings::write_concurrency_limit`).
     #[serde(default = "default_firestore_write_concurrency_limit")]
     pub firestore_write_concurrency_limit: usize,
