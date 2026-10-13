@@ -1838,6 +1838,24 @@ mod emulator_tests {
         GcpImmutableStore::new(storage, control, db, &settings)
     }
 
+    /// `publish_state` answers `SlowDown` rather than retrying a contended write itself, so it
+    /// is the caller that tries again. This is that caller.
+    async fn publish_retrying(
+        store: &GcpImmutableStore,
+        hash: Hash,
+    ) -> Result<FragmentState, StoreError> {
+        let mut result = store.publish_state(hash).await;
+        for _ in 1..8 {
+            match result {
+                Err(ref error) if error.is_slow_down() => {}
+                settled => return settled,
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            result = store.publish_state(hash).await;
+        }
+        result
+    }
+
     /// A hash no other test uses, so tests may share a collection without colliding.
     fn unique_hash() -> Hash {
         Hash::from(
@@ -1886,7 +1904,7 @@ mod emulator_tests {
         let mut tasks = JoinSet::new();
         for _ in 0..32 {
             let store = store.clone();
-            lore_base::lore_spawn!(tasks, async move { store.publish_state(hash).await });
+            lore_base::lore_spawn!(tasks, async move { publish_retrying(&store, hash).await });
         }
 
         while let Some(result) = tasks.join_next().await {
