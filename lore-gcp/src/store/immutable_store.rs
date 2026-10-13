@@ -111,6 +111,7 @@ use bytes::Bytes;
 use bytes::BytesMut;
 use firestore::FirestoreDb;
 use firestore::errors::BackoffError;
+use firestore::errors::FirestoreError;
 use futures::FutureExt;
 use futures::StreamExt;
 use google_cloud_gax::paginator::ItemPaginator;
@@ -298,7 +299,7 @@ pub struct FirestoreImmutableStoreSettings {
     pub fragment_associations_collection: String,
     pub slow_operation_threshold_millis: u64,
     pub timeout_millis: u64,
-    /// Caps how many `fragment_state` transactions (`publish_state`/`advance_state`) run at once.
+    /// Caps how many `fragment_state` writes (`publish_state`/`advance_state`) run at once.
     pub write_concurrency_limit: usize,
 }
 
@@ -328,6 +329,10 @@ impl GcpImmutableStoreSettings {
 /// put that had already passed its state probe needs time to land its own association before
 /// obliteration re-checks whether any reference survives.
 const MIN_OBLITERATION_DRAIN_MILLIS: u64 = 100;
+
+/// How many times [`GcpImmutableStore::publish_state`] re-attempts its conditional create before
+/// asking the caller to retry.
+const PUBLISH_STATE_ATTEMPTS: usize = 3;
 
 static STORE_ATTRIBUTES_GCP: LazyLock<[KeyValue; 1]> =
     LazyLock::new(|| [KeyValue::new("store", "gcp")]);
@@ -710,59 +715,58 @@ impl GcpImmutableStore {
     }
 
     /// Record that a payload exists, without disturbing an obliteration that may hold the hash.
-    /// Runs in a transaction so a concurrent obliteration's mark cannot be silently overwritten:
-    /// the write only happens if no document exists yet, mirroring
-    /// `lore_aws::store::immutable_store::RowAbsent`.
+    /// The create is conditional, so it can never overwrite a mark, mirroring
+    /// `lore_aws::store::immutable_store::RowAbsent`. Returns the state the hash carries
+    /// afterwards: an existing document's own state, or `Stored` when this call wrote it.
+    ///
+    /// Losing the condition is the ordinary outcome for content that is already stored. Firestore
+    /// does not return the document that won, so that state costs a read — and the read can find
+    /// the document gone again, which is why this re-attempts rather than reporting an absence it
+    /// cannot act on. A hash that stays unresolvable for [`PUBLISH_STATE_ATTEMPTS`] rounds is
+    /// handed back to the caller to retry.
     async fn publish_state(&self, hash: Hash) -> Result<FragmentState, StoreError> {
-        let collection = self.fragment_state_collection.clone();
-        let doc_id = hex_hash(hash);
+        for _ in 0..PUBLISH_STATE_ATTEMPTS {
+            if self.create_state(hash).await? {
+                return Ok(FragmentState::Stored);
+            }
+
+            if let Some(state) = self.load_state(hash).await? {
+                return Ok(state);
+            }
+        }
+
+        Err(StoreError::from(SlowDown))
+    }
+
+    /// Write `hash`'s state document as `Stored` unless one already exists. `false` means one
+    /// already did, whatever state it carries.
+    async fn create_state(&self, hash: Hash) -> Result<bool, StoreError> {
+        let entry = FragmentStateEntry::new(FragmentState::Stored);
         let _permit = self
             .firestore_write_semaphore
             .acquire()
             .await
             .expect("semaphore is never closed");
 
-        bounded(
+        let created = bounded(
             self.firestore_timeout,
             self.firestore_slow_threshold,
-            "fragment_state.publish_transaction",
+            "fragment_state.create",
             self.db
-                .run_transaction::<FragmentState, _, GcpError>(move |db, transaction| {
-                    let collection = collection.clone();
-                    let doc_id = doc_id.clone();
-                    async move {
-                        let current: Option<FragmentStateEntry> = db
-                            .fluent()
-                            .select()
-                            .by_id_in(collection.as_ref())
-                            .obj()
-                            .one(&doc_id)
-                            .await
-                            .map_err(GcpError::firestore)
-                            .map_err(BackoffError::Permanent)?;
-
-                        if let Some(current) = current {
-                            return Ok(current.state());
-                        }
-
-                        let entry = FragmentStateEntry::new(FragmentState::Stored);
-                        db.fluent()
-                            .update()
-                            .in_col(collection.as_ref())
-                            .document_id(&doc_id)
-                            .object(&entry)
-                            .add_to_transaction(transaction)
-                            .map_err(GcpError::firestore)
-                            .map_err(BackoffError::Permanent)?;
-
-                        Ok(FragmentState::Stored)
-                    }
-                    .boxed()
-                }),
+                .fluent()
+                .insert()
+                .into(self.fragment_state_collection.as_ref())
+                .document_id(hex_hash(hash))
+                .object(&entry)
+                .execute::<FragmentStateEntry>(),
         )
-        .await?
-        .map_err(GcpError::firestore)
-        .map_err(to_store_error)
+        .await?;
+
+        match created {
+            Ok(_) => Ok(true),
+            Err(FirestoreError::DataConflictError(_)) => Ok(false),
+            Err(error) => Err(to_store_error(GcpError::firestore(error))),
+        }
     }
 
     /// Delete the state document for a hash, so the next put treats it as new content. Only
