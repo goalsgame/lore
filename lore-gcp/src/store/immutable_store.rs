@@ -1782,6 +1782,23 @@ mod emulator_tests {
     /// The project the emulator serves. It accepts any id.
     const PROJECT: &str = "lore-gcp-emulator-tests";
 
+    /// The owner token the emulator grants everything to. It wants no real credentials, but it
+    /// does reject a bearer token it cannot parse, and the client asks its token source for one
+    /// ahead of every request -- which the default source cannot answer where there are no
+    /// Application Default Credentials.
+    struct EmulatorToken;
+
+    #[async_trait]
+    impl gcloud_sdk::Source for EmulatorToken {
+        async fn token(&self) -> gcloud_sdk::error::Result<gcloud_sdk::Token> {
+            Ok(gcloud_sdk::Token::new(
+                "Bearer".to_owned(),
+                gcloud_sdk::SecretValue::from("owner"),
+                chrono::Utc::now() + chrono::Duration::hours(1),
+            ))
+        }
+    }
+
     /// A store whose Firestore half talks to the emulator, under collections unique to this
     /// store so tests sharing one emulator cannot see each other's documents.
     async fn emulator_store() -> GcpImmutableStore {
@@ -1808,9 +1825,15 @@ mod emulator_tests {
         let (storage, control) = crate::clients::build_storage_clients(None, None)
             .await
             .expect("building GCS clients the emulator tests never call");
-        let db = crate::clients::build_firestore_db(PROJECT, None)
-            .await
-            .expect("connecting to the Firestore emulator; is FIRESTORE_EMULATOR_HOST set?");
+
+        crate::clients::ensure_crypto_provider();
+        let db = firestore::FirestoreDb::with_options_token_source(
+            firestore::FirestoreDbOptions::new(PROJECT.to_owned()),
+            Vec::new(),
+            gcloud_sdk::TokenSourceType::ExternalSource(Box::new(EmulatorToken)),
+        )
+        .await
+        .expect("connecting to the Firestore emulator; is FIRESTORE_EMULATOR_HOST set?");
 
         GcpImmutableStore::new(storage, control, db, &settings)
     }

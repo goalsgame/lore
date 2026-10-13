@@ -59,7 +59,7 @@ static CRYPTO_PROVIDER_INIT: Once = Once::new();
 /// not need a runtime call here: this crate's `Cargo.toml` enables exactly one of its
 /// `rust_crypto`/`aws_lc_rs` crate features (`rust_crypto`, to avoid `aws-lc-rs`), which makes
 /// `jsonwebtoken` auto-select that provider at compile time with no installation step.
-fn ensure_crypto_provider() {
+pub(crate) fn ensure_crypto_provider() {
     CRYPTO_PROVIDER_INIT.call_once(|| {
         if rustls::crypto::CryptoProvider::get_default().is_some() {
             return;
