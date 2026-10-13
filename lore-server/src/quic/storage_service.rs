@@ -482,8 +482,7 @@ fn reject_expired_connection(context: &Arc<AttributeMap>) -> Result<(), MessageH
     };
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|since| since.as_secs())
-        .unwrap_or(0);
+        .map_or(0, |since| since.as_secs());
     if now >= token.expires {
         return Err(MessageHandleError::AuthorizationFailure(
             "connection token has expired".to_string(),
