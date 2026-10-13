@@ -71,10 +71,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --verbose
 
-  # Runs the integration tests against the MinIO, DynamoDB Local, and Consul
-  # services that Docker Compose starts. Only the Linux runners provide Docker.
-  # The tests connect to 127.0.0.1 on ports 9000, 9090, and 8500, which the
-  # compose file maps.
+  # Runs the integration tests against the MinIO, DynamoDB Local, Firestore
+  # emulator, and Consul services that Docker Compose starts. Only the Linux
+  # runners provide Docker. The tests connect to 127.0.0.1 on ports 9000, 9090,
+  # 8787, and 8500, which the compose file maps.
   integration:
     name: integration (linux-x86_64)
     runs-on: ubuntu-latest
@@ -99,14 +99,15 @@ jobs:
         with:
           key: integration
 
-      - name: Start backing services (MinIO, DynamoDB Local, Consul)
+      - name: Start backing services (MinIO, DynamoDB Local, Firestore, Consul)
         run: docker compose --file lore-integration-tests/compose.yaml up --detach
 
       - name: Wait for services to be ready
         run: |
-          for i in $(seq 1 30); do
+          for i in $(seq 1 45); do
             if curl -sf http://127.0.0.1:9000/minio/health/ready \
                && curl -sf http://127.0.0.1:8500/v1/status/leader \
+               && curl -sf http://127.0.0.1:8787 \
                && curl -s -o /dev/null http://127.0.0.1:9090; then
               echo "services ready"
               exit 0
@@ -124,6 +125,15 @@ jobs:
           AWS_REGION: us-east-1
         run: >
           cargo test --package lore-integration-tests
+          --features integration_tests --verbose
+
+      # lore-gcp's own tests rather than the suite's: they reach private state
+      # the crate does not export.
+      - name: cargo test (lore-gcp, Firestore emulator)
+        env:
+          FIRESTORE_EMULATOR_HOST: 127.0.0.1:8787
+        run: >
+          cargo test --package lore-gcp
           --features integration_tests --verbose
 
       - name: Dump service logs on failure
