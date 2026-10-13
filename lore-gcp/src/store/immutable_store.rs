@@ -1767,3 +1767,214 @@ mod tests {
         assert_eq!(first.len(), 64 + 1 + 32 + 1 + 32);
     }
 }
+
+/// The Firestore half of this store, against a live Firestore emulator: the lifecycle of a
+/// fragment's state document and the associations a query answers from. GCS is never reached, so
+/// the clients these tests build are only there to satisfy [`GcpImmutableStore::new`].
+///
+/// Requires the `firestore` service in `lore-integration-tests/compose.yaml`; see that crate's
+/// README for how to bring it up. Behind `integration_tests` so an ordinary `cargo test` does not
+/// reach for a service that is not running.
+#[cfg(all(test, feature = "integration_tests"))]
+mod emulator_tests {
+    use super::*;
+
+    /// The project the emulator serves. It accepts any id.
+    const PROJECT: &str = "lore-gcp-emulator-tests";
+
+    /// A store whose Firestore half talks to the emulator, under collections unique to this
+    /// store so tests sharing one emulator cannot see each other's documents.
+    async fn emulator_store() -> GcpImmutableStore {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let settings = GcpImmutableStoreSettings::new(
+            GcsStoreSettings {
+                bucket: format!("lore-gcp-emulator-tests-{suffix}"),
+                endpoint: None,
+                slow_operation_threshold_millis: 2_000,
+                timeout_millis: 30_000,
+            },
+            FirestoreImmutableStoreSettings {
+                firestore_project: PROJECT.to_owned(),
+                firestore_database: None,
+                fragment_state_collection: format!("fragment_state_{suffix}"),
+                fragment_associations_collection: format!("fragment_associations_{suffix}"),
+                slow_operation_threshold_millis: 2_000,
+                timeout_millis: 30_000,
+                write_concurrency_limit: 32,
+            },
+            false,
+        );
+
+        let (storage, control) = crate::clients::build_storage_clients(None, None)
+            .await
+            .expect("building GCS clients the emulator tests never call");
+        let db = crate::clients::build_firestore_db(PROJECT, None)
+            .await
+            .expect("connecting to the Firestore emulator; is FIRESTORE_EMULATOR_HOST set?");
+
+        GcpImmutableStore::new(storage, control, db, &settings)
+    }
+
+    /// A hash no other test uses, so tests may share a collection without colliding.
+    fn unique_hash() -> Hash {
+        Hash::from(
+            *uuid::Uuid::new_v4()
+                .as_bytes()
+                .repeat(2)
+                .first_chunk()
+                .unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn publishes_a_stored_state_for_a_new_hash() {
+        let store = emulator_store().await;
+        let hash = unique_hash();
+
+        assert_eq!(store.load_state(hash).await.unwrap(), None);
+        assert_eq!(
+            store.publish_state(hash).await.unwrap(),
+            FragmentState::Stored
+        );
+        assert_eq!(
+            store.load_state(hash).await.unwrap(),
+            Some(FragmentState::Stored)
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_a_hash_that_is_already_stored_reports_stored() {
+        let store = emulator_store().await;
+        let hash = unique_hash();
+
+        store.publish_state(hash).await.unwrap();
+
+        assert_eq!(
+            store.publish_state(hash).await.unwrap(),
+            FragmentState::Stored
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_publishes_of_one_hash_all_report_stored() {
+        let store = Arc::new(emulator_store().await);
+        let hash = unique_hash();
+
+        let mut tasks = JoinSet::new();
+        for _ in 0..32 {
+            let store = store.clone();
+            lore_base::lore_spawn!(tasks, async move { store.publish_state(hash).await });
+        }
+
+        while let Some(result) = tasks.join_next().await {
+            assert_eq!(result.unwrap().unwrap(), FragmentState::Stored);
+        }
+        assert_eq!(
+            store.load_state(hash).await.unwrap(),
+            Some(FragmentState::Stored)
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_does_not_overwrite_an_obliteration_mark() {
+        let store = emulator_store().await;
+        let hash = unique_hash();
+
+        store.publish_state(hash).await.unwrap();
+        store
+            .advance_state(hash, FragmentState::Stored, FragmentState::Obliterating)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.publish_state(hash).await.unwrap(),
+            FragmentState::Obliterating
+        );
+        assert_eq!(
+            store.load_state(hash).await.unwrap(),
+            Some(FragmentState::Obliterating)
+        );
+    }
+
+    #[tokio::test]
+    async fn publishing_after_a_cleared_state_stores_it_again() {
+        let store = emulator_store().await;
+        let hash = unique_hash();
+
+        store.publish_state(hash).await.unwrap();
+        store.clear_state(hash).await.unwrap();
+        assert_eq!(store.load_state(hash).await.unwrap(), None);
+
+        assert_eq!(
+            store.publish_state(hash).await.unwrap(),
+            FragmentState::Stored
+        );
+    }
+
+    #[tokio::test]
+    async fn a_query_matches_only_with_both_an_association_and_a_stored_state() {
+        let store = emulator_store().await;
+        let partition = Partition::from([7u8; 16]);
+        let address = Address::zero_context_hash(unique_hash());
+        let mut results = [StoreMatchResult::default()];
+
+        store
+            .do_query_batch(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        assert_eq!(results[0].match_made, StoreMatch::MatchNone);
+
+        store.publish_state(address.hash).await.unwrap();
+        store
+            .do_query_batch(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        assert_eq!(
+            results[0].match_made,
+            StoreMatch::MatchNone,
+            "a state with no association is not a match"
+        );
+
+        store.associate_fragment(partition, address).await.unwrap();
+        store
+            .do_query_batch(partition, &[address], &mut results)
+            .await
+            .unwrap();
+        assert_eq!(results[0].match_made, StoreMatch::MatchFull);
+        assert!(results[0].stored_durable);
+    }
+
+    #[tokio::test]
+    async fn an_association_without_a_state_is_not_a_match() {
+        let store = emulator_store().await;
+        let partition = Partition::from([9u8; 16]);
+        let address = Address::zero_context_hash(unique_hash());
+
+        store.associate_fragment(partition, address).await.unwrap();
+        assert!(store.exists(partition, address).await.unwrap());
+
+        let mut results = [StoreMatchResult::default()];
+        store
+            .do_query_batch(partition, &[address], &mut results)
+            .await
+            .unwrap();
+
+        assert_eq!(results[0].match_made, StoreMatch::MatchNone);
+    }
+
+    #[tokio::test]
+    async fn an_association_is_gone_once_deleted() {
+        let store = emulator_store().await;
+        let partition = Partition::from([11u8; 16]);
+        let address = Address {
+            hash: unique_hash(),
+            context: Context::from([5u8; 16]),
+        };
+
+        store.associate_fragment(partition, address).await.unwrap();
+        assert!(store.exists(partition, address).await.unwrap());
+
+        store.delete_association(partition, address).await.unwrap();
+        assert!(!store.exists(partition, address).await.unwrap());
+    }
+}

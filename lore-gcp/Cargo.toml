@@ -57,3 +57,5 @@ uuid = { workspace = true }
 
 [features]
 default = []
+# Tests that need the Firestore emulator from lore-integration-tests/compose.yaml.
+integration_tests = []

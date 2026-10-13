@@ -23,6 +23,13 @@ services:
       - AWS_SECRET_ACCESS_KEY=lorelocal
       - AWS_REGION=us-east-1
     command: "-jar DynamoDBLocal.jar -port 9090 -inMemory -sharedDb"
+  firestore:
+    image: gcr.io/google.com/cloudsdktool/google-cloud-cli:emulators
+    ports:
+      - "8787:8787"
+    # The emulator binds the host it is told to and nothing else, so it has to be
+    # 0.0.0.0 to be reachable from outside the container.
+    command: gcloud emulators firestore start --host-port=0.0.0.0:8787
   consul-server:
     image: hashicorp/consul:latest
     container_name: consul-server
