@@ -301,6 +301,10 @@ pub struct FirestoreImmutableStoreSettings {
     pub timeout_millis: u64,
     /// Caps how many `fragment_state` writes (`publish_state`/`advance_state`) run at once.
     pub write_concurrency_limit: usize,
+    /// Caps how many Firestore calls outside that write path run at once. Disjoint from
+    /// `write_concurrency_limit`, so the store's ceiling on concurrent Firestore calls is the sum
+    /// of the two.
+    pub read_concurrency_limit: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -358,6 +362,7 @@ pub struct GcpImmutableStore {
     firestore_timeout: Duration,
     firestore_slow_threshold: Duration,
     firestore_write_semaphore: Arc<Semaphore>,
+    firestore_read_semaphore: Arc<Semaphore>,
     obliteration_drain: Duration,
     latency_histogram: Histogram<f64>,
     labels_get: LabelArray,
@@ -410,6 +415,9 @@ impl GcpImmutableStore {
             firestore_write_semaphore: Arc::new(Semaphore::new(
                 settings.firestore.write_concurrency_limit.max(1),
             )),
+            firestore_read_semaphore: Arc::new(Semaphore::new(
+                settings.firestore.read_concurrency_limit.max(1),
+            )),
             obliteration_drain: Duration::from_millis(
                 settings
                     .firestore
@@ -429,8 +437,12 @@ impl GcpImmutableStore {
     }
 
     /// Run a Firestore future, bounded by this store's configured Firestore timeout/slow
-    /// threshold, and classify its error as a `StoreError` (retryable failures become
-    /// [`StoreError::SlowDown`]; see [`crate::clients::is_firestore_retryable`]).
+    /// threshold and by `read_concurrency_limit`, and classify its error as a `StoreError`
+    /// (retryable failures become [`StoreError::SlowDown`]; see
+    /// [`crate::clients::is_firestore_retryable`]).
+    ///
+    /// The permit is taken inside the timeout, so a caller that cannot get one in
+    /// `timeout_millis` is told to retry rather than queued indefinitely.
     async fn firestore_op<T>(
         &self,
         op: &'static str,
@@ -440,7 +452,14 @@ impl GcpImmutableStore {
             self.firestore_timeout,
             self.firestore_slow_threshold,
             op,
-            fut,
+            async {
+                let _permit = self
+                    .firestore_read_semaphore
+                    .acquire()
+                    .await
+                    .expect("semaphore is never closed");
+                fut.await
+            },
         )
         .await?
         .map_err(GcpError::firestore)
@@ -517,6 +536,12 @@ impl GcpImmutableStore {
             self.firestore_slow_threshold,
             "fragment_associations.batch_get",
             async {
+                let _permit = self
+                    .firestore_read_semaphore
+                    .acquire()
+                    .await
+                    .expect("semaphore is never closed");
+
                 let mut stream = self
                     .db
                     .fluent()
@@ -1777,6 +1802,9 @@ mod tests {
 /// reach for a service that is not running.
 #[cfg(all(test, feature = "integration_tests"))]
 mod emulator_tests {
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering as AtomicOrdering;
+
     use super::*;
 
     /// The project the emulator serves. It accepts any id.
@@ -1802,6 +1830,10 @@ mod emulator_tests {
     /// A store whose Firestore half talks to the emulator, under collections unique to this
     /// store so tests sharing one emulator cannot see each other's documents.
     async fn emulator_store() -> GcpImmutableStore {
+        emulator_store_with_read_limit(64).await
+    }
+
+    async fn emulator_store_with_read_limit(read_concurrency_limit: usize) -> GcpImmutableStore {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let settings = GcpImmutableStoreSettings::new(
             GcsStoreSettings {
@@ -1818,6 +1850,7 @@ mod emulator_tests {
                 slow_operation_threshold_millis: 2_000,
                 timeout_millis: 30_000,
                 write_concurrency_limit: 32,
+                read_concurrency_limit,
             },
             false,
         );
@@ -1854,6 +1887,34 @@ mod emulator_tests {
             result = store.publish_state(hash).await;
         }
         result
+    }
+
+    /// Runs `op` through `firestore_op`, counting how many run at once. The body is the test's
+    /// own, so this measures the gate rather than anything Firestore does.
+    async fn count_concurrent_firestore_ops(
+        store: &GcpImmutableStore,
+        calls: usize,
+    ) -> (usize, usize) {
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+
+        let ops = (0..calls).map(|_| {
+            let inflight = inflight.clone();
+            let peak = peak.clone();
+            store.firestore_op("test.concurrency_probe", async move {
+                let now = inflight.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                peak.fetch_max(now, AtomicOrdering::SeqCst);
+                for _ in 0..8 {
+                    tokio::task::yield_now().await;
+                }
+                inflight.fetch_sub(1, AtomicOrdering::SeqCst);
+                Ok::<(), firestore::errors::FirestoreError>(())
+            })
+        });
+
+        let results = futures::future::join_all(ops).await;
+        let completed = results.into_iter().filter(Result::is_ok).count();
+        (completed, peak.load(AtomicOrdering::SeqCst))
     }
 
     /// A hash no other test uses, so tests may share a collection without colliding.
@@ -2017,5 +2078,27 @@ mod emulator_tests {
 
         store.delete_association(partition, address).await.unwrap();
         assert!(!store.exists(partition, address).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn firestore_reads_run_no_more_than_the_read_concurrency_limit_at_once() {
+        let store = emulator_store_with_read_limit(4).await;
+
+        let (completed, peak) = count_concurrent_firestore_ops(&store, 64).await;
+
+        assert_eq!(completed, 64);
+        assert_eq!(peak, 4);
+    }
+
+    /// The limit is a floor as well as a ceiling: a store configured for more concurrency than it
+    /// is asked for must not serialise the calls it does get.
+    #[tokio::test]
+    async fn firestore_reads_below_the_read_concurrency_limit_all_run_together() {
+        let store = emulator_store_with_read_limit(64).await;
+
+        let (completed, peak) = count_concurrent_firestore_ops(&store, 16).await;
+
+        assert_eq!(completed, 16);
+        assert_eq!(peak, 16);
     }
 }
