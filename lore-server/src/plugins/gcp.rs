@@ -120,6 +120,11 @@ pub struct GcpImmutableStorePluginConfig {
     /// `FirestoreImmutableStoreSettings::write_concurrency_limit`).
     #[serde(default = "default_firestore_write_concurrency_limit")]
     pub firestore_write_concurrency_limit: usize,
+
+    /// Caps how many Firestore calls outside that write path run at once (see
+    /// `FirestoreImmutableStoreSettings::read_concurrency_limit`).
+    #[serde(default = "default_firestore_read_concurrency_limit")]
+    pub firestore_read_concurrency_limit: usize,
 }
 
 /// Configuration for the GCP mutable store plugin.
@@ -185,6 +190,15 @@ fn default_firestore_timeout() -> u64 {
 
 fn default_firestore_write_concurrency_limit() -> usize {
     32
+}
+
+/// Read concurrency is bounded for a different reason than write concurrency: not Firestore
+/// document contention but the single HTTP/2 connection every call shares, whose server-advertised
+/// stream budget is 100. Past it the surplus calls queue inside the transport, and Firestore
+/// eventually sheds the connection with a `GOAWAY` instead. 64 leaves room for the 32 concurrent
+/// writes `default_firestore_write_concurrency_limit` allows alongside them.
+fn default_firestore_read_concurrency_limit() -> usize {
+    64
 }
 
 // =============================================================================
@@ -300,6 +314,7 @@ impl ImmutableStorePluginFactory for GcpImmutableStorePluginFactory {
                 .firestore_slow_operation_threshold_millis,
             timeout_millis: plugin_config.firestore_timeout_millis,
             write_concurrency_limit: plugin_config.firestore_write_concurrency_limit,
+            read_concurrency_limit: plugin_config.firestore_read_concurrency_limit,
         };
 
         let store_settings = GcpImmutableStoreSettings::new(
@@ -490,6 +505,8 @@ mod tests {
             firestore_slow_operation_threshold_millis = 500
             timeout_millis = 3000
             firestore_timeout_millis = 15000
+            firestore_write_concurrency_limit = 8
+            firestore_read_concurrency_limit = 16
             force_write = true
         "#;
 
@@ -513,6 +530,8 @@ mod tests {
         assert_eq!(plugin_config.firestore_slow_operation_threshold_millis, 500);
         assert_eq!(plugin_config.timeout_millis, 3000);
         assert_eq!(plugin_config.firestore_timeout_millis, 15000);
+        assert_eq!(plugin_config.firestore_write_concurrency_limit, 8);
+        assert_eq!(plugin_config.firestore_read_concurrency_limit, 16);
         assert!(plugin_config.force_write);
     }
 
@@ -546,6 +565,8 @@ mod tests {
         );
         assert_eq!(plugin_config.timeout_millis, 5000);
         assert_eq!(plugin_config.firestore_timeout_millis, 30000);
+        assert_eq!(plugin_config.firestore_write_concurrency_limit, 32);
+        assert_eq!(plugin_config.firestore_read_concurrency_limit, 64);
         assert!(!plugin_config.force_write);
     }
 
