@@ -436,6 +436,16 @@ impl GcpImmutableStore {
         }
     }
 
+    /// A permit from the `read_concurrency_limit` gate, held for as long as the Firestore call
+    /// it guards. Every Firestore call outside the `fragment_state` write path takes one, inside
+    /// the timeout that bounds the call.
+    async fn firestore_read_permit(&self) -> tokio::sync::SemaphorePermit<'_> {
+        self.firestore_read_semaphore
+            .acquire()
+            .await
+            .expect("semaphore is never closed")
+    }
+
     /// Run a Firestore future, bounded by this store's configured Firestore timeout/slow
     /// threshold and by `read_concurrency_limit`, and classify its error as a `StoreError`
     /// (retryable failures become [`StoreError::SlowDown`]; see
@@ -453,11 +463,7 @@ impl GcpImmutableStore {
             self.firestore_slow_threshold,
             op,
             async {
-                let _permit = self
-                    .firestore_read_semaphore
-                    .acquire()
-                    .await
-                    .expect("semaphore is never closed");
+                let _permit = self.firestore_read_permit().await;
                 fut.await
             },
         )
@@ -536,11 +542,7 @@ impl GcpImmutableStore {
             self.firestore_slow_threshold,
             "fragment_associations.batch_get",
             async {
-                let _permit = self
-                    .firestore_read_semaphore
-                    .acquire()
-                    .await
-                    .expect("semaphore is never closed");
+                let _permit = self.firestore_read_permit().await;
 
                 let mut stream = self
                     .db
@@ -714,6 +716,8 @@ impl GcpImmutableStore {
             self.firestore_slow_threshold,
             "fragment_state.batch_get",
             async {
+                let _permit = self.firestore_read_permit().await;
+
                 let mut stream = self
                     .db
                     .fluent()
