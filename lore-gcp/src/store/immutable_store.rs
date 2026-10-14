@@ -1498,11 +1498,30 @@ impl ImmutableStoreTrait for GcpImmutableStore {
     ) -> Result<StoreGetData, StoreError> {
         let result: Result<(Fragment, Bytes), StoreError> =
             timed!(self.latency_histogram, &self.labels_get, {
-                if !self.exists(partition, address).await? {
+                // Both run concurrently; the loop breaks as soon as the association check
+                // resolves, stashing the payload if it arrived first.
+                let exists_fut = self.exists(partition, address);
+                let load_fut = self.load(address.hash);
+                tokio::pin!(exists_fut, load_fut);
+
+                let mut load_result = None;
+                let exists_result = loop {
+                    tokio::select! {
+                        result = &mut exists_fut => break result,
+                        result = &mut load_fut, if load_result.is_none() => {
+                            load_result = Some(result);
+                        }
+                    }
+                };
+                // An early return here drops `load_fut`, cancelling the GCS read.
+                if !exists_result? {
                     return Err(StoreError::from(AddressNotFound::from(address)));
                 }
 
-                let load_result = self.load(address.hash).await;
+                let load_result = match load_result {
+                    Some(result) => result,
+                    None => load_fut.await,
+                };
                 if load_result
                     .as_ref()
                     .err()
