@@ -218,10 +218,18 @@ pub async fn bounded<T>(
 /// timeout `bounded` in this module enforces on every call: this classifies a failure the
 /// *server* already returned, including one where the server gave up on its own deadline;
 /// `bounded` instead bounds calls that never returned at all.)
+///
+/// `INTERNAL` is read the same way, and for the same reason. A transport-level failure mid-call —
+/// Firestore sending an HTTP/2 `GOAWAY` to shed load, say — reaches `firestore-0.47.1` as a
+/// `tonic::Status` rather than a `NetworkError`, so it lands in that same `retry_possible = false`
+/// catch-all with `public.code == "Internal"`. Google's own Firestore clients retry that status on
+/// reads alongside `UNAVAILABLE` and `DEADLINE_EXCEEDED`.
 pub(crate) fn is_firestore_retryable(error: &firestore::errors::FirestoreError) -> bool {
     use firestore::errors::FirestoreError;
     match error {
-        FirestoreError::DatabaseError(e) => e.retry_possible || e.public.code == "DeadlineExceeded",
+        FirestoreError::DatabaseError(e) => {
+            e.retry_possible || matches!(e.public.code.as_str(), "DeadlineExceeded" | "Internal")
+        }
         FirestoreError::NetworkError(_) => true,
         _ => false,
     }
@@ -252,6 +260,26 @@ mod tests {
         let error = FirestoreError::DatabaseError(FirestoreDatabaseError::new(
             FirestoreErrorPublicGenericDetails::new("DeadlineExceeded".to_string()),
             "Status { code: DeadlineExceeded, message: \"\" }".to_string(),
+            false,
+        ));
+
+        assert!(is_firestore_retryable(&error));
+    }
+
+    /// Firestore shedding the HTTP/2 connection mid-read, which `firestore-0.47.1` reports as a
+    /// permanent `Internal` database error.
+    #[test]
+    fn internal_from_a_transport_goaway_is_retryable() {
+        use firestore::errors::FirestoreDatabaseError;
+        use firestore::errors::FirestoreError;
+        use firestore::errors::FirestoreErrorPublicGenericDetails;
+
+        let error = FirestoreError::DatabaseError(FirestoreDatabaseError::new(
+            FirestoreErrorPublicGenericDetails::new("Internal".to_string()),
+            "code: 'Internal error', message: \"h2 protocol error: http2 error\", source: \
+             tonic::transport::Error(Transport, hyper::Error(Http2, Error { kind: \
+             GoAway(b\"load_shed\", NO_ERROR, Remote) }))"
+                .to_string(),
             false,
         ));
 
