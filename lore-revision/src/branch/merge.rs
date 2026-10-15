@@ -30,7 +30,6 @@ use crate::find;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::with_operation;
-use crate::infer;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreEvent;
@@ -2926,7 +2925,7 @@ async fn merge_abort_ignore_links(
             .await
             .forward::<MergeError>("deserializing current and staged state")?;
 
-        state_current.set_parent_self(state_current.revision());
+        state_current.reparent_onto(state_current.revision());
 
         for r in &resolved {
             // Re-read the link reference from the post-abort state to find
@@ -3532,10 +3531,12 @@ async fn resolve_single_file(
         return Ok(());
     }
 
-    // Check if the file still has conflict markers
-    if infer::infer_is_conflicted(&operation.content_source(&relative_path))
+    if operation
+        .infer_is_conflicted(&relative_path)
         .await
-        .unwrap_or(false)
+        .forward_with::<MergeError, _>(|| {
+            format!("checking {relative_path} for conflict markers")
+        })?
     {
         lore_warn!(
             "Cannot resolve path with conflict markers still present: {}",
@@ -4247,9 +4248,13 @@ async fn merge_into_link(
             .forward::<MergeError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state_new.clone())
-        .await
-        .forward::<MergeError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        state_new.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<MergeError>("weaving history")?;
 
     let signature = state_new
         .serialize(repository.clone(), token)
@@ -4600,9 +4605,13 @@ pub async fn merge_into(
             .forward::<MergeError>("serializing metadata")?,
     );
 
-    commit::weave_history(repository.clone(), state_new.clone())
-        .await
-        .forward::<MergeError>("weaving history")?;
+    commit::weave_history(
+        repository.clone(),
+        state_new.clone(),
+        commit::BasedOn::FirstParent,
+    )
+    .await
+    .forward::<MergeError>("weaving history")?;
 
     let signature = state_new
         .serialize(repository.clone(), token)

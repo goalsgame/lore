@@ -5,12 +5,11 @@ use serde::Serialize;
 use crate::interface::LoreString;
 
 pub mod login;
-pub mod mode;
 pub mod userinfo;
 
-pub use mode::AuthMode;
-pub use mode::AuthPath;
-pub use mode::UnknownAuthMode;
+pub use lore_transport::auth::AuthMode;
+pub use lore_transport::auth::AuthPath;
+pub use lore_transport::auth::UnknownAuthMode;
 
 /////////////////////////////////
 // General Notes for Auth token handling
@@ -31,6 +30,9 @@ pub use mode::UnknownAuthMode;
 pub struct LoreAuthUrlEventData {
     /// Authentication URL
     pub url: LoreString,
+    /// Code the user enters or confirms at `url`. Empty when the login
+    /// doesn't ask for one.
+    pub user_code: LoreString,
 }
 
 /// Event data for one wait in an interactive login: the user has not

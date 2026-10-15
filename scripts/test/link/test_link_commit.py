@@ -2,12 +2,13 @@
 # SPDX-License-Identifier: MIT
 import os
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 from error_types import NotALinkError, NothingStagedError
 from link_helpers import make_parent_with_link, make_repo
-from lore_parsers import parse_commit_stats_json
+from lore_parsers import parse_commit_stats_json, parse_status_json
 from service_util import LORE_SERVICE_ENVIRONMENT, SERVICE_UNAVAILABLE
 
 from lore import Lore
@@ -102,6 +103,67 @@ def test_link_unchanged_commit(new_lore_repo):
 
     assert "Before committing link node" not in commit_output, (
         "Expected link unchanged message after link content was modified"
+    )
+
+
+@pytest.mark.smoke
+def test_link_commit_records_no_time_a_later_write_could_share(new_lore_repo):
+    """A file committed through a link while its time is in the commit's clock tick, saved again
+    after the commit at the same size and time, is reported by the next status: the commit
+    recorded no time a later write could share. One committed with an older time has it
+    recorded: saved again the same way, the status answers for it by that time."""
+    link_repo: Lore = new_lore_repo()
+    with link_repo.open_file("link-file.txt", "w+") as f:
+        f.write("initial link content\n")
+    with link_repo.open_file("older.txt", "w+") as f:
+        f.write("initial older content\n")
+    link_repo.stage(scan=True)
+    link_repo.commit("Initial link commit")
+    link_repo.push()
+
+    urc: Lore = new_lore_repo()
+    with urc.open_file("main-file.txt", "w+") as f:
+        f.write("initial main content\n")
+    urc.stage(scan=True)
+    urc.commit("Initial main commit")
+    urc.push()
+
+    link_path = "linked"
+    urc.link_add(link_path, link_repo.get_id(), "/")
+    urc.commit("Add link")
+    urc.push()
+
+    linked_file = os.path.join(link_path, "link-file.txt")
+    host_file = os.path.join(urc.path, linked_file)
+    older_file = os.path.join(link_path, "older.txt")
+    older_host = os.path.join(urc.path, older_file)
+    tick = time.time() + 3600
+    older = time.time() - 3600
+    with urc.open_file(linked_file, "w") as f:
+        f.write("saved: one\n")
+    os.utime(host_file, (tick, tick))
+    with urc.open_file(older_file, "w") as f:
+        f.write("older: one\n")
+    os.utime(older_host, (older, older))
+    urc.stage(scan=True)
+    urc.commit("Link update", non_interactive=True)
+
+    with urc.open_file(linked_file, "w") as f:
+        f.write("saved: two\n")
+    os.utime(host_file, (tick, tick))
+    with urc.open_file(older_file, "w") as f:
+        f.write("older: two\n")
+    os.utime(older_host, (older, older))
+
+    reported = [
+        entry["path"]
+        for entry in parse_status_json(urc.status(json=True, unstaged=True, scan=True))
+    ]
+    assert not any(path.endswith("older.txt") for path in reported), (
+        f"the commit recorded no time for the file older than its clock: {reported}"
+    )
+    assert any(path.endswith("link-file.txt") for path in reported), (
+        f"the save after the commit is not reported: {reported}"
     )
 
 
@@ -361,6 +423,50 @@ def test_link_commit_partial_link_messages(new_lore_repo):
     assert b_info.message == "Main fallback message", (
         f"Expected 'Main fallback message', got '{b_info.message}'"
     )
+
+
+@pytest.mark.smoke
+def test_link_commit_on_a_pin_that_is_a_merge_has_the_pin_as_its_only_parent(
+    new_lore_repo,
+):
+    """A change committed through a link pinned at a merge revision is a revision on top of the
+    pin. The pin's own second parent is not carried onto it, so it is not a merge."""
+    link_path = "linked/repo"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"a.txt": "a\n", "b.txt": "b\n"}, {"p.txt": "p\n"}
+    )
+
+    link_repo.branch_create("side")
+    with link_repo.open_file("b.txt", "w") as f:
+        f.write("side\n")
+    link_repo.stage("b.txt")
+    link_repo.commit("Side change")
+    link_repo.push()
+    link_repo.branch_switch("main")
+    with link_repo.open_file("a.txt", "w") as f:
+        f.write("main\n")
+    link_repo.stage("a.txt")
+    link_repo.commit("Main change")
+    link_repo.push()
+    link_repo.branch_merge("side", message="Merge side")
+    link_repo.push()
+    pin = link_repo.revision_info().signature
+
+    urc.link_update(link_path)
+    urc.commit("Repin the link", non_interactive=True)
+    urc.push()
+
+    with urc.open_file(f"{link_path}/a.txt", "w") as f:
+        f.write("edited through the mount\n")
+    urc.stage(f"{link_path}/a.txt")
+    urc.commit("Edit through the link", non_interactive=True)
+    urc.push()
+
+    link_repo.sync()
+    committed = link_repo.revision_info()
+    assert committed.message == "Edit through the link"
+    assert committed.merge == ""
+    assert committed.parent == pin
 
 
 @pytest.mark.smoke

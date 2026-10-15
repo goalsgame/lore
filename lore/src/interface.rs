@@ -390,7 +390,7 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 #[unsafe(no_mangle)]
@@ -423,7 +423,7 @@ pub extern "C" fn lore_auth_login_interactive(
 ///
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
-/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+/// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 #[unsafe(no_mangle)]
@@ -3999,6 +3999,12 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 
 /// Clone a remote repository to a local path.
 ///
+/// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+/// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+/// its files caches every file metadata block of the cloned revision, which staging and committing
+/// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+/// and reads them from the remote when a call needs them.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -4020,7 +4026,7 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -4059,7 +4065,7 @@ pub extern "C" fn lore_repository_clone(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 /// | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+/// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 /// | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 /// | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 /// | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |

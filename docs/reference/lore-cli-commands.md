@@ -230,7 +230,7 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--identity-token <token>` — Use given authentication token instead of one from the secure store. Acts as the identity
   the token was issued to
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service
-* `--max-connections <MAX_CONNECTIONS>` — Set maximum number of parallel connections
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
@@ -358,6 +358,11 @@ Create a repository in the given directory
 ## `lore repository clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
+instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -2099,6 +2104,11 @@ are persisted so subsequent `lore stage` / `lore status` calls see an accurate p
 ## `lore clone`
 
 Clone a remote repository into the given path
+
+A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
+instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
+writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 

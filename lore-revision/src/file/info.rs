@@ -270,7 +270,9 @@ async fn info_path(
 
         if filtered {
             // We will be iterating the tree, cache the state fragments
-            let _ = state_current.cache_fragments(repository.clone()).await;
+            let _ = state_current
+                .cache_fragments(repository.clone(), false)
+                .await;
         }
 
         lore_debug!("Info local {local} and filtered {filtered}");
@@ -421,7 +423,13 @@ async fn compare_to_node(
     let local_hash = match comparison {
         NodeComparison::Matches => node.address.hash,
         NodeComparison::Differs => {
-            immutable::hash_file(repository.clone(), &operation.content_source(relative_path))
+            let source = operation
+                .content_source(relative_path)
+                .await
+                .forward_with::<InfoError, _>(|| {
+                    format!("naming the content of local file {relative_path}")
+                })?;
+            immutable::hash_file(repository.clone(), &source)
                 .await
                 .forward_with::<InfoError, _>(|| {
                     format!("Failed to hash local file: {relative_path}")

@@ -1,8 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+mod file_failure_tests;
 mod operation_tests;
 mod statistics_level_tests;
 mod walk_tests;
+mod weave_tests;
 
 use lore_base::error::NotALayer;
 use lore_revision::commit::*;

@@ -332,7 +332,7 @@ def test_commit(new_lore_repo):
 
 ### Running with uv
 
-Tests require Python 3.13+. Use `uv` to manage dependencies and run tests:
+Tests require Python 3.13 or 3.14. Use `uv` to manage dependencies and run tests:
 
 ```bash
 # Install dependencies
@@ -361,6 +361,25 @@ uv run pytest scripts/test/ --disable-local-server --lore-remote-url=lore://host
 | `--disable-local-server` | `false` | Use external server |
 | `--disable-auto-server` | `false` | Don't auto start the server |
 | `--keep-test-data` | `false` | Leave repositories, stores and server roots on disk |
+| `--swfs` | `false` | Run the tests that mount through SWFS |
+
+### Running the SWFS tests
+
+`test_swfs.py` skips its mounting tests unless `--swfs` says to run them,
+because two of their preconditions are arranged outside the harness and neither
+is visible from it:
+
+1. A client built with the `swfs` feature, which links the SWFS library named by
+   `SWFS_LIB_DIR`: `cargo build --release -p lore-client --features swfs`. The
+   binary reports no feature list, so nothing can ask it whether it has one.
+2. The `epicvfs` filesystem driver loaded. It installs from `EpicVFS.exe` and is
+   demand-start, and the SWFS library starts it through the service control
+   manager, which takes an elevated session — `sc query epicvfs` reporting
+   `STOPPED` means the next mount will try and fail.
+
+Without the driver a mount does not fail, it hangs: the SWFS library parks the
+service process, so the client relaying to it blocks until the per-test timeout
+kills the worker. That is what `--swfs` defaulting off avoids.
 
 ### Running every test through one service
 

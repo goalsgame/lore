@@ -99,6 +99,10 @@ pub struct ReadOptions {
     pub decompress: bool,
     /// Verify data
     pub verify: bool,
+    /// Skip the hash check [`read_raw`](crate::read::read_raw) makes under debug assertions on a
+    /// local load that is not verified. Meaningful only with `verify` off, as
+    /// [`trusting_local`](Self::trusting_local) sets it.
+    pub trust_local: bool,
     /// Probe the local store before falling through to remote. Setting this to `false` makes
     /// reads bypass the local store entirely; combined with `remote: true` and a session, the
     /// reader always fetches from the peer. Used by handles bound to remote-only mode.
@@ -113,6 +117,10 @@ pub struct ReadOptions {
     pub sync_data: bool,
     /// Priority read hint for stream scheduling (metadata/tree blocks)
     pub priority: bool,
+    /// A local miss answers `AddressNotFound` at once: the load never waits on another task's
+    /// store or fetch of the address, and never reaches the remote itself. The local probe still
+    /// takes the store's own locks.
+    pub never_wait: bool,
     /// Refuse to read if the fragment's declared `size_content` exceeds this
     /// cap. `None` means "no cap" (existing behavior). Callers that know the
     /// maximum legitimate blob size for the data they are reading should set
@@ -126,12 +134,14 @@ impl Default for ReadOptions {
         ReadOptions {
             decompress: true,
             verify: true,
+            trust_local: false,
             local: true,
             remote: true,
             cache: false,
             direct_write: false,
             sync_data: false,
             priority: false,
+            never_wait: false,
             max_content_size: None,
         }
     }
@@ -155,6 +165,13 @@ impl ReadOptions {
 
     pub fn no_verify(mut self) -> Self {
         self.verify = false;
+        self
+    }
+
+    /// Serve local bytes unhashed, under debug assertions too. See [`ReadOptions::trust_local`].
+    pub fn trusting_local(mut self) -> Self {
+        self.verify = false;
+        self.trust_local = true;
         self
     }
 
@@ -200,6 +217,12 @@ impl ReadOptions {
 
     pub fn with_priority(mut self) -> Self {
         self.priority = true;
+        self
+    }
+
+    /// See [`ReadOptions::never_wait`].
+    pub fn never_wait(mut self) -> Self {
+        self.never_wait = true;
         self
     }
 

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 use std::future::Future;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
 use lore_base::error::Disconnected;
@@ -22,7 +24,7 @@ use lore_transport::StorageSession;
 
 /// A context carrying the given remote state, on in-memory stores so
 /// everything but the remote is valid.
-async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
+pub(super) async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
     let (immutable, mutable) = lore_revision::repository::create_client_memory_stores()
         .await
         .expect("in-memory stores should be creatable");
@@ -41,7 +43,7 @@ async fn context_with_state(state: RemoteState) -> Arc<RepositoryContext> {
 /// Build and run the future `body` returns under an execution context, which is where the
 /// correlation id a session is attributed to comes from. The future is built inside the
 /// context, as a wrapper resolves its session when built.
-async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
+pub(super) async fn under_execution_context<F: Future>(body: impl FnOnce() -> F) -> F::Output {
     let execution = Arc::new(ExecutionContext::new_client(
         LoreGlobalArgs::default(),
         EventDispatcher::no_dispatch(),
@@ -60,34 +62,61 @@ fn absent_address() -> Address {
     }
 }
 
-/// A pool for the context to hold, with the strong reference left to the caller
-/// and the one session in it to compare a pick against. That session is never
-/// resolved: the test asks which pool answered, not what it yields.
-fn held_pool() -> (Arc<lore_transport::SessionPool>, Arc<StorageSession>) {
+/// A pool for the context to hold, with the strong reference left to the caller. Its one
+/// session is never resolved: the test asks which pool answered, not what it yields.
+fn held_pool() -> Arc<lore_transport::SessionPool> {
     let session = Arc::new(StorageSession::pending(|| async {
         Err(ProtocolError::internal(
             "a pooled session this test never resolves",
         ))
     }));
-    (
-        Arc::new(lore_transport::SessionPool::new(vec![session.clone()])),
-        session,
-    )
+    Arc::new(lore_transport::SessionPool::new(vec![session]))
 }
 
-/// What a read or write ends up using comes from the pool the context holds.
-/// This context's connect has failed, so reaching the pool at all is proof the
-/// session was not looked up through the connection per call.
+/// A session that counts how often it is resolved, and fails: the test asks which session
+/// answered, not what it yields.
+pub(super) fn counting_session(resolutions: Arc<AtomicUsize>) -> Arc<StorageSession> {
+    Arc::new(StorageSession::pending(move || {
+        let resolutions = resolutions.clone();
+        async move {
+            resolutions.fetch_add(1, Ordering::Relaxed);
+            Err(ProtocolError::internal(
+                "a pooled session this test never resolves",
+            ))
+        }
+    }))
+}
+
+/// What a read or write ends up using comes from the pool the context holds, one session of
+/// it per operation, so a command's reads spread over every connection the pool spans. This
+/// context's connect has failed, so reaching the pool at all is proof the session was not
+/// looked up through the connection per call.
 #[tokio::test]
-async fn a_pooled_session_comes_from_the_pool_the_context_holds() {
+async fn a_pooled_session_takes_turns_over_the_pool_the_context_holds() {
     let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
-    let (pool, pooled) = held_pool();
+    let first = Arc::new(AtomicUsize::new(0));
+    let second = Arc::new(AtomicUsize::new(0));
+    let pool = Arc::new(lore_transport::SessionPool::new(vec![
+        counting_session(first.clone()),
+        counting_session(second.clone()),
+    ]));
     context.set_session_pool(&pool);
 
     let session = pooled_session(&context, "correlation")
         .await
         .expect("the pool the context holds answers, remote or no remote");
-    assert!(Arc::ptr_eq(&session, &pooled));
+    for _ in 0..4 {
+        assert!(session.get(&absent_address()).await.is_err());
+    }
+
+    assert_eq!(
+        (
+            first.load(Ordering::Relaxed),
+            second.load(Ordering::Relaxed)
+        ),
+        (1, 1),
+        "each session of the pool is reached and resolved once"
+    );
 }
 
 /// A context with no remote has nothing a session could resolve to, so the
@@ -175,7 +204,7 @@ async fn a_miss_on_an_offline_context_reports_the_address_not_found() {
 #[tokio::test]
 async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
     let context = context_with_state(RemoteState::Failed(ProtocolError::from(Disconnected))).await;
-    let (pool, _pooled) = held_pool();
+    let pool = held_pool();
     context.set_session_pool(&pool);
 
     let err =
@@ -183,4 +212,33 @@ async fn a_read_handed_the_last_context_reference_reaches_the_pool() {
             .await
             .expect_err("the pooled session never resolves");
     assert!(!err.is_address_not_found(), "reported {err:?}");
+}
+
+/// A context trusting local bytes reads with options that serve them unchecked; any other verifies
+/// them.
+#[tokio::test]
+async fn reads_trust_local_bytes_where_the_context_does() {
+    let context = context_with_state(RemoteState::Offline).await;
+    let verifying = read_options_from_repository(&context);
+    assert!(verifying.verify && !verifying.trust_local);
+
+    context.set_trust_local(true);
+    let trusting = read_options_from_repository(&context);
+    assert!(!trusting.verify && trusting.trust_local);
+}
+
+/// Trusting local bytes comes along with the context's other runtime settings, cloned or copied.
+#[test]
+fn trusting_local_bytes_is_copied_with_the_runtime_settings() {
+    use std::sync::atomic::Ordering;
+
+    use lore_revision::repository::RepositoryRuntimeSettings;
+
+    let trusting = RepositoryRuntimeSettings::default();
+    trusting.trust_local.store(true, Ordering::Relaxed);
+    assert!(trusting.clone().trust_local.load(Ordering::Relaxed));
+
+    let mut copied = RepositoryRuntimeSettings::default();
+    copied.clone_from(&trusting);
+    assert!(copied.trust_local.load(Ordering::Relaxed));
 }
