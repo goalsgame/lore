@@ -23,6 +23,18 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      # The GOALS fork merges upstream, which brings in commits authored by Epic
+      # under no sign-off obligation to this repository. Fetching upstream lets
+      # the check below exclude them by reachability rather than by author.
+      - name: Fetch upstream for the exemption below
+        env:
+          UPSTREAM_URL: https://github.com/EpicGames/lore.git
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null || \
+            git remote set-url upstream "$UPSTREAM_URL"
+          git fetch --no-tags --quiet upstream '+refs/heads/*:refs/remotes/upstream/*'
+
       - name: Check DCO sign-off
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -32,7 +44,10 @@ jobs:
           set -euo pipefail
 
           # --no-merges drops PR merge commits; they aren't authored by the contributor.
-          commits=$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA")
+          # --not --remotes=upstream drops everything that already exists upstream, so a
+          # merge of upstream is checked on what this fork adds and nothing else. By
+          # reachability, not by author: an Epic address committing here still signs off.
+          commits=$(git rev-list --no-merges "$BASE_SHA".."$HEAD_SHA" --not --remotes=upstream)
 
           if [ -z "$commits" ]; then
             echo "No non-merge commits to check." | tee -a "$GITHUB_STEP_SUMMARY"
@@ -89,7 +104,7 @@ jobs:
             echo ""
             echo "Verifies every commit in this PR carries a \`Signed-off-by\` line"
             echo "matching its author, certifying the [Developer Certificate of Origin]($DCO_DOC)."
-            echo "Merge commits and bot authors are exempt."
+            echo "Merge commits, bot authors, and commits already upstream are exempt."
             echo ""
             echo "Passed: $pass · Skipped (bots): $skip · Failed: $fail"
           } >> "$GITHUB_STEP_SUMMARY"
