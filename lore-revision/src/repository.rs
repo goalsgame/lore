@@ -392,6 +392,9 @@ pub struct RepositoryRuntimeSettings {
     pub disable_cache: AtomicBool,
     /// Write directly to target file instead of write to temporary file + move
     pub direct_file_write: AtomicBool,
+    /// Serve local fragments unhashed in read options from the repository; remote payloads are
+    /// checked regardless
+    pub trust_local: AtomicBool,
 }
 
 impl Default for RepositoryRuntimeSettings {
@@ -400,6 +403,7 @@ impl Default for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(true),
             disable_cache: AtomicBool::new(true),
             direct_file_write: AtomicBool::new(false),
+            trust_local: AtomicBool::new(false),
         }
     }
 }
@@ -410,6 +414,7 @@ impl Clone for RepositoryRuntimeSettings {
             disable_upload: AtomicBool::new(self.disable_upload.load(Ordering::Relaxed)),
             disable_cache: AtomicBool::new(self.disable_cache.load(Ordering::Relaxed)),
             direct_file_write: AtomicBool::new(self.direct_file_write.load(Ordering::Relaxed)),
+            trust_local: AtomicBool::new(self.trust_local.load(Ordering::Relaxed)),
         }
     }
 
@@ -424,6 +429,10 @@ impl Clone for RepositoryRuntimeSettings {
         );
         self.direct_file_write.store(
             source.direct_file_write.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
+        self.trust_local.store(
+            source.trust_local.load(Ordering::Relaxed),
             Ordering::Relaxed,
         );
     }
@@ -594,6 +603,19 @@ impl RepositoryPaths {
     }
 }
 
+/// How a repository is mounted into the working tree of the one that names it.
+///
+/// A mount is one or the other, never both: a link is recorded in the parent's
+/// revision and a layer only in its local configuration, so the two reach a
+/// repository by different routes and a context arrives by exactly one of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MountKind {
+    /// Recorded in the parent's revision, so it travels with every clone.
+    Link,
+    /// Configured locally, so it is absent from every clone.
+    Layer,
+}
+
 #[lore_macro::test_pub]
 pub struct RepositoryContext {
     /// Working-tree path for this repository. `None` for path-less contexts
@@ -615,11 +637,11 @@ pub struct RepositoryContext {
     /// the requester's authorization.
     link_read: CanReadRepository,
     settings: RepositoryRuntimeSettings,
-    is_link: bool,
-    is_layer: bool,
+    /// How this context was mounted, or `None` where it stands on its own.
+    mount: Option<MountKind>,
     write_token: Option<RepositoryWriteToken>,
     repo_lock: Option<Arc<RepositoryLock>>,
-    /// The storage session pool this repository's reads and writes pick from,
+    /// The storage session pool this repository's reads and writes take sessions from,
     /// resolved on first use.
     ///
     /// Weak on purpose. The strong reference lives in the connection's session
@@ -713,13 +735,67 @@ impl RepositoryContext {
             remote: remote_arc(remote),
             filter,
             settings: RepositoryRuntimeSettings::default(),
-            is_link: false,
-            is_layer: false,
+            mount: None,
             write_token: None,
             repo_lock: None,
             session_pool: Default::default(),
             lazy_session: Default::default(),
             file_system,
+        }
+    }
+
+    /// Every field a context derived from this one carries over unchanged, for a
+    /// deriving constructor to spread and then name only what it changes.
+    ///
+    /// The filter is carried as the same handle, not rebuilt. A diff tells one view from two by
+    /// pointer identity on it, so a fresh handle holding the same rules would leave every diff
+    /// across a mount doing two-view work for a view that has not changed.
+    ///
+    /// The session cells are the exception, starting empty rather than adopting sessions that
+    /// belong to another partition.
+    fn inherited(&self) -> Self {
+        RepositoryContext {
+            link_read: self.link_read.clone(),
+            paths: self.paths.clone(),
+            immutable_store: self.immutable_store.clone(),
+            mutable_store: self.mutable_store.clone(),
+            id: self.id,
+            root_id: self.root_id,
+            instance_id: self.instance_id,
+            remote: self.remote.clone(),
+            filter: self.filter.clone(),
+            settings: self.settings.clone(),
+            mount: self.mount,
+            write_token: self.write_token.as_ref().map(|token| token.share()),
+            repo_lock: self.repo_lock.clone(),
+            session_pool: Default::default(),
+            lazy_session: Default::default(),
+            file_system: self.file_system.clone(),
+        }
+    }
+
+    /// This context aimed at the repository mounted at `id` over `remote`, keeping the working
+    /// tree it is materialized into.
+    ///
+    /// Every path in a working tree is spelled relative to the root this keeps, so the paths a
+    /// walk carries across a mount stay the paths the filesystem, the filter and the
+    /// modified-time keys answer for. A path within the mounted tree is derived from its node
+    /// by [`State::node_path`](crate::state::State::node_path).
+    ///
+    /// Takes the connection already resolved rather than awaiting it here, and its callers await
+    /// inline rather than through a shared `async fn`. Either would nest one future inside
+    /// another, and `to_link_context` is awaited on every link the read paths cross.
+    fn mounted(
+        &self,
+        id: RepositoryId,
+        mount: MountKind,
+        remote: Result<Arc<Connection>, ProtocolError>,
+    ) -> Self {
+        RepositoryContext {
+            id,
+            remote: remote_arc(RemoteState::from_result(remote)),
+            mount: Some(mount),
+            ..self.inherited()
         }
     }
 
@@ -782,6 +858,7 @@ impl RepositoryContext {
     /// propagate the field). Used by `load_and_connect` on the disk-backed
     /// path; other construction paths leave `repo_lock` as `None`.
     #[must_use]
+    #[lore_macro::test_pub]
     pub(crate) fn with_repository_lock(mut self, lock: Arc<RepositoryLock>) -> Self {
         self.repo_lock = Some(lock);
         self
@@ -949,8 +1026,7 @@ impl RepositoryContext {
             remote: remote_arc(RemoteState::Offline),
             filter: Arc::default(),
             settings: RepositoryRuntimeSettings::default(),
-            is_link: false,
-            is_layer: false,
+            mount: None,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
             session_pool: Default::default(),
@@ -960,179 +1036,72 @@ impl RepositoryContext {
 
     pub fn to_server_context(&self, id: RepositoryId) -> Self {
         RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
             id,
             root_id: id,
-            instance_id: self.instance_id,
             remote: remote_arc(RemoteState::Offline),
-            filter: self.filter.clone(),
-            settings: self.settings.clone(),
-            is_link: false,
-            is_layer: false,
+            mount: None,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
             repo_lock: None,
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
+            ..self.inherited()
         }
     }
 
+    /// A server context on the zero repository, for a call that names none.
     pub fn new_null_context(
         immutable_store: Arc<dyn ImmutableStore>,
         mutable_store: Arc<dyn MutableStore>,
     ) -> Self {
-        RepositoryContext {
-            link_read: allow_all_repositories(),
-            file_system: Self::default_filesystem(Path::new("")),
-            paths: None,
-            immutable_store,
-            mutable_store,
-            id: RepositoryId::default(),
-            root_id: RepositoryId::default(),
-            instance_id: crate::instance::InstanceId::default(),
-            remote: remote_arc(RemoteState::Offline),
-            filter: Arc::default(),
-            settings: RepositoryRuntimeSettings::default(),
-            is_link: false,
-            is_layer: false,
-            write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
-            repo_lock: None,
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-        }
+        Self::new_server_context(immutable_store, mutable_store, RepositoryId::default())
     }
 
-    pub fn to_null_context(&self) -> Self {
+    /// This context without the write token and repository lock, for a holder that outlives
+    /// the command it came from: a token held past the command blocks every later write to the
+    /// instance. Its filesystem provider is an invalid one, so the holder never keeps the
+    /// provider alive.
+    pub fn without_command_locks(&self) -> Self {
         RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
-            id: RepositoryId::default(),
-            root_id: RepositoryId::default(),
-            instance_id: self.instance_id,
-            remote: remote_arc(RemoteState::Offline),
-            filter: self.filter.clone(),
-            settings: self.settings.clone(),
-            is_link: false,
-            is_layer: false,
             write_token: None,
             repo_lock: None,
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
+            file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
+            ..self.inherited()
         }
     }
 
     /// Rebuild this context with a different filter view and remote connection,
-    /// inheriting everything else — stores, ids, path, format, settings, repo
-    /// lock, and write token. Used by clone (`repository/clone.rs`) to apply
+    /// inheriting everything else. Used by clone (`repository/clone.rs`) to apply
     /// a filter view on top of an already-loaded context without re-exposing
     /// the raw `Arc<dyn MutableStore>`.
-    ///
-    /// The write token is propagated via [`RepositoryWriteToken::share`], so
-    /// the rebuilt context's token is a sibling of `self`'s — the underlying
-    /// per-path mutex guard stays held until every sibling drops.
     pub(crate) fn with_filter_and_remote(
         &self,
         filter: Arc<Filter>,
         remote: Result<Arc<Connection>, ProtocolError>,
     ) -> Self {
         RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
-            id: self.id,
-            root_id: self.root_id,
-            instance_id: self.instance_id,
-            remote: remote_arc(RemoteState::from_result(remote)),
             filter,
-            settings: self.settings.clone(),
-            is_link: self.is_link,
-            is_layer: self.is_layer,
-            write_token: self.write_token.as_ref().map(|t| t.share()),
-            repo_lock: self.repo_lock.clone(),
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
+            remote: remote_arc(RemoteState::from_result(remote)),
+            ..self.inherited()
         }
     }
 
-    /// This context aimed at the repository a link mounts, keeping the working tree it is
-    /// materialized into.
-    ///
-    /// The mounted repository holds its own tree of nodes, and a node in it is named by the
-    /// state and node id a caller already holds. Every path in a working tree is spelled
-    /// relative to the root this keeps, so the paths a walk carries across a mount stay the
-    /// paths the filesystem, the filter and the modified-time keys answer for. A path within
-    /// the mounted tree is derived from its node where one is called for, by
-    /// [`State::node_path`](crate::state::State::node_path).
-    ///
-    /// The filter is carried over as the same handle, not rebuilt. A diff tells one view from two
-    /// by pointer identity on it, so a fresh handle holding the same rules would leave every diff
-    /// across the mount doing two-view work for a view that has not changed.
+    /// This context aimed at the repository a link mounts. See [`Self::mounted`].
     pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
-        let remote = if let Ok(remote) = remote {
-            remote.connect_module(id).await
-        } else {
-            remote
+        let remote = match remote {
+            Ok(remote) => remote.connect_module(id).await,
+            Err(err) => Err(err),
         };
-        let settings = self.settings.clone();
-        Arc::new(RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
-            id,
-            root_id: self.root_id,
-            instance_id: self.instance_id,
-            remote: remote_arc(RemoteState::from_result(remote)),
-            filter: self.filter.clone(),
-            settings,
-            is_link: true,
-            is_layer: false,
-            write_token: self.write_token.as_ref().map(|t| t.share()),
-            repo_lock: self.repo_lock.clone(),
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
-        })
+        Arc::new(self.mounted(id, MountKind::Link, remote))
     }
 
-    /// This context aimed at the repository a layer draws from, keeping the working tree it is
-    /// materialized into, as [`Self::to_link_context`] does for a link.
-    pub async fn to_layer_context(&self, id: RepositoryId) -> Self {
+    /// This context aimed at the repository a layer draws from, as
+    /// [`Self::to_link_context`] does for a link.
+    pub async fn to_layer_context(&self, id: RepositoryId) -> Arc<Self> {
         let remote = self.remote().await;
-        let remote = if let Ok(remote) = remote {
-            remote.connect_module(id).await
-        } else {
-            remote
+        let remote = match remote {
+            Ok(remote) => remote.connect_module(id).await,
+            Err(err) => Err(err),
         };
-        let settings = self.settings.clone();
-        RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
-            id,
-            root_id: self.root_id,
-            instance_id: self.instance_id,
-            remote: remote_arc(RemoteState::from_result(remote)),
-            filter: self.filter.clone(),
-            settings,
-            is_link: false,
-            is_layer: true,
-            write_token: self.write_token.as_ref().map(|t| t.share()),
-            repo_lock: self.repo_lock.clone(),
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
-        }
+        Arc::new(self.mounted(id, MountKind::Layer, remote))
     }
 
     /// This context reading the same repository through `filter`, inheriting everything else as
@@ -1142,28 +1111,11 @@ impl RepositoryContext {
     /// path are gated on it and skip themselves without one — chiefly
     /// [`state::file_modified_against_node`](crate::state::file_modified_against_node), which
     /// records the modified time of a file a hash check just established as unmodified — so a
-    /// context without one leaves every later pass to pay the hash again. Sharing grants no
-    /// authority the caller does not already hold: the guard is the one `self` holds, and it is
-    /// released once every sibling drops.
+    /// context without one leaves every later pass to pay the hash again.
     pub fn to_filter_context(&self, filter: Arc<Filter>) -> Self {
         RepositoryContext {
-            link_read: self.link_read.clone(),
-            paths: self.paths.clone(),
-            immutable_store: self.immutable_store.clone(),
-            mutable_store: self.mutable_store.clone(),
-            id: self.id,
-            root_id: self.root_id,
-            instance_id: self.instance_id,
-            remote: self.remote.clone(),
             filter,
-            settings: self.settings.clone(),
-            is_link: self.is_link,
-            is_layer: self.is_layer,
-            write_token: self.write_token.as_ref().map(|t| t.share()),
-            repo_lock: self.repo_lock.clone(),
-            session_pool: Default::default(),
-            lazy_session: Default::default(),
-            file_system: self.file_system.clone(),
+            ..self.inherited()
         }
     }
 
@@ -1175,6 +1127,22 @@ impl RepositoryContext {
         self.settings
             .disable_cache
             .store(disable, Ordering::Relaxed);
+    }
+
+    /// Whether [`read_options_from_repository`] answers options that serve local fragments
+    /// unhashed ([`ReadOptions::trust_local`]).
+    ///
+    /// [`read_options_from_repository`]: crate::immutable::read_options_from_repository
+    /// [`ReadOptions::trust_local`]: lore_storage::ReadOptions::trust_local
+    pub fn trust_local(&self) -> bool {
+        self.settings.trust_local.load(Ordering::Relaxed)
+    }
+
+    /// Sets [`Self::trust_local`]. Sound only for a store whose every fragment was checked on its
+    /// way in: a trusting read serves what the store holds. [`crate::immutable::cache`] stores a
+    /// payload unchecked where no read joins its fetch, so a store it fills is not one.
+    pub fn set_trust_local(&self, trust: bool) {
+        self.settings.trust_local.store(trust, Ordering::Relaxed);
     }
 
     pub fn disable_upload(&self) -> bool {
@@ -1273,7 +1241,7 @@ impl RepositoryContext {
         self.lazy_session.write().get_or_insert_with(build).clone()
     }
 
-    /// The session pool if one is already resolved and still live, without
+    /// The session pool if one is already resolved, live and not stale, without
     /// touching the remote. `None` means "resolve it", not "there is none".
     ///
     /// Private so the pool is only ever reached through [`Self::session_pool`]. A
@@ -1282,7 +1250,10 @@ impl RepositoryContext {
     /// session resolution.
     #[lore_macro::test_pub]
     fn cached_session_pool(&self) -> Option<Arc<SessionPool>> {
-        self.session_pool.read().upgrade()
+        self.session_pool
+            .read()
+            .upgrade()
+            .filter(|pool| !pool.is_stale())
     }
 
     /// Hold `pool` as resolved, standing in for a resolution against a live remote.
@@ -1324,11 +1295,11 @@ impl RepositoryContext {
     }
 
     pub fn is_link(&self) -> bool {
-        self.is_link
+        self.mount == Some(MountKind::Link)
     }
 
     pub fn is_layer(&self) -> bool {
-        self.is_layer
+        self.mount == Some(MountKind::Layer)
     }
 }
 
@@ -1556,6 +1527,7 @@ pub fn load_repository_config(path: impl AsRef<Path>) -> Result<RepositoryConfig
 /// managed via an `Arc` + weak-ref cache so overlapping commands share one
 /// acquisition; the underlying flock drops when the last strong reference is
 /// released.
+#[lore_macro::test_pub]
 pub(crate) struct RepositoryLock {
     _lock: FSLock,
 }
@@ -1579,6 +1551,7 @@ static REPOSITORY_LOCK_INIT_MUTEXES: OnceLock<
 /// reference drops. Concurrent first-time initializers are serialized via a
 /// per-path `tokio::sync::Mutex` so only one thread calls into the OS flock
 /// for a given path at a time; others wait, then observe the cached entry.
+#[lore_macro::test_pub]
 pub(crate) async fn get_or_create_repository_lock(
     dot_path: PathBuf,
 ) -> Result<Arc<RepositoryLock>, RepositoryError> {
@@ -1872,11 +1845,7 @@ pub async fn create_immutable_store_at_path(
         Some(path.as_path()),
         create_options,
         false, /* Don't deserialize all buckets on load */
-        ImmutableStoreSettings {
-            protect_local_fragment: true, /* Protect local fragments from eviction */
-            verify_write,
-            ..Default::default()
-        },
+        crate::store::immutable::client_settings(verify_write),
     )
     .await
     .forward::<RepositoryError>("Failed to create local store")?;
@@ -2671,7 +2640,11 @@ pub async fn create_local(
     let config_path = dotpath.join(CONFIG);
     save_config(config_path, &config).await?;
 
-    repository.flush(true).await?;
+    // Written before returning, since clone drops this handle and loads the
+    // repository afresh from disk; synced only under `--sync-data`.
+    let sync_data = crate::runtime::try_execution_context()
+        .is_some_and(|context| context.globals().sync_data());
+    repository.flush(sync_data).await?;
 
     Ok(repository)
 }
@@ -2808,6 +2781,9 @@ pub async fn branch_switch(
     branch: String,
     options: BranchSwitchOptions,
 ) -> Result<Hash, RepositoryError> {
+    if options.reset && !options.bare && repository.file_system().holds_state() {
+        return Err(crate::fs::hold::refused("reset local changes in a branch switch").into());
+    }
     let context = execution_context();
     let global = context.globals();
 
@@ -3700,6 +3676,8 @@ pub fn repository_remote(repository_path: impl AsRef<str>) -> Result<String, Rep
     Ok(config.remote_url.unwrap_or_default())
 }
 
+/// Run a full eviction and compaction pass over the repository's store with the caps in its
+/// configuration, with the whole index loaded for eviction.
 pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryError> {
     let dot_path = repository.dot_dir_path()?;
     let config_path = dot_path.join(CONFIG);
@@ -3709,14 +3687,21 @@ pub async fn gc(repository: Arc<RepositoryContext>) -> Result<(), RepositoryErro
 
     let sync_data = crate::runtime::try_execution_context()
         .is_some_and(|context| context.globals().sync_data());
+    let max_size = config_store
+        .map(|config| config.max_size.unwrap_or_default())
+        .unwrap_or_default();
+    let max_capacity = config_store
+        .map(|config| config.max_capacity.unwrap_or_default())
+        .unwrap_or_default();
+    if max_capacity > 0
+        && let Err(err) = repository.immutable_store().load_index().await
+    {
+        lore_warn!("Garbage collection could not load the whole store index: {err}");
+    }
     crate::store::gc(
         repository.immutable_store(),
-        config_store
-            .map(|config| config.max_capacity.unwrap_or_default())
-            .unwrap_or_default(),
-        config_store
-            .map(|config| config.max_size.unwrap_or_default())
-            .unwrap_or_default(),
+        max_size,
+        max_capacity,
         sync_data,
         gc_event_sink(),
     )

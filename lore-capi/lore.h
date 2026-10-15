@@ -469,6 +469,9 @@ typedef struct lore_maintenance_event_data_t {
 typedef struct lore_auth_url_event_data_t {
   // Authentication URL
   struct lore_string_t url;
+  // Code the user enters or confirms at `url`. Empty when the login
+  // doesn't ask for one.
+  struct lore_string_t user_code;
 } lore_auth_url_event_data_t;
 
 // Event data resolving a user identity to a display name.
@@ -1850,7 +1853,8 @@ typedef struct lore_repository_clone_progress_event_data_t {
   struct lore_repository_clone_count_data_t count;
 } lore_repository_clone_progress_event_data_t;
 
-// Data for the event emitted when a clone finishes.
+// Data for the event emitted when a clone succeeds. A clone that fails sends no such event, and
+// reports its outcome on the complete event as every clone does.
 typedef struct lore_repository_clone_end_event_data_t {
   // Name of the branch that was cloned.
   struct lore_string_t branch;
@@ -3597,7 +3601,8 @@ enum lore_event_id_t {
   LORE_EVENT_REPOSITORY_CLONE_BEGIN,
   // Progress during a repository clone.
   LORE_EVENT_REPOSITORY_CLONE_PROGRESS,
-  // The end of a repository clone.
+  // The end of a repository clone that succeeded. A clone that fails sends none, and reports its
+  // outcome on the complete event as every clone does.
   LORE_EVENT_REPOSITORY_CLONE_END,
   // The start of resolving dependencies.
   LORE_EVENT_DEPENDENCY_RESOLVE_BEGIN,
@@ -4069,7 +4074,8 @@ typedef struct lore_global_args_t {
   uint8_t remote;
   // Dry run mode, only report what would have been changed and perform no changes to local file system
   uint8_t dry_run;
-  // Maximum number of parallel connections for bulk data transfer
+  // Number of parallel storage connections for bulk data transfer, 0 for the default of 1.
+  // At most 10 are opened
   uint32_t max_connections;
   // Search limit when iterating revisions
   uint32_t search_limit;
@@ -6438,7 +6444,7 @@ void lore_auth_local_user_info_async(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
@@ -6466,7 +6472,7 @@ int32_t lore_auth_login_interactive(const struct lore_global_args_t *globals,
 //
 // | Tag | Data Type | Description |
 // |-----|-----------|-------------|
-// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested |
+// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 // | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
 // | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
 void lore_auth_login_interactive_async(const struct lore_global_args_t *globals,
@@ -9375,6 +9381,12 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 
 // Clone a remote repository to a local path.
 //
+// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
+// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
+// its files caches every file metadata block of the cloned revision, which staging and committing
+// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
+// and reads them from the remote when a call needs them.
+//
 // # Events
 //
 // Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -9396,7 +9408,7 @@ void lore_link_update_async(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |
@@ -9430,7 +9442,7 @@ int32_t lore_repository_clone(const struct lore_global_args_t *globals,
 // |-----|-----------|-------------|
 // | `LORE_EVENT_REPOSITORY_CLONE_BEGIN` | `lore_repository_clone_begin_event_data_t` | Emitted when clone begins, includes remote URL and target path |
 // | `LORE_EVENT_REPOSITORY_CLONE_PROGRESS` | `lore_repository_clone_progress_event_data_t` | Emitted periodically during clone with progress data |
-// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted when clone completes successfully |
+// | `LORE_EVENT_REPOSITORY_CLONE_END` | `lore_repository_clone_end_event_data_t` | Emitted only when the clone succeeds; `LORE_EVENT_COMPLETE` reports the outcome of every clone |
 // | `LORE_EVENT_REVISION_SYNC_TARGET` | `lore_revision_sync_target_event_data_t` | Emitted after resolving the target revision to sync during clone |
 // | `LORE_EVENT_REVISION_SYNC_FILE` | `lore_revision_sync_file_event_data_t` | Emitted for each file written during initial sync |
 // | `LORE_EVENT_REVISION_SYNC_PROGRESS` | `lore_revision_sync_progress_event_data_t` | Emitted periodically during initial file sync |

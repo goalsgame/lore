@@ -293,6 +293,7 @@ class Lore:
         offline: bool = False,
         remote: bool = False,
         local: bool = False,
+        cache: bool = False,
         identity: str | None = None,
         identity_token: str | None = None,
         access_token: str | None = None,
@@ -327,6 +328,7 @@ class Lore:
             + (["--offline"] if offline else [])
             + (["--remote"] if remote else [])
             + (["--local"] if local else [])
+            + (["--cache"] if cache else [])
             + (["--identity", identity] if identity else [])
             + (["--identity-token", identity_token] if identity_token else [])
             + (["--access-token", access_token] if access_token else [])
@@ -2061,6 +2063,7 @@ class Lore:
             name=new_repo_name,
             create_repo=False,
             created_paths=self.created_paths,
+            environment_vars=self.environment_vars,
         )
         new_repo._ensure_test_identity_in_config()
         return new_repo
@@ -2278,6 +2281,7 @@ class Lore:
         revision: str | None = None,
         forward_changes: bool = False,
         reset: bool = False,
+        force: bool = False,
         root_files: list[str] | None = None,
         dependency_tags: list[str] | None = None,
         dependency_recursive: bool = False,
@@ -2297,6 +2301,7 @@ class Lore:
             + (["--view", self._fix_path(view)] if view else [])
             + (["--forward-changes"] if forward_changes else [])
             + (["--reset"] if reset else [])
+            + (["--force"] if force else [])
             + root_file_args
             + dep_tag_args
             + (["--dependency-recursive"] if dependency_recursive else [])
@@ -2584,6 +2589,7 @@ class Lore:
         other_file_repo: Lore | None,
         file_path: str | Path,
         other_file_path: str | Path | None = None,
+        only_file_contents: bool = False,
     ):
         if other_file_path is None:
             other_file_path = file_path
@@ -2594,8 +2600,45 @@ class Lore:
         else:
             dest_path = self._fix_path(other_file_path)
 
-        filecmp.clear_cache()
-        return filecmp.cmp(source_path, dest_path, shallow=False)
+        if only_file_contents:
+            with (
+                open(source_path, "rb") as source_contents,
+                open(dest_path, "rb") as dest_contents,
+            ):
+                return source_contents.read() == dest_contents.read()
+        else:
+            filecmp.clear_cache()
+            return filecmp.cmp(source_path, dest_path, shallow=False)
+
+    def compare_file2(
+        self,
+        other_file_repo: Lore | None,
+        file_path: str | Path,
+        other_file_path: str | Path | None = None,
+        only_file_contents: bool = False,
+    ):
+        if other_file_path is None:
+            other_file_path = file_path
+
+        source_path = self._fix_path(file_path)
+        if other_file_repo:
+            dest_path = other_file_repo._fix_path(other_file_path)
+        else:
+            dest_path = self._fix_path(other_file_path)
+
+        if only_file_contents:
+            with (
+                open(source_path, "rb") as source_contents,
+                open(dest_path, "rb") as dest_contents,
+            ):
+                source_contents = source_contents.read()
+                dest_contents = dest_contents.read()
+                assert source_contents == dest_contents, (
+                    f"Source: {source_contents}\nDest: {dest_contents}"
+                )
+        else:
+            filecmp.clear_cache()
+            assert filecmp.cmp(source_path, dest_path, shallow=False)
 
     def open_file(self, path, mode="r", encoding=None):
         return open(self._fix_path(path), mode, encoding=encoding)
@@ -2738,6 +2781,7 @@ class GlobalOptionsParseable(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     max_connections: int
     file_count_limit: int
@@ -2762,6 +2806,7 @@ class GlobalOptions(TypedDict, total=False):
     offline: bool
     remote: bool
     local: bool
+    cache: bool
     identity: str
     identity_token: str
     access_token: str
@@ -2773,3 +2818,4 @@ class GlobalOptions(TypedDict, total=False):
     search_nearest: bool
     no_gc: bool
     non_interactive: bool
+    event_interval: int

@@ -7,18 +7,14 @@ import platform
 import shutil
 import signal
 import subprocess
-import tempfile
-import typing
-import uuid
-
 import sys
+import tempfile
+import uuid
 from pathlib import Path
 from time import monotonic, sleep
 
 import pytest
-
 from cleanup_util import remove_tree
-from lore import Lore, lore_test_env
 from lore_server import (
     _get_shared_tmp_dir,
     _get_worker_id,
@@ -33,11 +29,14 @@ from lore_server import (
 from service_util import (
     LORE_SERVICE_LISTENING_MESSAGE,
     LORE_SERVICE_SOCKET_VAR,
+    service_claim_path,
     LORE_TEST_SERVICE_SOCKET_VAR,
     LORE_TEST_SHARED_SERVICE_VAR,
     service_supported,
     stop_lore_service,
 )
+
+from lore import Lore, lore_test_env
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +133,22 @@ def pytest_addoption(parser):
             "Off by default: the suite writes about ten gigabytes per session, "
             "so it is removed as it goes. Turn this on to inspect the state a "
             "failing test left behind, including the server log."
+        ),
+    )
+    parser.addoption(
+        "--swfs",
+        action="store_true",
+        default=False,
+        help=(
+            "Run the tests that mount a repository through SWFS. Off by "
+            "default, because mounting needs two things the harness cannot "
+            "arrange for itself: a client built with `--features swfs` "
+            "against SWFS_LIB_DIR, and the epicvfs filesystem driver started, "
+            "which takes an elevated session. Neither is visible from the "
+            "outside -- the binary reports no feature list -- and a run "
+            "without them does not fail, it hangs: the SWFS library parks the "
+            "service process when it cannot reach the driver, so the client "
+            "waiting on it blocks until the per-test timeout kills the worker."
         ),
     )
 
@@ -306,7 +321,7 @@ def _wait_for_service_ready(service_process, log_path: Path, timeout=30):
     pytest.fail("Timed out waiting for Lore background service to accept connections")
 
 
-class TrackedServices(object):
+class TrackedServices:
     def __init__(
         self,
         lore_executable_path: str,
@@ -316,12 +331,21 @@ class TrackedServices(object):
         self.lore_executable_path = lore_executable_path
         self.lore_subprocess_env = lore_subprocess_env
         self.global_dir_name = global_dir_name
-        self.service_processes: typing.Dict[str | None, subprocess.Popen | None] = {}
+        self.service_processes: dict[str | None, subprocess.Popen | None] = {}
 
     def start(self, directory: str | None = None):
         """Starts the service, optionally with a chosen working directory. The service
         shares the test's isolated global config so shared stores it creates land
         where the client looks for them."""
+        process, log_path = self.launch(directory)
+        _wait_for_service_ready(process, log_path)
+
+        return process
+
+    def launch(self, directory: str | None = None):
+        """Starts the service as `start` does without waiting for it to accept
+        connections, for a test that does not expect it to become ready. Returns
+        the process and the file its output goes to."""
         assert self.service_processes.get(directory) is None
 
         env = self.lore_subprocess_env.copy()
@@ -344,12 +368,11 @@ class TrackedServices(object):
                 stderr=subprocess.STDOUT,
                 **ends_with_launcher(),
             )
-        # Tracked before the wait, so that a service which fails to become ready
+        # Tracked before any wait, so that a service which fails to become ready
         # is still ended when the test does rather than outliving the run.
         self.service_processes[directory] = process
-        _wait_for_service_ready(process, log_path)
 
-        return process
+        return process, log_path
 
     def terminate(self, directory: str | None = None):
         process = self.service_processes.get(directory)
@@ -425,7 +448,10 @@ def lore_service_socket():
     Set on the test process's own environment because every Lore command and
     every service in the suite is started from a copy of it, including the
     services a command starts on its own. Under xdist each worker is its own
-    process and so gets its own socket."""
+    process and so gets its own socket.
+
+    A service claims the socket name with a lock file beside it, which it
+    leaves in place when it exits, so the run removes its own at the end."""
     socket_name = f"lore_service-test-{uuid.uuid4().hex[:12]}"
     logger.info("Using Lore service socket %s for this run", socket_name)
     os.environ[LORE_SERVICE_SOCKET_VAR] = socket_name
@@ -433,6 +459,8 @@ def lore_service_socket():
     yield socket_name
 
     del os.environ[LORE_SERVICE_SOCKET_VAR]
+    if hasattr(os, "getuid"):
+        service_claim_path(socket_name).unlink(missing_ok=True)
 
 
 @pytest.fixture(autouse=True)
@@ -859,6 +887,10 @@ def _start_shared_service(config):
     env = lore_test_env(service_dir)
     env[LORE_SERVICE_SOCKET_VAR] = socket_name
     services = TrackedServices(_lore_executable_path(config), env, service_dir)
+    if hasattr(os, "getuid"):
+        config.add_cleanup(
+            lambda: service_claim_path(socket_name).unlink(missing_ok=True)
+        )
     config.add_cleanup(services.terminate_all)
     services.start(service_dir)
     os.environ[LORE_TEST_SERVICE_SOCKET_VAR] = socket_name

@@ -3,6 +3,8 @@
 use std::ops::Range;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -27,6 +29,7 @@ use lore_storage::options::ReadOptions;
 use lore_storage::read::*;
 use lore_storage::store_types::PayloadRead;
 use lore_storage::write::try_acquire_in_flight;
+use lore_transport::StorageSession;
 
 async fn make_test_store() -> (TempDir, Arc<dyn ImmutableStore>) {
     let dir = TempDir::new("lore-storage-read-test-");
@@ -214,27 +217,71 @@ async fn read_into_vec(
 ///
 /// The bytes delivered are the same either way, so a read that stopped landing in the caller's
 /// buffer would still return the right content. The counts are what tells the two apart.
+///
+/// After its first read answers from the inner store, it notifies its release and lands its
+/// landing, where it was given them.
 struct CountingReadStore {
     inner: Arc<dyn ImmutableStore>,
     gets: Arc<std::sync::atomic::AtomicUsize>,
     gets_into: Arc<std::sync::atomic::AtomicUsize>,
+    hooks: Arc<std::sync::Mutex<ReadHooks>>,
 }
+
+/// What a [`CountingReadStore`] does after its first read answers: notify `release`, and land
+/// `landing` by putting its payload and dropping its in-flight guard, as a tracker leader
+/// finishing during a reader's probe would.
+#[derive(Default)]
+struct ReadHooks {
+    release: Option<Arc<tokio::sync::Notify>>,
+    landing: Option<Landing>,
+}
+
+type Landing = (
+    Partition,
+    Address,
+    Fragment,
+    Bytes,
+    lore_storage::write::StoreInFlightGuard,
+);
 
 impl CountingReadStore {
     fn wrap(inner: Arc<dyn ImmutableStore>) -> (Arc<dyn ImmutableStore>, Self) {
-        let gets = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let gets_into = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Self::with_hooks(inner, ReadHooks::default())
+    }
+
+    fn with_hooks(
+        inner: Arc<dyn ImmutableStore>,
+        hooks: ReadHooks,
+    ) -> (Arc<dyn ImmutableStore>, Self) {
         let counts = CountingReadStore {
-            inner: inner.clone(),
-            gets: gets.clone(),
-            gets_into: gets_into.clone(),
+            inner,
+            gets: Arc::default(),
+            gets_into: Arc::default(),
+            hooks: Arc::new(std::sync::Mutex::new(hooks)),
         };
         let store: Arc<dyn ImmutableStore> = Arc::new(CountingReadStore {
-            inner,
-            gets,
-            gets_into,
+            inner: counts.inner.clone(),
+            gets: counts.gets.clone(),
+            gets_into: counts.gets_into.clone(),
+            hooks: counts.hooks.clone(),
         });
         (store, counts)
+    }
+
+    async fn after_read(&self) {
+        let ReadHooks { release, landing } =
+            std::mem::take(&mut *self.hooks.lock().expect("hooks"));
+        if let Some(release) = release {
+            release.notify_one();
+        }
+        if let Some((partition, address, fragment, payload, guard)) = landing {
+            self.inner
+                .clone()
+                .put(partition, address, fragment, Some(payload), false)
+                .await
+                .expect("the landing store writes");
+            drop(guard);
+        }
     }
 
     fn gets(&self) -> usize {
@@ -254,7 +301,9 @@ impl ImmutableStore for CountingReadStore {
         address: Address,
     ) -> Result<lore_storage::store_types::StoreGetData, StoreError> {
         self.gets.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.clone().get(partition, address).await
+        let got = self.inner.clone().get(partition, address).await;
+        self.after_read().await;
+        got
     }
 
     async fn get_into(
@@ -265,7 +314,9 @@ impl ImmutableStore for CountingReadStore {
     ) -> Result<(Fragment, PayloadRead), StoreError> {
         self.gets_into
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        self.inner.clone().get_into(partition, address, dst).await
+        let got = self.inner.clone().get_into(partition, address, dst).await;
+        self.after_read().await;
+        got
     }
 
     fn is_local(&self) -> bool {
@@ -932,6 +983,47 @@ async fn an_unverified_read_skips_the_hash_check() {
     assert_eq!(buffer.as_slice(), payload.as_ref());
 }
 
+/// A load trusting local bytes serves them unhashed, without the check a load that is not verified
+/// makes of them under debug assertions: a local payload that does not hash to its address is
+/// served as stored.
+#[tokio::test]
+async fn a_load_trusting_local_bytes_serves_them_unchecked() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([0x56; 16]);
+    let payload = Bytes::from_static(b"local bytes that do not hash to their address");
+    let address = Address {
+        hash: hash::hash_slice(b"different content"),
+        context: Context::from([0x56; 16]),
+    };
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: FragmentFlags::PayloadStoredLocal.bits(),
+                size_payload: payload.len() as u32,
+                size_content: payload.len() as u64,
+            },
+            Some(payload.clone()),
+            false,
+        )
+        .await
+        .expect("put content under a mismatched address");
+
+    let (_, loaded) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().no_remote().trusting_local(),
+        None,
+    )
+    .await
+    .expect("a load trusting local bytes serves them");
+
+    assert_eq!(loaded, payload);
+}
+
 /// A compressed payload expands into the caller's buffer whether or not the content is hashed
 /// afterwards.
 #[tokio::test]
@@ -1332,6 +1424,227 @@ async fn load_fragment_waits_for_in_flight_leader() {
         .expect("reader observes terminal entry after leader completes");
     assert_eq!(loaded_fragment.size_payload, fragment.size_payload);
     assert_eq!(loaded_payload.as_ref(), payload.as_ref());
+}
+
+/// A load whose content is local returns it at once while a store of the same address is in
+/// flight: the store publishes an entry only once its payload is written, and the address
+/// names the content.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_hit_never_waits_on_a_store_in_flight() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xC3);
+    store
+        .clone()
+        .put(partition, address, fragment, Some(payload.clone()), false)
+        .await
+        .expect("put the payload locally");
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+
+    let (_, loaded) = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default().no_verify(),
+            None,
+        ),
+    )
+    .await
+    .expect("the local hit waited on the store in flight")
+    .expect("the local hit");
+    assert_eq!(loaded, payload);
+    drop(guard);
+}
+
+/// A load that must never wait answers a local miss at once while a store of the same address
+/// is in flight.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _fragment, _payload) = make_input(0xC4);
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+
+    let loaded = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default().no_remote().never_wait(),
+            None,
+        ),
+    )
+    .await
+    .expect("the miss waited on the store in flight");
+    assert!(
+        matches!(loaded, Err(StorageError::AddressNotFound(_))),
+        "a never-waiting miss answers AddressNotFound, got {loaded:?}"
+    );
+    drop(guard);
+}
+
+/// A miss probes the local store once when no store of the address lands meanwhile. Another
+/// test's store in the same bucket can move the count; a run where it does is tried again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_miss_with_no_store_landing_probes_once() {
+    let (_dir, inner) = make_test_store().await;
+    let (partition, address, _fragment, _payload) = make_input(0xA5);
+    for _ in 0..100 {
+        let (store, counts) = CountingReadStore::wrap(inner.clone());
+        let landed = lore_storage::write::stores_landed(address);
+        let loaded = load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default().no_remote(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(loaded, Err(StorageError::AddressNotFound(_))),
+            "got {loaded:?}"
+        );
+        if lore_storage::write::stores_landed(address) == landed {
+            assert_eq!(
+                counts.gets(),
+                1,
+                "a miss with no store landing probed again"
+            );
+            return;
+        }
+    }
+    panic!("a store in the address's bucket landed during every one of 100 loads");
+}
+
+/// A store of the address that lands while a reader's first probe runs, after that probe
+/// missed and before the reader looks for it in flight, is found by a second probe.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_landing_during_the_probe_is_found_by_a_second_probe() {
+    let (_dir, inner) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xA6);
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let (store, counts) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            landing: Some((partition, address, fragment, payload.clone(), guard)),
+            ..ReadHooks::default()
+        },
+    );
+
+    let (_, loaded) = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(
+            store,
+            partition,
+            address,
+            ReadOptions::default().no_remote().no_verify(),
+            None,
+        ),
+    )
+    .await
+    .expect("the load waited on a store its own probe lands")
+    .expect("the second probe finds the store that landed");
+    assert_eq!(loaded, payload);
+    assert_eq!(counts.gets(), 2);
+}
+
+/// [`a_miss_with_no_store_landing_probes_once`], for a read into a slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_read_into_missing_with_no_store_landing_probes_once() {
+    let (_dir, inner) = make_test_store().await;
+    let (partition, address, _fragment, payload) = make_input(0xC5);
+    for _ in 0..100 {
+        let (store, counts) = CountingReadStore::wrap(inner.clone());
+        let landed = lore_storage::write::stores_landed(address);
+        let mut slice = vec![0u8; payload.len()];
+        let read = read_into(
+            store,
+            partition,
+            address,
+            None,
+            &mut slice,
+            ReadOptions::default().no_remote(),
+            None,
+        )
+        .await;
+        assert!(
+            matches!(read, Err(StorageError::AddressNotFound(_))),
+            "got {read:?}"
+        );
+        if lore_storage::write::stores_landed(address) == landed {
+            assert_eq!(
+                counts.gets(),
+                1,
+                "a miss with no store landing probed again"
+            );
+            return;
+        }
+    }
+    panic!("a store in the address's bucket landed during every one of 100 reads");
+}
+
+/// [`a_store_landing_during_the_probe_is_found_by_a_second_probe`], for a read into a slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_store_landing_during_a_read_into_probe_is_found_by_a_second_probe() {
+    let (_dir, inner) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xC6);
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let (store, counts) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            landing: Some((partition, address, fragment, payload.clone(), guard)),
+            ..ReadHooks::default()
+        },
+    );
+
+    let mut slice = vec![0u8; payload.len()];
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into(
+            store,
+            partition,
+            address,
+            None,
+            &mut slice,
+            ReadOptions::default().no_remote().no_verify(),
+            None,
+        ),
+    )
+    .await
+    .expect("the read waited on a store its own probe lands")
+    .expect("the second probe finds the store that landed");
+    assert_eq!(slice, payload.as_ref());
+    assert_eq!(counts.gets(), 2);
+}
+
+/// [`a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight`], for a read into a slice.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_never_waiting_read_into_answers_a_miss_at_once_while_a_store_is_in_flight() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _fragment, payload) = make_input(0xE5);
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+
+    let mut slice = vec![0u8; payload.len()];
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into(
+            store,
+            partition,
+            address,
+            None,
+            &mut slice,
+            ReadOptions::default().no_remote().never_wait(),
+            None,
+        ),
+    )
+    .await
+    .expect("the miss waited on the store in flight");
+    assert!(
+        matches!(read, Err(StorageError::AddressNotFound(_))),
+        "a never-waiting miss answers AddressNotFound, got {read:?}"
+    );
+    drop(guard);
 }
 
 /// When the leader drops its guard without writing (upload failed, task
@@ -2158,6 +2471,1249 @@ async fn read_into_single_fragment_respects_range() {
     .expect("read_into should respect range");
 
     assert_eq!(&out[..], &payload[10..50]);
+}
+
+/// With caching off the leader stores nothing locally, so followers must be handed the
+/// fetched payload rather than re-probing the local store.
+#[tokio::test(flavor = "multi_thread")]
+async fn followers_get_the_leaders_bytes_when_nothing_is_cached() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xD7);
+    let fetches = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(tokio::sync::Barrier::new(9));
+
+    let tasks: Vec<_> = (0..8)
+        .map(|_| {
+            let store = store.clone();
+            let fetches = fetches.clone();
+            let payload = payload.clone();
+            let gate = gate.clone();
+            lore_base::lore_spawn!(async move {
+                gate.wait().await;
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let fetches = fetches.clone();
+                        let payload = payload.clone();
+                        async move {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
+                .await
+                .map(|flown| flown.take(true))
+            })
+        })
+        .collect();
+    gate.wait().await;
+
+    for task in tasks {
+        let (got_fragment, bytes) = task
+            .await
+            .expect("single-flight task panicked")
+            .expect("every caller gets the content");
+        assert_eq!(got_fragment.size_content, fragment.size_content);
+        assert_eq!(bytes, payload);
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 1, "one fetch serves all");
+    assert!(
+        read_raw(store, partition, address, false).await.is_err(),
+        "nothing was cached"
+    );
+}
+
+/// Concurrent misses of one content under different addresses, other contexts and other
+/// partitions, share one fetch where the store does not isolate partitions.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_misses_of_one_content_under_different_addresses_fetch_once() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xE8);
+    let fetches = Arc::new(AtomicU64::new(0));
+    let gate = Arc::new(tokio::sync::Barrier::new(9));
+
+    let tasks: Vec<_> = (0..8u8)
+        .map(|caller| {
+            let store = store.clone();
+            let fetches = fetches.clone();
+            let payload = payload.clone();
+            let gate = gate.clone();
+            let partition = if caller % 2 == 0 {
+                partition
+            } else {
+                lore_storage::Partition::from([caller; 16])
+            };
+            let address = Address {
+                context: lore_storage::Context::from([caller; 16]),
+                ..address
+            };
+            lore_base::lore_spawn!(async move {
+                gate.wait().await;
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let fetches = fetches.clone();
+                        let payload = payload.clone();
+                        async move {
+                            fetches.fetch_add(1, Ordering::SeqCst);
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
+                .await
+                .map(|flown| flown.take(true))
+            })
+        })
+        .collect();
+    gate.wait().await;
+
+    for task in tasks {
+        let (_, bytes) = task
+            .await
+            .expect("single-flight task panicked")
+            .expect("every caller gets the content");
+        assert_eq!(bytes, payload);
+    }
+    assert_eq!(fetches.load(Ordering::SeqCst), 1, "one fetch serves all");
+}
+
+/// A follower takes the leader's error only for the leader's own address: one under another
+/// context fetches for itself, and one under the same address answers the error.
+#[tokio::test(flavor = "multi_thread")]
+async fn only_a_follower_of_the_leaders_address_takes_its_error() {
+    use lore_storage::read_flight::ReadFlight;
+    use lore_storage::read_flight::join_read_flight;
+
+    let (_dir, store) = make_test_store().await;
+    for (seed, same_address) in [(0xE9, false), (0xEA, true)] {
+        let (partition, address, fragment, payload) = make_input(seed);
+        let ReadFlight::Leader(leader) = join_read_flight(partition, address, false) else {
+            panic!("the first caller leads");
+        };
+        let follower_address = if same_address {
+            address
+        } else {
+            Address {
+                context: lore_storage::Context::from([!seed; 16]),
+                ..address
+            }
+        };
+        let fetches = Arc::new(AtomicU64::new(0));
+        let follower = {
+            let (store, fetches, raw) =
+                (store.clone(), fetches.clone(), (fragment, payload.clone()));
+            lore_base::lore_spawn!(async move {
+                fetch_single_flight(
+                    store,
+                    partition,
+                    follower_address,
+                    ReadOptions::default(),
+                    || {
+                        fetches.fetch_add(1, Ordering::SeqCst);
+                        let raw = raw.clone();
+                        async move {
+                            Ok(Flown::Fetched(Fetched {
+                                content: raw.clone(),
+                                raw,
+                            }))
+                        }
+                    },
+                    || {},
+                )
+                .await
+                .map(|flown| flown.take(true))
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !leader.has_followers() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the follower joined");
+        leader.complete(&Err(StorageError::from(
+            lore_storage::errors::AddressNotFound::from(address),
+        )));
+
+        let read = follower.await.expect("follower task");
+        if same_address {
+            assert!(
+                matches!(read, Err(StorageError::AddressNotFound(_))),
+                "a follower of the leader's address answers its error, got {read:?}"
+            );
+            assert_eq!(fetches.load(Ordering::SeqCst), 0);
+        } else {
+            let (_, bytes) = read.expect("a follower of another address fetches itself");
+            assert_eq!(bytes, payload);
+            assert_eq!(fetches.load(Ordering::SeqCst), 1);
+        }
+    }
+}
+
+/// A leader whose fetch answers a payload unchecked, and that no follower joined, hands it back
+/// unchecked: nothing decodes or hashes it, so even a payload that would fail its check returns.
+#[tokio::test]
+async fn an_unchecked_fetch_no_follower_joined_is_handed_back_unchecked() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, _) = make_input(0xEC);
+    let altered = Bytes::from(vec![!0xECu8; 64]);
+    lore_storage::test_util::reset_counts();
+
+    let flown = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, altered.clone());
+            async move { Ok(Flown::Unverified(raw)) }
+        },
+        || {},
+    )
+    .await
+    .expect("the leader hands back its fetch");
+
+    assert!(matches!(flown, Flown::Unverified((_, ref payload)) if *payload == altered));
+    assert_eq!(
+        lore_storage::test_util::counts(),
+        (0, 0, 0),
+        "nothing is decoded or hashed"
+    );
+}
+
+/// A leader whose fetch answers a payload unchecked checks it once a follower joined, and both
+/// take the checked fetch: the payload is hashed once, by the leader.
+#[tokio::test]
+async fn an_unchecked_fetch_is_checked_once_for_a_follower() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xED);
+    let followers = lore_storage::test_util::followers();
+    let follower_fetches = Arc::new(AtomicU64::new(0));
+    lore_storage::test_util::reset_counts();
+
+    let lead = fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, payload.clone());
+            async move {
+                while lore_storage::test_util::followers() == followers {
+                    tokio::task::yield_now().await;
+                }
+                Ok(Flown::Unverified(raw))
+            }
+        },
+        || {},
+    );
+    let follow = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            async { Err(StorageError::internal("the follower fetches nothing")) }
+        },
+        || {},
+    );
+    let (led, followed) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(lead, follow) })
+            .await
+            .expect("the follower joins the leader");
+
+    for flown in [led, followed] {
+        let flown = flown.expect("the checked fetch");
+        assert!(matches!(flown, Flown::Fetched(_)), "got {flown:?}");
+        assert_eq!(flown.take(true).1, payload);
+    }
+    assert_eq!(follower_fetches.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        lore_storage::test_util::counts().2,
+        1,
+        "the payload is hashed once"
+    );
+}
+
+/// A leader whose fetch answers a payload that fails its check, once a follower joined, publishes
+/// nothing: the follower fetches for itself, as after a leader that vanished, and the leader takes
+/// its payload back rejected.
+#[tokio::test]
+async fn an_unchecked_fetch_failing_its_check_is_not_published() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xEE);
+    let altered = Bytes::from(vec![!0xEEu8; 64]);
+    let followers = lore_storage::test_util::followers();
+    let follower_fetches = Arc::new(AtomicU64::new(0));
+
+    let lead = fetch_single_flight(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            let raw = (fragment, altered.clone());
+            async move {
+                while lore_storage::test_util::followers() == followers {
+                    tokio::task::yield_now().await;
+                }
+                Ok(Flown::Unverified(raw))
+            }
+        },
+        || {},
+    );
+    let follow = fetch_single_flight(
+        store,
+        partition,
+        address,
+        ReadOptions::default(),
+        || {
+            follower_fetches.fetch_add(1, Ordering::SeqCst);
+            let raw = (fragment, payload.clone());
+            async move {
+                Ok(Flown::Fetched(Fetched {
+                    content: raw.clone(),
+                    raw,
+                }))
+            }
+        },
+        || {},
+    );
+    let (led, followed) =
+        tokio::time::timeout(Duration::from_secs(5), async { tokio::join!(lead, follow) })
+            .await
+            .expect("the follower joins the leader");
+
+    assert!(
+        matches!(led, Ok(Flown::Rejected((_, ref payload))) if *payload == altered),
+        "the leader takes its payload back rejected, got {led:?}"
+    );
+    let (_, bytes) = followed
+        .expect("the follower fetches for itself")
+        .take(true);
+    assert_eq!(bytes, payload);
+    assert_eq!(follower_fetches.load(Ordering::SeqCst), 1);
+}
+
+/// Where the store isolates partitions, a miss in another partition fetches for itself rather
+/// than following a flight for the same content held in another.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_isolating_store_never_shares_a_flight_across_partitions() {
+    use lore_storage::read_flight::ReadFlight;
+    use lore_storage::read_flight::join_read_flight;
+
+    let (_dir, store) = store_with_isolation(true).await;
+    let (partition, address, fragment, payload) = make_input(0xEB);
+    let ReadFlight::Leader(leader) = join_read_flight(partition, address, true) else {
+        panic!("the first caller leads");
+    };
+    let other_partition = lore_storage::Partition::from([!0xEBu8; 16]);
+    let fetches = Arc::new(AtomicU64::new(0));
+    let (_, bytes) = tokio::time::timeout(
+        Duration::from_secs(2),
+        fetch_single_flight(
+            store,
+            other_partition,
+            address,
+            ReadOptions::default(),
+            || {
+                fetches.fetch_add(1, Ordering::SeqCst);
+                let raw = (fragment, payload.clone());
+                async move {
+                    Ok(Flown::Fetched(Fetched {
+                        content: raw.clone(),
+                        raw,
+                    }))
+                }
+            },
+            || {},
+        ),
+    )
+    .await
+    .expect("the miss in another partition followed the held flight")
+    .expect("the miss fetches itself")
+    .take(true);
+    assert_eq!(bytes, payload);
+    assert_eq!(fetches.load(Ordering::SeqCst), 1);
+    drop(leader);
+}
+
+/// A local-only load that misses while a remote flight for the same address is held answers
+/// the miss at once rather than following the flight: with no session, and with a session
+/// but the remote forbidden.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_local_only_miss_never_follows_a_remote_flight() {
+    let (_dir, store) = make_test_store().await;
+    for (seed, options, session) in [
+        (0xC1, ReadOptions::default(), None),
+        (0xC2, ReadOptions::default().no_remote(), stand_in_session()),
+    ] {
+        let (partition, address, fragment, payload) = make_input(seed);
+        let (started, released) = (
+            Arc::new(tokio::sync::Notify::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
+        let leader = {
+            let (store, started, released) = (store.clone(), started.clone(), released.clone());
+            lore_base::lore_spawn!(async move {
+                fetch_single_flight(
+                    store,
+                    partition,
+                    address,
+                    ReadOptions::default(),
+                    || {
+                        let (started, released, payload) =
+                            (started.clone(), released.clone(), payload.clone());
+                        async move {
+                            started.notify_one();
+                            released.notified().await;
+                            Ok(Flown::Fetched(Fetched {
+                                content: (fragment, payload.clone()),
+                                raw: (fragment, payload),
+                            }))
+                        }
+                    },
+                    || {},
+                )
+                .await
+                .map(|flown| flown.take(true))
+            })
+        };
+        started.notified().await;
+
+        let local = tokio::time::timeout(
+            Duration::from_secs(2),
+            load_fragment(store.clone(), partition, address, options, session),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("the local-only load ({seed:#x}) followed the held remote flight")
+        });
+        assert!(
+            matches!(local, Err(StorageError::AddressNotFound(_))),
+            "a local-only miss answers AddressNotFound, got {local:?}"
+        );
+
+        released.notify_one();
+        leader
+            .await
+            .expect("leader task")
+            .expect("the leader fetches");
+    }
+}
+
+/// A session whose resolve, and so a leader's upload, waits for `release` and then fails, so
+/// the leader keeps the payload locally. `entered` fires as the upload starts.
+fn held_upload_session(
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+) -> Arc<StorageSession> {
+    Arc::new(StorageSession::pending(move || {
+        let (entered, release) = (entered.clone(), release.clone());
+        async move {
+            entered.notify_one();
+            release.notified().await;
+            Err(lore_transport::ProtocolError::internal(
+                "the held upload fails",
+            ))
+        }
+    }))
+}
+
+/// A tracker-dispatched store, held in its upload with nothing local yet. A
+/// reader holding a session misses, waits for the leader, and reads the leader's local write
+/// rather than starting a flight before the upload is done.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_reader_waits_out_a_dispatched_upload_then_reads_local() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xB7);
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let tracker = Arc::new(lore_storage::WriteTracker::new());
+    lore_storage::write::store_fragment(
+        store.clone(),
+        partition,
+        address,
+        Fragment {
+            flags: 0,
+            ..fragment
+        },
+        payload.clone(),
+        false,
+        Some(held_upload_session(entered.clone(), release.clone())),
+        lore_storage::WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .expect("dispatch the store");
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the leader reached its upload");
+
+    let reader = lore_base::lore_spawn!(load_fragment(
+        store.clone(),
+        partition,
+        address,
+        ReadOptions::default(),
+        stand_in_session(),
+    ));
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !reader.is_finished(),
+        "the reader finished before the leader's upload completed"
+    );
+    release.notify_one();
+    let (_, loaded) = tokio::time::timeout(Duration::from_secs(5), reader)
+        .await
+        .expect("the reader hung after the leader finished")
+        .expect("reader task")
+        .expect("the reader reads the leader's local write");
+    assert_eq!(loaded, payload);
+    tracker.await_all().await.expect("the tracker drains");
+}
+
+/// Content already local while a dispatched store of it is held in its upload:
+/// a reader with a session hits local at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_session_reader_hits_local_during_a_dispatched_upload() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xB8);
+    store
+        .clone()
+        .put(
+            partition,
+            address,
+            Fragment {
+                flags: 0,
+                ..fragment
+            },
+            Some(payload.clone()),
+            false,
+        )
+        .await
+        .expect("put locally, not durable");
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let tracker = Arc::new(lore_storage::WriteTracker::new());
+    lore_storage::write::store_fragment(
+        store.clone(),
+        partition,
+        address,
+        Fragment {
+            flags: 0,
+            ..fragment
+        },
+        payload.clone(),
+        false,
+        Some(held_upload_session(entered.clone(), release.clone())),
+        lore_storage::WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .expect("dispatch the store");
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the leader reached its upload");
+
+    let (_, loaded) = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            stand_in_session(),
+        ),
+    )
+    .await
+    .expect("the local hit waited on the dispatched upload")
+    .expect("the local hit");
+    assert_eq!(loaded, payload);
+    release.notify_one();
+    tracker.await_all().await.expect("the tracker drains");
+}
+
+/// `never_wait` with the remote allowed and a session: a miss answers
+/// `AddressNotFound` with no flight, while a remote flight for the address is held.
+#[tokio::test(flavor = "multi_thread")]
+async fn never_wait_with_a_session_never_follows_a_flight() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xB9);
+    let (started, released) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let leader = {
+        let (store, started, released) = (store.clone(), started.clone(), released.clone());
+        lore_base::lore_spawn!(async move {
+            fetch_single_flight(
+                store,
+                partition,
+                address,
+                ReadOptions::default(),
+                || {
+                    let (started, released, payload) =
+                        (started.clone(), released.clone(), payload.clone());
+                    async move {
+                        started.notify_one();
+                        released.notified().await;
+                        Ok(Flown::Fetched(Fetched {
+                            content: (fragment, payload.clone()),
+                            raw: (fragment, payload),
+                        }))
+                    }
+                },
+                || {},
+            )
+            .await
+            .map(|flown| flown.take(true))
+        })
+    };
+    started.notified().await;
+    let local = tokio::time::timeout(
+        Duration::from_secs(2),
+        load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default().never_wait(),
+            stand_in_session(),
+        ),
+    )
+    .await
+    .expect("never_wait with a session followed the held flight");
+    assert!(
+        matches!(local, Err(StorageError::AddressNotFound(_))),
+        "got {local:?}"
+    );
+    released.notify_one();
+    leader
+        .await
+        .expect("leader task")
+        .expect("the leader fetches");
+}
+
+/// A whole read into a buffer that misses while a tracker-dispatched store of the address is
+/// held in its upload reads the store's local write once it lands, rather than fetching it:
+/// the read's own probe releases the upload.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally() {
+    let (_dir, inner) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xBA);
+    let (entered, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let tracker = Arc::new(lore_storage::WriteTracker::new());
+    lore_storage::write::store_fragment(
+        inner.clone(),
+        partition,
+        address,
+        Fragment {
+            flags: 0,
+            ..fragment
+        },
+        payload.clone(),
+        false,
+        Some(held_upload_session(entered.clone(), release.clone())),
+        lore_storage::WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .expect("dispatch the store");
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the leader reached its upload");
+    let (store, counts) = CountingReadStore::with_hooks(
+        inner,
+        ReadHooks {
+            release: Some(release),
+            ..ReadHooks::default()
+        },
+    );
+
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let (_, written) = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into_buffer(
+            store,
+            partition,
+            address,
+            None,
+            &mut dst,
+            ReadOptions::default(),
+            stand_in_session(),
+        ),
+    )
+    .await
+    .expect("the whole read hung on the dispatched store")
+    .expect("the whole read reads the store's local write");
+    assert!(
+        counts.gets() + counts.gets_into() >= 1,
+        "the whole read probed the local store"
+    );
+    assert_eq!(&buffer[..written], payload.as_ref());
+    tracker.await_all().await.expect("the tracker drains");
+}
+
+/// A whole read into a buffer with `never_wait` misses at once while a remote flight for the
+/// address is held, rather than following it.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_never_waiting_whole_read_into_a_buffer_never_follows_a_flight() {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, fragment, payload) = make_input(0xBB);
+    let (started, released) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let leader = {
+        let (store, started, released) = (store.clone(), started.clone(), released.clone());
+        lore_base::lore_spawn!(async move {
+            fetch_single_flight(
+                store,
+                partition,
+                address,
+                ReadOptions::default(),
+                || {
+                    let (started, released, payload) =
+                        (started.clone(), released.clone(), payload.clone());
+                    async move {
+                        started.notify_one();
+                        released.notified().await;
+                        Ok(Flown::Fetched(Fetched {
+                            content: (fragment, payload.clone()),
+                            raw: (fragment, payload),
+                        }))
+                    }
+                },
+                || {},
+            )
+            .await
+            .map(|flown| flown.take(true))
+        })
+    };
+    started.notified().await;
+
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into_buffer(
+            store.clone(),
+            partition,
+            address,
+            None,
+            &mut dst,
+            ReadOptions::default().never_wait(),
+            stand_in_session(),
+        ),
+    )
+    .await
+    .expect("the never-waiting whole read followed the held flight");
+    assert!(
+        matches!(read, Err(StorageError::AddressNotFound(_))),
+        "got {read:?}"
+    );
+    released.notify_one();
+    leader
+        .await
+        .expect("leader task")
+        .expect("the leader fetches");
+}
+
+/// [`a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight`], for a whole read into a
+/// buffer.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_never_waiting_whole_read_into_a_buffer_answers_a_miss_at_once_while_a_store_is_in_flight()
+ {
+    let (_dir, store) = make_test_store().await;
+    let (partition, address, _fragment, _payload) = make_input(0xE7);
+    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let read = tokio::time::timeout(
+        Duration::from_secs(2),
+        read_into_buffer(
+            store,
+            partition,
+            address,
+            None,
+            &mut dst,
+            ReadOptions::default().no_remote().never_wait(),
+            None,
+        ),
+    )
+    .await
+    .expect("the miss waited on the store in flight");
+    assert!(
+        matches!(read, Err(StorageError::AddressNotFound(_))),
+        "a never-waiting miss answers AddressNotFound, got {read:?}"
+    );
+    drop(guard);
+}
+
+/// A stand-in remote serving `size` bytes of compressible content as one compressed fragment, and
+/// a stand-in session whose fetches the served fragment answers. Nothing is stored locally and the
+/// counts start at zero.
+///
+/// The content follows from `context`'s first byte, so tests that pass different contexts serve
+/// different content: reads of the same content coalesce across the process, and a test counting
+/// its own fetches must not share a flight with another.
+fn serve_compressed(
+    context: Context,
+    size: usize,
+) -> (Address, Vec<u8>, Option<Arc<StorageSession>>) {
+    let seed = context.as_ref()[0];
+    let content: Vec<u8> = (0..size).map(|index| (index / 64) as u8 ^ seed).collect();
+    let plain = Fragment {
+        flags: 0,
+        size_payload: content.len() as u32,
+        size_content: content.len() as u64,
+    };
+    let (fragment, payload) = lore_storage::compress::compress(
+        plain,
+        &content,
+        lore_storage::compress::CompressionMode::Lz4,
+    )
+    .expect("compress test content");
+    let address = Address {
+        hash: hash::hash_slice(&content),
+        context,
+    };
+    lore_storage::test_util::serve_remote(address, fragment, payload);
+    lore_storage::test_util::reset_counts();
+    (address, content, stand_in_session())
+}
+
+/// A session for the stand-in remote: fetches never reach it, and a heal it is asked for fails.
+fn stand_in_session() -> Option<Arc<StorageSession>> {
+    Some(Arc::new(StorageSession::pending(|| async {
+        Err(lore_transport::ProtocolError::internal(
+            "the stand-in remote needs no session",
+        ))
+    })))
+}
+
+/// `size` bytes of content, the plain fragment describing it, and its address.
+fn plain_content(context: Context, size: usize, seed: u8) -> (Address, Fragment, Bytes) {
+    let content = Bytes::from(
+        (0..size)
+            .map(|index| (index as u8).wrapping_mul(seed))
+            .collect::<Vec<u8>>(),
+    );
+    let fragment = Fragment {
+        flags: 0,
+        size_payload: size as u32,
+        size_content: size as u64,
+    };
+    let address = Address {
+        hash: hash::hash_slice(&content),
+        context,
+    };
+    (address, fragment, content)
+}
+
+/// Remote payloads that fail receipt: a plain payload claiming less content than it holds, one
+/// whose bytes do not hash to its address, and one whose length disagrees with its size.
+fn failing_receipts(context: Context) -> [(&'static str, Address, Fragment, Bytes); 3] {
+    let (address, fragment, content) = plain_content(context, 4096, 3);
+    let short_content = Fragment {
+        size_content: 4000,
+        ..fragment
+    };
+    let mut other = content.to_vec();
+    other[0] ^= 0xff;
+    let long_payload = Fragment {
+        size_payload: 4095,
+        ..fragment
+    };
+    [
+        (
+            "a wrong content size",
+            address,
+            short_content,
+            content.clone(),
+        ),
+        ("a hash mismatch", address, fragment, Bytes::from(other)),
+        ("a payload length mismatch", address, long_payload, content),
+    ]
+}
+
+async fn test_mutable_store(
+    dir: &TempDir,
+    store: &Arc<dyn ImmutableStore>,
+) -> Arc<dyn MutableStore> {
+    use lore_storage::local::mutable_store::LocalMutableStore;
+    use lore_storage::local::mutable_store::MutableStoreSettings;
+    Arc::new(
+        LocalMutableStore::new(
+            Some(PathBuf::from(dir.as_ref())),
+            MutableStoreSettings::default(),
+            store.clone(),
+        )
+        .await
+        .expect("create mutable store"),
+    )
+}
+
+/// A fetched payload that fails receipt is refused and never reaches the local store.
+#[tokio::test]
+async fn a_remote_payload_failing_receipt_is_refused_and_not_stored() {
+    for (index, (label, address, fragment, payload)) in failing_receipts(Context::from([96; 16]))
+        .into_iter()
+        .enumerate()
+    {
+        let (_dir, store) = make_test_store().await;
+        let partition = Partition::from([96 + index as u8; 16]);
+        lore_storage::test_util::serve_remote(address, fragment, payload);
+
+        let loaded = load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default().with_cache(),
+            stand_in_session(),
+        )
+        .await;
+
+        assert!(loaded.is_err(), "{label} was accepted");
+        assert!(
+            read_raw(store, partition, address, false).await.is_err(),
+            "{label} was stored"
+        );
+    }
+}
+
+/// A resolved root that fails receipt is refused, and neither it nor the mapping to it is
+/// stored.
+#[tokio::test]
+async fn a_resolved_root_failing_receipt_is_refused_and_not_stored() {
+    for (index, (label, address, fragment, payload)) in failing_receipts(Context::from([97; 16]))
+        .into_iter()
+        .enumerate()
+    {
+        let (dir, store) = make_test_store().await;
+        let mutable = test_mutable_store(&dir, &store).await;
+        let partition = Partition::from([97 + index as u8; 16]);
+        let key = hash::hash_slice(label.as_bytes());
+        lore_storage::test_util::serve_remote_resolved(key, address.hash, fragment, payload);
+
+        let resolved = resolve_root(
+            store.clone(),
+            mutable.clone(),
+            partition,
+            key,
+            address.context,
+            0,
+            ReadOptions::default().with_cache(),
+            stand_in_session(),
+        )
+        .await;
+
+        assert!(resolved.is_err(), "{label} was accepted");
+        assert!(
+            read_raw(store, partition, address, false).await.is_err(),
+            "{label} was stored"
+        );
+        assert!(
+            mutable
+                .load(partition, key, KeyType::Resolve)
+                .await
+                .map_or(true, |hash| hash.is_zero()),
+            "the mapping to {label} was stored"
+        );
+    }
+}
+
+/// One fetch, one decode, one hash: the root a remote resolve verified is the root handed back.
+#[tokio::test]
+async fn remote_resolve_decodes_and_hashes_once() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let partition = Partition::from([98; 16]);
+    let context = Context::from([98; 16]);
+    let (address, content, session) = serve_compressed(context, 4096);
+    let (fragment, payload) =
+        lore_storage::test_util::remote_payload(address).expect("the compressed root");
+    let key = hash::hash_slice(b"a key naming compressed content");
+    lore_storage::test_util::serve_remote_resolved(key, address.hash, fragment, payload);
+    lore_storage::test_util::reset_counts();
+
+    let resolved = resolve_root(
+        store,
+        mutable,
+        partition,
+        key,
+        context,
+        0,
+        ReadOptions::default().with_cache(),
+        session,
+    )
+    .await
+    .expect("resolve the remote root");
+
+    assert_eq!(resolved.buffer.as_ref(), content.as_slice());
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
+}
+
+/// A remote resolve that does not ask to expand hands the root back as fetched.
+#[tokio::test]
+async fn a_remote_resolve_without_decompress_hands_the_root_back_as_fetched() {
+    let (dir, store) = make_test_store().await;
+    let mutable = test_mutable_store(&dir, &store).await;
+    let partition = Partition::from([95; 16]);
+    let context = Context::from([95; 16]);
+    let (address, _content, session) = serve_compressed(context, 4096);
+    let (fragment, payload) =
+        lore_storage::test_util::remote_payload(address).expect("the compressed root");
+    let key = hash::hash_slice(b"a key naming a compressed root read as fetched");
+    lore_storage::test_util::serve_remote_resolved(key, address.hash, fragment, payload.clone());
+
+    let resolved = resolve_root(
+        store,
+        mutable,
+        partition,
+        key,
+        context,
+        0,
+        ReadOptions::default().no_decompress(),
+        session,
+    )
+    .await
+    .expect("resolve the remote root");
+
+    assert_eq!(resolved.buffer, payload);
+    assert_ne!(
+        resolved.fragment.flags & FragmentFlags::PayloadCompressed,
+        0
+    );
+}
+
+/// A fetch into a caller's buffer that fails is the read's failure: the assembling path does
+/// not fetch, heal and retry the same address again.
+#[tokio::test]
+async fn a_failing_remote_fetch_into_a_buffer_fetches_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([99; 16]);
+    let [_, (_, address, fragment, payload), _] = failing_receipts(Context::from([99; 16]));
+    lore_storage::test_util::serve_remote(address, fragment, payload);
+    lore_storage::test_util::reset_counts();
+
+    let mut buffer = vec![0u8; 4096];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let read = read_into_buffer(
+        store,
+        partition,
+        address,
+        None,
+        &mut dst,
+        ReadOptions::default(),
+        stand_in_session(),
+    )
+    .await;
+
+    assert!(read.is_err());
+    assert_eq!(lore_storage::test_util::counts().0, 1, "fetches");
+}
+
+/// One fetch, one decode, one hash: the content a remote fetch verified is the content handed
+/// back.
+#[tokio::test]
+async fn remote_content_load_decodes_and_hashes_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([91; 16]);
+    let (address, content, session) = serve_compressed(Context::from([91; 16]), 4096);
+
+    let (_, loaded) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().with_cache(),
+        session,
+    )
+    .await
+    .expect("load the remote content");
+
+    assert_eq!(loaded.as_ref(), content.as_slice());
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
+}
+
+/// A caller asking for the stored form gets it as fetched, verified once on receipt.
+#[tokio::test]
+async fn remote_stored_load_decodes_and_hashes_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([92; 16]);
+    let (address, _content, session) = serve_compressed(Context::from([92; 16]), 4096);
+
+    let (fragment, _) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().no_decompress(),
+        session,
+    )
+    .await
+    .expect("load the remote payload");
+
+    assert_ne!(fragment.flags & FragmentFlags::PayloadCompressed, 0);
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
+}
+
+/// A payload fetched from the remote adds its length to the process-wide byte count.
+#[tokio::test]
+async fn a_remote_fetch_counts_its_payload_bytes() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([231; 16]);
+    let (address, _content, session) = serve_compressed(Context::from([231; 16]), 8192);
+    let before = remote_fetch_bytes();
+
+    let (fragment, _) = load_fragment(
+        store,
+        partition,
+        address,
+        ReadOptions::default().no_decompress(),
+        session,
+    )
+    .await
+    .expect("load the remote payload");
+
+    assert!(remote_fetch_bytes() - before >= u64::from(fragment.size_payload));
+}
+
+#[tokio::test]
+async fn remote_read_into_decodes_and_hashes_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([93; 16]);
+    let (address, content, session) = serve_compressed(Context::from([93; 16]), 4096);
+
+    let mut slice = vec![0u8; 100];
+    read_into(
+        store,
+        partition,
+        address,
+        Some(1000..1100),
+        &mut slice,
+        ReadOptions::default(),
+        session,
+    )
+    .await
+    .expect("read the remote range");
+
+    assert_eq!(slice.as_slice(), &content[1000..1100]);
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
+}
+
+#[tokio::test]
+async fn remote_read_into_buffer_decodes_and_hashes_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([94; 16]);
+    let (address, content, session) = serve_compressed(Context::from([94; 16]), 4096);
+
+    let mut buffer = vec![0u8; content.len()];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let (_, written) = read_into_buffer(
+        store,
+        partition,
+        address,
+        None,
+        &mut dst,
+        ReadOptions::default(),
+        session,
+    )
+    .await
+    .expect("read the remote content");
+
+    assert_eq!(written, content.len());
+    assert_eq!(buffer, content);
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
+}
+
+/// A whole read into a buffer of fetched content larger than the caller's cap fails with the
+/// one fetch it made, rather than leaving the read to a path that fetches it again.
+#[tokio::test]
+async fn a_remote_whole_read_over_the_cap_fails_after_one_fetch() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([84; 16]);
+    let (address, content, session) = serve_compressed(Context::from([84; 16]), 4096);
+
+    let mut buffer = vec![0u8; content.len()];
+    // SAFETY: the buffer outlives the read and nothing else touches it.
+    let mut dst = unsafe { CallerBuffer::new(buffer.as_mut_ptr(), buffer.len()) };
+    let result = read_into_buffer(
+        store,
+        partition,
+        address,
+        None,
+        &mut dst,
+        ReadOptions::default().with_max_content_size(1024),
+        session,
+    )
+    .await;
+
+    assert!(
+        matches!(result, Err(StorageError::Oversized(_))),
+        "got {result:?}"
+    );
+    assert_eq!(lore_storage::test_util::counts().0, 1, "fetches");
+}
+
+/// A caller joining a fetch in flight takes the content the leader already decoded.
+#[tokio::test]
+async fn concurrent_remote_misses_decode_and_hash_once() {
+    let (_dir, store) = make_test_store().await;
+    let partition = Partition::from([85; 16]);
+    let (address, content, session) = serve_compressed(Context::from([85; 16]), 4096);
+    let gate = Arc::new(tokio::sync::Notify::new());
+    lore_storage::test_util::hold_remote_fetches(gate.clone());
+
+    let load = || {
+        load_fragment(
+            store.clone(),
+            partition,
+            address,
+            ReadOptions::default(),
+            session.clone(),
+        )
+    };
+    let release = async {
+        while lore_storage::test_util::followers() == 0 {
+            tokio::task::yield_now().await;
+        }
+        gate.notify_one();
+    };
+    let (first, second, ()) = tokio::join!(load(), load(), release);
+
+    assert_eq!(first.expect("leader").1.as_ref(), content.as_slice());
+    assert_eq!(second.expect("follower").1.as_ref(), content.as_slice());
+    assert_eq!(lore_storage::test_util::counts(), (1, 1, 1));
 }
 
 #[cfg(not(feature = "oodle"))]

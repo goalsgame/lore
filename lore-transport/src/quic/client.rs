@@ -78,6 +78,11 @@ const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
 #[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
+/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
+/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
+/// datagram that arrives while it is full is lost.
+#[lore_macro::test_pub]
+const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -422,6 +427,11 @@ impl QuicConnection {
 
     pub async fn connection_stats(&self) -> ConnectionStats {
         self.connection.read().await.connection.stats().into()
+    }
+
+    /// Requests outstanding on each stream, as the stream selection sees them.
+    pub fn stream_inflight(&self) -> [u64; STREAM_COUNT as usize] {
+        std::array::from_fn(|stream| self.stream_inflight[stream].load(Ordering::Relaxed))
     }
 }
 
@@ -769,6 +779,9 @@ pub async fn connect(
                 if let Some(cwnd) = transport.initial_cwnd {
                     bbr.initial_window(cwnd);
                 }
+                // quinn never has more than the send window unacknowledged, so a larger
+                // congestion window would only raise the pacing rate.
+                bbr.max_window(send_window);
                 Arc::new(bbr)
             }
             CongestionAlgorithm::Cubic => {
@@ -896,6 +909,22 @@ where
     }
 }
 
+/// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
+/// that size alone. The OS may grant less than asked: Linux caps the request at
+/// `net.core.rmem_max`, and allocates and reports twice what it grants.
+#[lore_macro::test_pub]
+fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+    let socket = socket2::SockRef::from(socket);
+    if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
+        return;
+    }
+    let result = socket.set_recv_buffer_size(bytes);
+    lore_debug!(
+        "QUIC socket receive buffer {:?} after asking for {bytes} bytes: {result:?}",
+        socket.recv_buffer_size()
+    );
+}
+
 async fn connect_to_addr(
     client_config: quinn::ClientConfig,
     host: String,
@@ -919,6 +948,7 @@ async fn connect_to_addr(
     let endpoint = {
         let _guard = lore_base::runtime::net_runtime().enter();
         std::net::UdpSocket::bind(bind).and_then(|socket| {
+            raise_receive_buffer(&socket, RECEIVE_BUFFER_BYTES);
             quinn::Endpoint::new(
                 quinn::EndpointConfig::default(),
                 None,

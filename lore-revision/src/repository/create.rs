@@ -13,6 +13,7 @@ use super::SharedStoreToUseConfig;
 use super::StoreConfig;
 use super::VfsConfig;
 use super::get_dot_lore_path;
+use super::load_repository_config_from_dot_dir;
 use crate::branch;
 use crate::errors::*;
 use crate::event;
@@ -215,7 +216,10 @@ pub(crate) async fn create_with_metadata(
 
     let existing_dot_dir = get_dot_lore_path(path)?;
     if existing_dot_dir.exists() {
-        if call.force() {
+        let existing_repository_is_swfs =
+            load_repository_config_from_dot_dir(existing_dot_dir.as_path())
+                .is_ok_and(|config| config.is_swfs());
+        if call.force() && !existing_repository_is_swfs {
             lore_io::IoDriver::global()
                 .remove_dir_all(existing_dot_dir.as_path())
                 .await
@@ -356,9 +360,10 @@ pub(crate) async fn create_with_metadata(
     // The create command goes through dispatch_call, not repository_call,
     // so the normal spawn_flush_stores path that flushes dirty mutable store
     // buckets after each command does not run. Flush explicitly to ensure
-    // branch creation, instance registration, and metadata are persisted
-    // before the process exits.
-    let _ = repository.flush(true).await;
+    // branch creation, instance registration, and metadata are written
+    // before the process exits — synced to disk only under `--sync-data`, as
+    // every other command's flush is.
+    let _ = repository.flush(call.sync_data()).await;
 
     drop(repository);
     drop(connection);
