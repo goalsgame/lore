@@ -2369,6 +2369,35 @@ dependencies = [
 ]
 
 [[package]]
+name = "google-cloud-pubsub"
+version = "1.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4be72496ad46df259d8a489edf2ace5c75729672e1695be3ab06f6f4c4fa9fd3"
+dependencies = [
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "futures",
+ "google-cloud-auth",
+ "google-cloud-gax",
+ "google-cloud-gax-internal",
+ "google-cloud-iam-v1",
+ "google-cloud-wkt",
+ "http 1.4.0",
+ "prost",
+ "prost-types",
+ "serde",
+ "serde_json",
+ "serde_with",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "google-cloud-rpc"
 version = "1.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3431,17 +3460,22 @@ dependencies = [
  "firestore",
  "futures",
  "gcloud-sdk",
+ "google-cloud-auth",
  "google-cloud-gax",
+ "google-cloud-pubsub",
  "google-cloud-storage",
  "hex",
  "jsonwebtoken 10.4.0",
  "lore-base",
  "lore-error-set",
  "lore-macro",
+ "lore-proto",
  "lore-revision",
  "lore-storage",
  "lore-telemetry",
  "opentelemetry 0.31.0",
+ "prost",
+ "prost-types",
  "rand 0.9.4",
  "rustls",
  "serde",
@@ -6073,6 +6107,7 @@ dependencies = [
  "futures-core",
  "futures-sink",
  "futures-util",
+ "hashbrown 0.15.5",
  "pin-project-lite",
  "tokio",
 ]
