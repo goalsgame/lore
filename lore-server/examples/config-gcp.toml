@@ -35,8 +35,13 @@ mode = "local"
 # decoding the payload. Omit this section to keep the default in-process
 # sender.
 #
-# The topic must exist; the plugin does not create it. The service account
-# needs roles/pubsub.publisher on it.
+# The topic must exist and the service account needs roles/pubsub.publisher on
+# it. Both are checked at startup: the plugin asks Pub/Sub for the topic and
+# refuses to start if it is absent or not writable, because the publisher is
+# otherwise built from the topic's name alone and a typo would leave a server
+# that runs normally and discards every event. A transport failure reaching
+# Pub/Sub is logged and tolerated instead -- that is transient, and it should
+# not stop the server serving version control.
 #
 # Events go to both: the server keeps delivering to the in-process sender, so
 # the gRPC Subscribe RPC works alongside the topic rather than being replaced

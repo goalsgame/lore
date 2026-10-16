@@ -20,7 +20,9 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use google_cloud_gax::error::rpc::Code;
 use google_cloud_pubsub::client::Publisher;
+use google_cloud_pubsub::client::TopicAdmin;
 use google_cloud_pubsub::error::PublishError;
 use google_cloud_pubsub::model::Message as PubsubMessage;
 use lore_base::types::Address;
@@ -43,6 +45,8 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::gcp_error::GcpError;
 
 /// Configuration for the Pub/Sub notification sender.
 #[derive(Clone, Debug)]
@@ -125,14 +129,27 @@ impl OutcomeGate {
 }
 
 impl PubSubNotificationSender {
-    /// Builds a publisher for `settings`' topic.
+    /// Builds a publisher for `settings`' topic, after checking the topic can be
+    /// published to.
+    ///
+    /// The publisher itself is built from the topic's *name* and never contacts it,
+    /// so without this check a mistyped topic or a missing `roles/pubsub.publisher`
+    /// grant would leave a server that starts cleanly, serves normally, and
+    /// discards every event — delivery here is best-effort, so nothing else would
+    /// report it either.
     ///
     /// # Errors
-    /// Returns the client's error if the topic's publisher cannot be built, which
-    /// covers unreachable credentials and a malformed endpoint.
-    pub async fn new(
-        settings: &PubSubSettings,
-    ) -> Result<Self, google_cloud_gax::client_builder::Error> {
+    /// [`GcpError::PubSubTopic`] when the topic is absent or this identity may not
+    /// publish to it: both are configuration errors that will not fix themselves,
+    /// and failing to start is the loudest way to say so.
+    ///
+    /// [`GcpError::ClientBuild`] when a client cannot be constructed at all.
+    ///
+    /// Any other failure reaching Pub/Sub — unavailable, timed out — is logged and
+    /// tolerated. Those are transient, and refusing to start a version control
+    /// server because its notification backend is briefly unreachable trades a
+    /// large outage for a small one.
+    pub async fn new(settings: &PubSubSettings) -> Result<Self, GcpError> {
         // As `build_storage_clients` and `build_firestore_db` do: a caller that
         // reaches this before any other GCP client must not depend on something
         // else having installed the rustls provider first.
@@ -143,8 +160,20 @@ impl PubSubNotificationSender {
             builder = builder.with_endpoint(endpoint.clone());
         }
 
+        let publisher = builder.build().await.map_err(GcpError::client_build)?;
+
+        let mut admin_builder = TopicAdmin::builder();
+        if let Some(endpoint) = settings.endpoint.as_ref() {
+            admin_builder = admin_builder.with_endpoint(endpoint.clone());
+        }
+        let admin = admin_builder
+            .build()
+            .await
+            .map_err(GcpError::client_build)?;
+        check_topic_is_publishable(&admin, &settings.topic_resource_name()).await?;
+
         Ok(Self {
-            publisher: builder.build().await?,
+            publisher,
             outcomes: OutcomeGate::new(settings.outcome_concurrency_limit),
         })
     }
@@ -189,6 +218,36 @@ impl PubSubNotificationSender {
 
         self.outcomes
             .observe(self.publisher.publish(message), event_type, repository_hex);
+    }
+}
+
+/// Asks Pub/Sub for `topic`, so a configuration error is reported at startup
+/// rather than as silence.
+///
+/// Takes the client rather than building one, so a test can supply the anonymous
+/// credentials an emulator needs without that being a production option.
+async fn check_topic_is_publishable(admin: &TopicAdmin, topic: &str) -> Result<(), GcpError> {
+    match admin.get_topic().set_topic(topic).send().await {
+        Ok(_) => Ok(()),
+        Err(error) => match error.status().map(|status| status.code) {
+            Some(Code::NotFound) => Err(GcpError::PubSubTopic(format!(
+                "{topic} does not exist; it is not created automatically"
+            ))),
+            Some(Code::PermissionDenied) => Err(GcpError::PubSubTopic(format!(
+                "not permitted to publish to {topic}; the service account needs \
+                     roles/pubsub.publisher on it"
+            ))),
+            _ => {
+                // Transient as far as this can tell. Publishing will report its
+                // own failures; a server that will not start is the worse answer.
+                warn!(
+                    %topic,
+                    %error,
+                    "Could not confirm the Pub/Sub topic at startup; continuing"
+                );
+                Ok(())
+            }
+        },
     }
 }
 
@@ -550,6 +609,52 @@ mod emulator_tests {
         let event = notification::Event::decode(message.data.as_ref())
             .expect("the payload decodes as a lore.notification.Event");
         (event, message.attributes.clone())
+    }
+
+    /// An admin client against the emulator. The production constructor builds its
+    /// own, which reaches for Application Default Credentials -- fine on a server,
+    /// absent in CI -- so the check is driven directly here with anonymous ones.
+    async fn emulator_topic_admin() -> TopicAdmin {
+        TopicAdmin::builder()
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the topic admin client")
+    }
+
+    /// The reason the check exists: the publisher is built from the topic's name
+    /// and never contacts it, so without this a mistyped topic would start
+    /// cleanly and discard every event in silence.
+    #[tokio::test]
+    async fn a_missing_topic_is_refused() {
+        let absent = format!(
+            "projects/{PROJECT}/topics/absent-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+
+        let Err(error) = check_topic_is_publishable(&emulator_topic_admin().await, &absent).await
+        else {
+            panic!("a topic that does not exist must not be reported as publishable");
+        };
+
+        assert!(
+            matches!(error, GcpError::PubSubTopic(_)),
+            "expected a topic error, got {error:?}"
+        );
+        assert!(
+            format!("{error}").contains("does not exist"),
+            "the message should say what is wrong: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_existing_topic_is_accepted() {
+        let (topic, _subscription) = topic_and_subscription().await;
+
+        check_topic_is_publishable(&emulator_topic_admin().await, &topic)
+            .await
+            .expect("a topic that exists must be reported as publishable");
     }
 
     #[tokio::test]

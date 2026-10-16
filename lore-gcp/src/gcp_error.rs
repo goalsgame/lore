@@ -25,6 +25,11 @@ pub enum GcpError {
     /// A Firestore document existed but could not be decoded into the shape this crate expects.
     #[error("Firestore document decode failed: {0}")]
     Decode(String),
+    /// The configured Pub/Sub topic cannot be published to: it does not exist, or this
+    /// identity may not publish to it. Deliberately distinct from a transport failure
+    /// reaching Pub/Sub, which is transient and must not stop the server starting.
+    #[error("Pub/Sub topic unusable: {0}")]
+    PubSubTopic(String),
     /// A GCS/Firestore client could not be constructed (credentials, transport init, etc). A
     /// distinct variant from [`GcpError::Gcs`] because client construction uses its own error
     /// type (`google_cloud_gax::client_builder::Error`), separate from the one runtime RPCs
