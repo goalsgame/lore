@@ -38,16 +38,13 @@ mode = "local"
 # The topic must exist; the plugin does not create it. The service account
 # needs roles/pubsub.publisher on it.
 #
-# Two things this costs, both of which bite on a single instance too:
+# Events go to both: the server keeps delivering to the in-process sender, so
+# the gRPC Subscribe RPC works alongside the topic rather than being replaced
+# by it.
 #
-# 1. The notification Subscribe RPC is turned off. configure_notification
-#    returns no NotificationService for a plugin mode, and grpc/server.rs only
-#    registers that service when one exists, so a client calling Subscribe gets
-#    UNIMPLEMENTED. Pub/Sub replaces in-process subscriptions here rather than
-#    adding to them; anything relying on Subscribe has to move to the topic.
-# 2. This sender contributes no receiver, so obliterate propagation between
-#    server instances is not covered. That is correct for a single instance and
-#    not for any other.
+# What this does not cover: the sender contributes no receiver, so obliterate
+# propagation between server instances does not happen. That is correct for a
+# single instance and not for any other.
 #[notification]
 #mode = "gcp"
 #

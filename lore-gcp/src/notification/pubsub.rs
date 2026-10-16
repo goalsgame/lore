@@ -9,10 +9,9 @@
 //! and, where the event names one, `branch` — so a subscription can filter without
 //! decoding the payload.
 //!
-//! Selecting this sender turns the notification Subscribe RPC off: the server
-//! builds a `NotificationService` only for the in-process sender, and registers
-//! that gRPC service only when one exists. This replaces in-process
-//! subscriptions rather than adding to them.
+//! This adds a destination rather than replacing one: the server fans each event
+//! out to the in-process sender as well, so the gRPC Subscribe RPC keeps working
+//! alongside the topic.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;

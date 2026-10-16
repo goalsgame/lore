@@ -1662,18 +1662,17 @@ async fn configure_notification(
     let mode = notification_settings
         .as_ref()
         .map_or("local", |ns| ns.mode.as_ref());
+    // Built whatever the mode: the gRPC Subscribe RPC is served from this
+    // sender's broadcast channels, and a plugin has none to offer. A plugin mode
+    // adds a destination rather than replacing this one.
+    let local = Arc::new(crate::notification::local::NotificationSender::default());
+    let service =
+        NotificationService::new(local.clone(), repository_authorizer, authorization_timeout);
+
     match mode {
         "local" => {
             info!("Starting local notification service");
-            let sender = Arc::new(crate::notification::local::NotificationSender::default());
-            Ok((
-                sender.clone(),
-                Some(NotificationService::new(
-                    sender,
-                    repository_authorizer,
-                    authorization_timeout,
-                )),
-            ))
+            Ok((local, Some(service)))
         }
         plugin_name => {
             info!(plugin_name = plugin_name, "Creating notification plugin");
@@ -1705,7 +1704,15 @@ async fn configure_notification(
                 });
             }
 
-            Ok((output.sender, None))
+            // Both: the plugin gets every event, and in-process subscribers keep
+            // the Subscribe RPC they had before the plugin was configured.
+            Ok((
+                Arc::new(crate::notification::fanout::NotificationSender::new(
+                    local,
+                    output.sender,
+                )),
+                Some(service),
+            ))
         }
     }
 }
