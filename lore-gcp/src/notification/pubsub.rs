@@ -666,16 +666,23 @@ mod emulator_tests {
         );
     }
 
+    /// Asserts the confirmation, not just the absence of a complaint: a test that
+    /// only checked nothing was logged would pass against a function that did
+    /// nothing at all.
     #[tokio::test]
     #[tracing_test::traced_test]
-    async fn an_existing_topic_is_not_reported_as_missing() {
+    async fn an_existing_topic_is_confirmed() {
         let (topic, _subscription) = topic_and_subscription().await;
 
         report_topic_reachability(&emulator_topic_admin().await, &topic).await;
 
         assert!(
+            logs_contain("Pub/Sub topic confirmed at startup"),
+            "a topic that exists must be reported as confirmed"
+        );
+        assert!(
             !logs_contain("does not exist"),
-            "a topic that exists must not be reported missing"
+            "and must not be reported missing"
         );
     }
 
