@@ -170,7 +170,7 @@ impl PubSubNotificationSender {
             .build()
             .await
             .map_err(GcpError::client_build)?;
-        check_topic_is_publishable(&admin, &settings.topic_resource_name()).await?;
+        report_topic_reachability(&admin, &settings.topic_resource_name()).await;
 
         Ok(Self {
             publisher,
@@ -221,32 +221,41 @@ impl PubSubNotificationSender {
     }
 }
 
-/// Asks Pub/Sub for `topic`, so a configuration error is reported at startup
-/// rather than as silence.
+/// Looks the topic up at startup and says what it finds, so a mistyped topic has
+/// something pointing at it before anyone notices the silence.
+///
+/// Reports rather than refuses, and that is not timidity. `roles/pubsub.publisher`
+/// grants exactly `pubsub.topics.publish` -- not `pubsub.topics.get` -- so the
+/// correctly scoped, publisher-only identity this plugin is meant to run as is
+/// answered `PermissionDenied` here. Failing on that would refuse to start
+/// precisely the deployment the documentation asks for. Nor can the failure be
+/// narrowed to `NotFound`: without `topics.get`, Pub/Sub answers `PermissionDenied`
+/// for an absent topic just as for a present one, so the two cannot be told apart
+/// from here.
+///
+/// Verifying publish permission directly would need `TestIamPermissions`, which
+/// `google-cloud-pubsub`'s `TopicAdmin` does not expose. Until it does, or until
+/// the deployment also carries metadata read access, a startup log line is the
+/// honest extent of this: it catches a typo for anyone reading the log, and it
+/// never rejects a working configuration.
 ///
 /// Takes the client rather than building one, so a test can supply the anonymous
 /// credentials an emulator needs without that being a production option.
-async fn check_topic_is_publishable(admin: &TopicAdmin, topic: &str) -> Result<(), GcpError> {
+async fn report_topic_reachability(admin: &TopicAdmin, topic: &str) {
     match admin.get_topic().set_topic(topic).send().await {
-        Ok(_) => Ok(()),
+        Ok(_) => debug!(%topic, "Pub/Sub topic confirmed at startup"),
         Err(error) => match error.status().map(|status| status.code) {
-            Some(Code::NotFound) => Err(GcpError::PubSubTopic(format!(
-                "{topic} does not exist; it is not created automatically"
-            ))),
-            Some(Code::PermissionDenied) => Err(GcpError::PubSubTopic(format!(
-                "not permitted to publish to {topic}; the service account needs \
-                     roles/pubsub.publisher on it"
-            ))),
-            _ => {
-                // Transient as far as this can tell. Publishing will report its
-                // own failures; a server that will not start is the worse answer.
-                warn!(
-                    %topic,
-                    %error,
-                    "Could not confirm the Pub/Sub topic at startup; continuing"
-                );
-                Ok(())
-            }
+            Some(Code::NotFound) => warn!(
+                %topic,
+                "Pub/Sub topic does not exist; it is not created automatically, and every \
+                 notification will publish into nothing until it is"
+            ),
+            Some(Code::PermissionDenied) => debug!(
+                %topic,
+                "Cannot read the topic's metadata, which roles/pubsub.publisher does not \
+                 grant; whether it exists and is writable is unverified"
+            ),
+            _ => warn!(%topic, %error, "Could not reach Pub/Sub to confirm the topic at startup"),
         },
     }
 }
@@ -623,38 +632,37 @@ mod emulator_tests {
             .expect("building the topic admin client")
     }
 
-    /// The reason the check exists: the publisher is built from the topic's name
-    /// and never contacts it, so without this a mistyped topic would start
-    /// cleanly and discard every event in silence.
+    /// A missing topic is reported, not refused -- see `report_topic_reachability`
+    /// for why refusing would reject the publisher-only identity this is meant to
+    /// run as. The log line is the whole deliverable, so the test asserts the call
+    /// completes against an absent topic rather than that it fails.
     #[tokio::test]
-    async fn a_missing_topic_is_refused() {
+    #[tracing_test::traced_test]
+    async fn a_missing_topic_is_reported_and_not_refused() {
         let absent = format!(
             "projects/{PROJECT}/topics/absent-{}",
             uuid::Uuid::new_v4().simple()
         );
 
-        let Err(error) = check_topic_is_publishable(&emulator_topic_admin().await, &absent).await
-        else {
-            panic!("a topic that does not exist must not be reported as publishable");
-        };
+        report_topic_reachability(&emulator_topic_admin().await, &absent).await;
 
         assert!(
-            matches!(error, GcpError::PubSubTopic(_)),
-            "expected a topic error, got {error:?}"
-        );
-        assert!(
-            format!("{error}").contains("does not exist"),
-            "the message should say what is wrong: {error}"
+            logs_contain("Pub/Sub topic does not exist"),
+            "a missing topic must leave something in the log to find it by"
         );
     }
 
     #[tokio::test]
-    async fn an_existing_topic_is_accepted() {
+    #[tracing_test::traced_test]
+    async fn an_existing_topic_is_not_reported_as_missing() {
         let (topic, _subscription) = topic_and_subscription().await;
 
-        check_topic_is_publishable(&emulator_topic_admin().await, &topic)
-            .await
-            .expect("a topic that exists must be reported as publishable");
+        report_topic_reachability(&emulator_topic_admin().await, &topic).await;
+
+        assert!(
+            !logs_contain("does not exist"),
+            "a topic that exists must not be reported missing"
+        );
     }
 
     #[tokio::test]
