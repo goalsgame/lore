@@ -8,6 +8,11 @@
 //! both backends. Each message also carries attributes — `event_type`, `repository`
 //! and, where the event names one, `branch` — so a subscription can filter without
 //! decoding the payload.
+//!
+//! Selecting this sender turns the notification Subscribe RPC off: the server
+//! builds a `NotificationService` only for the in-process sender, and registers
+//! that gRPC service only when one exists. This replaces in-process
+//! subscriptions rather than adding to them.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
@@ -63,11 +68,61 @@ impl PubSubSettings {
 /// Publishes notification events to a Pub/Sub topic.
 pub struct PubSubNotificationSender {
     publisher: Publisher,
-    /// Bounds the tasks awaiting publish outcomes; see [`Self::observe`].
-    outcomes: Arc<Semaphore>,
-    /// Publishes whose outcome was never observed because `outcomes` was full.
-    /// They were still handed to the client; only the log line was dropped.
+    outcomes: OutcomeGate,
+}
+
+/// Bounds how many publish outcomes are being awaited at once.
+///
+/// A Pub/Sub outage would otherwise leave one task per event with nothing
+/// draining them. Past the bound the observation is dropped and counted; the
+/// publish it belonged to has already been handed to the client either way, so
+/// what is lost is the log line, never the message.
+#[derive(Clone)]
+struct OutcomeGate {
+    permits: Arc<Semaphore>,
     unobserved: Arc<AtomicU64>,
+}
+
+impl OutcomeGate {
+    fn new(limit: usize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(limit.max(1))),
+            unobserved: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    fn unobserved(&self) -> u64 {
+        self.unobserved.load(Ordering::Relaxed)
+    }
+
+    /// Awaits `outcome` on its own task, or drops the observation and counts it
+    /// when no permit is free. Answers whether a permit was taken.
+    fn observe<F>(&self, outcome: F, event_type: &'static str, repository: String) -> bool
+    where
+        F: Future<Output = Result<String, PublishError>> + Send + 'static,
+    {
+        let Ok(permit) = self.permits.clone().try_acquire_owned() else {
+            let dropped = self.unobserved.fetch_add(1, Ordering::Relaxed) + 1;
+            debug!(
+                event_type,
+                repository, dropped, "Publish outcome left unobserved; the gate is full"
+            );
+            return false;
+        };
+
+        lore_base::lore_spawn!("pubsub.publish_outcome", async move {
+            let _permit = permit;
+            if let Err(error) = outcome.await {
+                warn!(
+                    event_type,
+                    repository,
+                    %error,
+                    "Failed to publish a notification event to Pub/Sub"
+                );
+            }
+        });
+        true
+    }
 }
 
 impl PubSubNotificationSender {
@@ -79,6 +134,11 @@ impl PubSubNotificationSender {
     pub async fn new(
         settings: &PubSubSettings,
     ) -> Result<Self, google_cloud_gax::client_builder::Error> {
+        // As `build_storage_clients` and `build_firestore_db` do: a caller that
+        // reaches this before any other GCP client must not depend on something
+        // else having installed the rustls provider first.
+        crate::clients::ensure_crypto_provider();
+
         let mut builder = Publisher::builder(settings.topic_resource_name());
         if let Some(endpoint) = settings.endpoint.as_ref() {
             builder = builder.with_endpoint(endpoint.clone());
@@ -86,14 +146,13 @@ impl PubSubNotificationSender {
 
         Ok(Self {
             publisher: builder.build().await?,
-            outcomes: Arc::new(Semaphore::new(settings.outcome_concurrency_limit.max(1))),
-            unobserved: Arc::new(AtomicU64::new(0)),
+            outcomes: OutcomeGate::new(settings.outcome_concurrency_limit),
         })
     }
 
     /// Publishes whose outcome went unobserved because the gate was full.
     pub fn unobserved_publishes(&self) -> u64 {
-        self.unobserved.load(Ordering::Relaxed)
+        self.outcomes.unobserved()
     }
 
     /// Encodes `event` and hands it to the publisher.
@@ -129,38 +188,8 @@ impl PubSubNotificationSender {
             .set_data(envelope.encode_to_vec())
             .set_attributes(attributes);
 
-        self.observe(self.publisher.publish(message), event_type, repository_hex);
-    }
-
-    /// Awaits a publish outcome on its own task, so the caller is not held behind it.
-    ///
-    /// The gate bounds how many such tasks exist at once: a Pub/Sub outage would
-    /// otherwise grow one per event with nothing draining them. Failing to take a
-    /// permit drops the observation, never the publish.
-    fn observe<F>(&self, outcome: F, event_type: &'static str, repository: String)
-    where
-        F: Future<Output = Result<String, PublishError>> + Send + 'static,
-    {
-        let Ok(permit) = self.outcomes.clone().try_acquire_owned() else {
-            let dropped = self.unobserved.fetch_add(1, Ordering::Relaxed) + 1;
-            debug!(
-                event_type,
-                repository, dropped, "Publish outcome left unobserved; the gate is full"
-            );
-            return;
-        };
-
-        lore_base::lore_spawn!("pubsub.publish_outcome", async move {
-            let _permit = permit;
-            if let Err(error) = outcome.await {
-                warn!(
-                    event_type,
-                    repository,
-                    %error,
-                    "Failed to publish a notification event to Pub/Sub"
-                );
-            }
-        });
+        self.outcomes
+            .observe(self.publisher.publish(message), event_type, repository_hex);
     }
 }
 
@@ -330,6 +359,70 @@ mod tests {
                 branch,
             })),
             ("branch_deleted", Some("abcd".to_string()))
+        );
+    }
+
+    /// Saturating the gate must not stop anything being published: the gate holds
+    /// outcome *observers*, and a publish is handed to the client before one is
+    /// taken. This drives it directly, since reaching it through the sender needs
+    /// a live Publisher.
+    #[tokio::test]
+    async fn a_saturated_gate_drops_observations_and_nothing_else() {
+        let gate = OutcomeGate::new(2);
+        let (release, mut rx) = tokio::sync::broadcast::channel::<()>(1);
+
+        // Two observers that park until released, taking both permits.
+        for _ in 0..2 {
+            let mut parked = release.subscribe();
+            assert!(
+                gate.observe(
+                    async move {
+                        let _ = parked.recv().await;
+                        Ok(String::new())
+                    },
+                    "branch_pushed",
+                    "repo".to_string()
+                ),
+                "a free permit should have been taken"
+            );
+        }
+        // Let both tasks reach their await before the gate is probed again.
+        tokio::task::yield_now().await;
+
+        let mut outcomes_run = 0;
+        for _ in 0..8 {
+            let observed = gate.observe(
+                async { Ok::<_, PublishError>(String::new()) },
+                "branch_pushed",
+                "repo".to_string(),
+            );
+            if observed {
+                outcomes_run += 1;
+            }
+        }
+
+        assert_eq!(
+            outcomes_run, 0,
+            "the gate was full, so none should be taken"
+        );
+        assert_eq!(gate.unobserved(), 8, "every dropped observation is counted");
+
+        // Releasing the parked observers returns the permits.
+        let _ = release.send(());
+        let _ = rx.recv().await;
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+            if gate.permits.available_permits() == 2 {
+                break;
+            }
+        }
+        assert!(
+            gate.observe(
+                async { Ok(String::new()) },
+                "branch_pushed",
+                "repo".to_string()
+            ),
+            "a permit should be free again once the parked observers finish"
         );
     }
 
