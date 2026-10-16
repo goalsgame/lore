@@ -16,6 +16,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
@@ -213,6 +214,11 @@ impl PubSubNotificationSender {
     }
 }
 
+/// How long the startup lookup may take before it is abandoned. It is advisory:
+/// the server is not waiting on it for anything it needs, so it must not be able
+/// to hold readiness behind a Pub/Sub that is slow or unreachable.
+const TOPIC_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Looks the topic up at startup and says what it finds, so a mistyped topic has
 /// something pointing at it before anyone notices the silence.
 ///
@@ -234,7 +240,17 @@ impl PubSubNotificationSender {
 /// Takes the client rather than building one, so a test can supply the anonymous
 /// credentials an emulator needs without that being a production option.
 async fn report_topic_reachability(admin: &TopicAdmin, topic: &str) {
-    match admin.get_topic().set_topic(topic).send().await {
+    let lookup = admin.get_topic().set_topic(topic).send();
+    let Ok(result) = tokio::time::timeout(TOPIC_LOOKUP_TIMEOUT, lookup).await else {
+        warn!(
+            %topic,
+            timeout = ?TOPIC_LOOKUP_TIMEOUT,
+            "Gave up confirming the Pub/Sub topic at startup; continuing without it"
+        );
+        return;
+    };
+
+    match result {
         Ok(_) => debug!(%topic, "Pub/Sub topic confirmed at startup"),
         Err(error) => match error.status().map(|status| status.code) {
             Some(Code::NotFound) => warn!(
