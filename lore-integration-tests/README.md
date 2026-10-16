@@ -57,16 +57,27 @@ from, both of which are private to `lore_gcp::store::immutable_store`. They run 
 [compose.yaml](./compose.yaml) starts on port 8787, and need no credentials — the GCS clients they
 build are never called.
 
+The notification sender is covered the same way, against the
+[Pub/Sub emulator](https://cloud.google.com/pubsub/docs/emulator) on port 8085: a test creates a
+topic and a subscription, drives the sender's callbacks, and reads the messages back to check the
+decoded `lore.notification.Event` and the attributes a subscription filters on.
+
 ```shell
-$ docker compose --file lore-integration-tests/compose.yaml up --detach firestore
-$ FIRESTORE_EMULATOR_HOST=127.0.0.1:8787 cargo test --package lore-gcp --features integration_tests
+$ docker compose --file lore-integration-tests/compose.yaml up --detach firestore pubsub
+$ FIRESTORE_EMULATOR_HOST=127.0.0.1:8787 PUBSUB_EMULATOR_HOST=127.0.0.1:8085 \
+    cargo test --package lore-gcp --features integration_tests
 ```
+
+`PUBSUB_EMULATOR_HOST` is read by the tests themselves, not by the client: `google-cloud-pubsub`
+has no emulator support of its own, so the tests pass the endpoint and anonymous credentials to
+the builder explicitly.
 
 Without Docker, the same emulator comes from the Google Cloud CLI:
 
 ```shell
-$ gcloud components install cloud-firestore-emulator
+$ gcloud components install cloud-firestore-emulator pubsub-emulator
 $ gcloud emulators firestore start --host-port=127.0.0.1:8787
+$ gcloud beta emulators pubsub start --host-port=127.0.0.1:8085
 ```
 
 The emulator keeps everything in memory, and each test gives itself collection names of its own,

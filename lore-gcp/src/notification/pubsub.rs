@@ -444,3 +444,196 @@ mod tests {
         );
     }
 }
+
+/// Tests against the Pub/Sub emulator from `lore-integration-tests/compose.yaml`.
+///
+/// `google-cloud-pubsub` has no emulator support of its own — it reads no
+/// `PUBSUB_EMULATOR_HOST` — so these read that variable themselves and hand the
+/// endpoint and anonymous credentials to each builder.
+#[cfg(all(test, feature = "integration_tests"))]
+mod emulator_tests {
+    use std::time::Duration;
+
+    use google_cloud_auth::credentials::anonymous::Builder as AnonymousCredentials;
+    use google_cloud_pubsub::client::Subscriber;
+    use google_cloud_pubsub::client::SubscriptionAdmin;
+    use google_cloud_pubsub::client::TopicAdmin;
+    use lore_base::types::Context;
+
+    use super::*;
+
+    const PROJECT: &str = "lore-gcp-emulator-tests";
+
+    /// The emulator's endpoint, and the crypto provider every client built here
+    /// needs. `PubSubNotificationSender::new` installs it for the production
+    /// path; these tests build their clients directly and so must do it too.
+    fn endpoint() -> String {
+        crate::clients::ensure_crypto_provider();
+        let host = std::env::var("PUBSUB_EMULATOR_HOST")
+            .expect("PUBSUB_EMULATOR_HOST; is the Pub/Sub emulator running?");
+        format!("http://{host}")
+    }
+
+    /// A topic and a subscription on it, named for this test alone so tests
+    /// sharing one emulator cannot read each other's messages.
+    async fn topic_and_subscription() -> (String, String) {
+        let suffix = uuid::Uuid::new_v4().simple().to_string();
+        let topic = format!("projects/{PROJECT}/topics/events-{suffix}");
+        let subscription = format!("projects/{PROJECT}/subscriptions/reader-{suffix}");
+
+        TopicAdmin::builder()
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the topic admin client")
+            .create_topic()
+            .set_name(&topic)
+            .send()
+            .await
+            .expect("creating the topic");
+
+        SubscriptionAdmin::builder()
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the subscription admin client")
+            .create_subscription()
+            .set_name(&subscription)
+            .set_topic(&topic)
+            .send()
+            .await
+            .expect("creating the subscription");
+
+        (topic, subscription)
+    }
+
+    /// A sender publishing to `topic`. Built here rather than through
+    /// `PubSubNotificationSender::new` because the emulator needs anonymous
+    /// credentials, which are not a production configuration option.
+    async fn sender_for(topic: &str) -> PubSubNotificationSender {
+        let publisher = Publisher::builder(topic.to_string())
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the publisher");
+
+        PubSubNotificationSender {
+            publisher,
+            outcomes: OutcomeGate::new(64),
+        }
+    }
+
+    /// Reads one message, returning its decoded event and its attributes.
+    async fn read_one(
+        subscription: &str,
+    ) -> (
+        notification::Event,
+        std::collections::HashMap<String, String>,
+    ) {
+        let subscriber = Subscriber::builder()
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the subscriber");
+
+        let mut stream = subscriber.subscribe(subscription.to_string()).build();
+        let (message, handler) = tokio::time::timeout(Duration::from_secs(30), stream.next())
+            .await
+            .expect("a message within 30s")
+            .expect("the stream yielded nothing")
+            .expect("the stream failed");
+        handler.ack();
+
+        let event = notification::Event::decode(message.data.as_ref())
+            .expect("the payload decodes as a lore.notification.Event");
+        (event, message.attributes.clone())
+    }
+
+    #[tokio::test]
+    async fn a_pushed_branch_arrives_decodable_with_its_fields_intact() {
+        let (topic, subscription) = topic_and_subscription().await;
+        let sender = sender_for(&topic).await;
+
+        let repository = RepositoryId::from(&[0x11u8; 16][..]);
+        let branch = BranchId::from(&[0x22u8; 16][..]);
+        let revision = Hash::from([0x33u8; 32]);
+
+        sender
+            .branch_pushed(repository, branch, "someone@example.com", revision, 469)
+            .await;
+
+        let (event, attributes) = read_one(&subscription).await;
+
+        assert_eq!(
+            event.repository.as_ref(),
+            Context::from(repository).data(),
+            "the envelope names the repository"
+        );
+        assert!(!event.id.is_empty(), "every event carries an id");
+        assert!(event.time.is_some(), "every event carries a time");
+
+        let Some(notification::event::Event::BranchPushed(pushed)) = event.event else {
+            panic!("expected a BranchPushed payload, got {:?}", event.event);
+        };
+        assert_eq!(pushed.user_id, "someone@example.com");
+        assert_eq!(pushed.revision_number, 469);
+        assert_eq!(pushed.revision.as_ref(), revision.as_ref());
+        assert_eq!(pushed.branch.as_ref(), branch.data());
+
+        assert_eq!(
+            attributes.get("event_type").map(String::as_str),
+            Some("branch_pushed")
+        );
+        assert_eq!(
+            attributes.get("repository").map(String::as_str),
+            Some(hex::encode(Context::from(repository).data()).as_str())
+        );
+        assert_eq!(
+            attributes.get("branch").map(String::as_str),
+            Some(hex::encode(branch.data()).as_str()),
+            "a branch event is filterable by branch"
+        );
+    }
+
+    /// A lock event's branch is per resource, so the event carries no `branch`
+    /// attribute. A subscription filtering on `branch` must not match one.
+    #[tokio::test]
+    async fn a_lock_event_arrives_with_its_resources_and_no_branch_attribute() {
+        let (topic, subscription) = topic_and_subscription().await;
+        let sender = sender_for(&topic).await;
+
+        let repository = RepositoryId::from(&[0x44u8; 16][..]);
+        let branch = BranchId::from(&[0x55u8; 16][..]);
+        let resource = LockResource {
+            branch: (*branch.data()).into(),
+            hash: [0x66u8; 32].into(),
+            description: "Content/Foo.uasset".to_string(),
+        };
+
+        sender
+            .resource_locked(repository, branch, "someone@example.com", &[resource])
+            .await;
+
+        let (event, attributes) = read_one(&subscription).await;
+
+        let Some(notification::event::Event::ResourceLocked(locked)) = event.event else {
+            panic!("expected a ResourceLocked payload, got {:?}", event.event);
+        };
+        assert_eq!(locked.user_id, "someone@example.com");
+        assert_eq!(locked.resources.len(), 1);
+        assert_eq!(locked.resources[0].description, "Content/Foo.uasset");
+
+        assert_eq!(
+            attributes.get("event_type").map(String::as_str),
+            Some("resource_locked")
+        );
+        assert!(
+            !attributes.contains_key("branch"),
+            "a lock event names no single branch, so it must not claim one"
+        );
+    }
+}
