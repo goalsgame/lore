@@ -57,6 +57,11 @@ lore-telemetry = { workspace = true }
 
 [dev-dependencies]
 chrono = { workspace = true }
+# Only for the emulator tests: anonymous credentials, since the Pub/Sub emulator
+# wants none and the client would otherwise reach for Application Default
+# Credentials. default-features = false for the same aws-lc-rs reason as the
+# google-cloud-* dependencies above.
+google-cloud-auth = { version = "1.17", default-features = false }
 # Only for the emulator tests' token source. Same version firestore resolves, so the
 # `Source`/`Token` types the client takes are the ones this builds.
 gcloud-sdk = { version = "0.28.5", default-features = false }

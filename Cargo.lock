@@ -3460,6 +3460,7 @@ dependencies = [
  "firestore",
  "futures",
  "gcloud-sdk",
+ "google-cloud-auth",
  "google-cloud-gax",
  "google-cloud-pubsub",
  "google-cloud-storage",
