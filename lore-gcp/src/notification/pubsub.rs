@@ -129,26 +129,18 @@ impl OutcomeGate {
 }
 
 impl PubSubNotificationSender {
-    /// Builds a publisher for `settings`' topic, after checking the topic can be
-    /// published to.
+    /// Builds a publisher for `settings`' topic.
     ///
-    /// The publisher itself is built from the topic's *name* and never contacts it,
-    /// so without this check a mistyped topic or a missing `roles/pubsub.publisher`
-    /// grant would leave a server that starts cleanly, serves normally, and
-    /// discards every event — delivery here is best-effort, so nothing else would
-    /// report it either.
+    /// The publisher is built from the topic's *name* and never contacts it, so a
+    /// mistyped topic or a missing `roles/pubsub.publisher` grant yields a sender
+    /// that looks healthy and discards everything — delivery is best-effort, so
+    /// nothing downstream reports it either. [`report_topic_reachability`] logs
+    /// what it can about that at startup; read its documentation for why it cannot
+    /// refuse, and do not read this constructor as validating the destination.
     ///
     /// # Errors
-    /// [`GcpError::PubSubTopic`] when the topic is absent or this identity may not
-    /// publish to it: both are configuration errors that will not fix themselves,
-    /// and failing to start is the loudest way to say so.
-    ///
-    /// [`GcpError::ClientBuild`] when a client cannot be constructed at all.
-    ///
-    /// Any other failure reaching Pub/Sub — unavailable, timed out — is logged and
-    /// tolerated. Those are transient, and refusing to start a version control
-    /// server because its notification backend is briefly unreachable trades a
-    /// large outage for a small one.
+    /// [`GcpError::ClientBuild`] when a client cannot be constructed at all. No
+    /// outcome of the topic lookup fails construction.
     pub async fn new(settings: &PubSubSettings) -> Result<Self, GcpError> {
         // As `build_storage_clients` and `build_firestore_db` do: a caller that
         // reaches this before any other GCP client must not depend on something
@@ -250,10 +242,16 @@ async fn report_topic_reachability(admin: &TopicAdmin, topic: &str) {
                 "Pub/Sub topic does not exist; it is not created automatically, and every \
                  notification will publish into nothing until it is"
             ),
-            Some(Code::PermissionDenied) => debug!(
+            // At warn, not debug: the server filters to warn by default, this is
+            // the answer the documented publisher-only identity always gets, and it
+            // is also the answer a wrong topic name gets. Logging it quietly would
+            // hide the startup line the configuration tells operators to look for.
+            // It says the check was inconclusive, not that publishing is broken.
+            Some(Code::PermissionDenied) => warn!(
                 %topic,
-                "Cannot read the topic's metadata, which roles/pubsub.publisher does not \
-                 grant; whether it exists and is writable is unverified"
+                "Could not confirm the Pub/Sub topic: reading its metadata needs \
+                 pubsub.topics.get, which roles/pubsub.publisher does not grant. Whether it \
+                 exists and accepts writes is unverified -- check the name and the grant"
             ),
             _ => warn!(%topic, %error, "Could not reach Pub/Sub to confirm the topic at startup"),
         },
