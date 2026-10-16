@@ -43,10 +43,15 @@ mode = "local"
 # deployment and not for any other.
 #[notification]
 #mode = "gcp"
-
-#[plugins.gcp.notification]
-#pubsub_project = "my-project"
-#pubsub_topic = "lore-events"
+#
+# The Pub/Sub settings go in [plugins.gcp] directly, not a notification
+# sub-table: configure_notification passes the whole [plugins.gcp] table to the
+# plugin unchanged, where the stores resolve a sub-table per store.
+#
+#   [plugins.gcp]
+#   firestore_project = "..."
+#   pubsub_project = "my-project"
+#   pubsub_topic = "lore-events"
 
 # ---------------------------------------------------------------------
 # GCP Plugin Configuration
