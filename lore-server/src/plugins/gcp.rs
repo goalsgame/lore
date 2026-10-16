@@ -607,6 +607,62 @@ mod tests {
         assert_eq!(plugin_config.pubsub_outcome_concurrency_limit, 256);
     }
 
+    /// `configure_notification` (`server.rs`) hands the plugin the whole
+    /// `[plugins.gcp]` table rather than resolving a `notification` sub-table the
+    /// way the stores resolve theirs. So the Pub/Sub settings have to parse out of
+    /// a table that also carries the Firestore settings and both store sub-tables,
+    /// and documenting them under `[plugins.gcp.notification]` would mean they were
+    /// never read.
+    #[test]
+    fn test_notification_config_parses_from_the_whole_gcp_plugin_table() {
+        let config_str = r#"
+            firestore_project = "my-gcp-project"
+            firestore_database = "my-db"
+            pubsub_project = "my-gcp-project"
+            pubsub_topic = "lore-events"
+
+            [immutable_store]
+            gcs_bucket = "my-bucket"
+
+            [mutable_store]
+            firestore_mutable_store_collection = "mutable_store"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: GcpNotificationPluginConfig = config.clone().try_into().unwrap();
+
+        assert_eq!(plugin_config.pubsub_project, "my-gcp-project");
+        assert_eq!(plugin_config.pubsub_topic, "lore-events");
+
+        // And the factory accepts that same table.
+        assert!(
+            GcpNotificationPluginFactory
+                .validate_config(&config)
+                .is_ok()
+        );
+    }
+
+    /// The settings living one level down is exactly the mistake this guards: the
+    /// table reaching the plugin would carry no `pubsub_project` at all.
+    #[test]
+    fn test_notification_config_under_a_sub_table_is_not_found() {
+        let config_str = r#"
+            firestore_project = "my-gcp-project"
+
+            [notification]
+            pubsub_project = "my-gcp-project"
+            pubsub_topic = "lore-events"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+
+        assert!(
+            GcpNotificationPluginFactory
+                .validate_config(&config)
+                .is_err()
+        );
+    }
+
     /// The topic is not defaulted: publishing branch events to the wrong topic is
     /// worse than refusing to start.
     #[tokio::test]
