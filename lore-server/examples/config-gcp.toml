@@ -28,6 +28,26 @@ mode = "gcp"
 [lock_store]
 mode = "local"
 
+# Publishes branch and lock events to Pub/Sub as the encoded
+# lore.notification.Event protobuf, the same message the in-process sender
+# broadcasts. Each message carries event_type, repository and, where the event
+# names one, branch as attributes, so a subscription can filter without
+# decoding the payload. Omit this section to keep the default in-process
+# sender.
+#
+# The topic must exist; the plugin does not create it. The service account
+# needs roles/pubsub.publisher on it.
+#
+# This sender contributes no receiver, so obliterate propagation between server
+# instances is not covered by it. That is correct for a single-instance
+# deployment and not for any other.
+#[notification]
+#mode = "gcp"
+
+#[plugins.gcp.notification]
+#pubsub_project = "my-project"
+#pubsub_topic = "lore-events"
+
 # ---------------------------------------------------------------------
 # GCP Plugin Configuration
 # ---------------------------------------------------------------------

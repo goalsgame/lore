@@ -18,4 +18,5 @@
 
 pub mod clients;
 pub mod gcp_error;
+pub mod notification;
 pub mod store;

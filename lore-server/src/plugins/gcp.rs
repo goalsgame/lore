@@ -35,6 +35,8 @@ use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_gcp::clients;
+use lore_gcp::notification::PubSubNotificationSender;
+use lore_gcp::notification::PubSubSettings;
 use lore_gcp::store::immutable_store::FirestoreImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcpImmutableStore;
 use lore_gcp::store::immutable_store::GcpImmutableStoreSettings;
@@ -48,6 +50,9 @@ use tracing::info;
 
 use crate::plugins::ImmutableStorePluginFactory;
 use crate::plugins::MutableStorePluginFactory;
+use crate::plugins::NotificationPlugin;
+use crate::plugins::NotificationPluginContext;
+use crate::plugins::NotificationPluginFactory;
 use crate::plugins::PluginError;
 use crate::plugins::PluginRegistry;
 
@@ -404,6 +409,101 @@ impl MutableStorePluginFactory for GcpMutableStorePluginFactory {
     }
 }
 
+/// Configuration for the GCP notification plugin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GcpNotificationPluginConfig {
+    /// GCP project holding the Pub/Sub topic.
+    pub pubsub_project: String,
+
+    /// Topic id within that project, not the full resource name.
+    pub pubsub_topic: String,
+
+    /// Endpoint override, for the Pub/Sub emulator or a regional endpoint.
+    #[serde(default)]
+    pub pubsub_endpoint: Option<String>,
+
+    /// Caps how many publishes the sender awaits the outcome of at once (see
+    /// `PubSubNotificationSender::observe`). Past it a publish still happens; only
+    /// the log line for its failure is dropped.
+    #[serde(default = "default_pubsub_outcome_concurrency_limit")]
+    pub pubsub_outcome_concurrency_limit: usize,
+}
+
+fn default_pubsub_outcome_concurrency_limit() -> usize {
+    256
+}
+
+/// Plugin factory for creating the GCP notification sender.
+///
+/// Publishes to Pub/Sub. It contributes no receivers, so obliterate propagation
+/// between server instances is not covered; see
+/// [`PubSubNotificationSender::obliterate`].
+pub struct GcpNotificationPluginFactory;
+
+#[async_trait::async_trait]
+impl NotificationPluginFactory for GcpNotificationPluginFactory {
+    fn name(&self) -> &'static str {
+        PLUGIN_NAME
+    }
+
+    fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
+        let plugin_name = self.name();
+
+        let _plugin_config: GcpNotificationPluginConfig =
+            config.clone().try_into().map_err(|e| {
+                PluginError::from(PluginConfigError {
+                    plugin_name: plugin_name.to_string(),
+                    message: format!("Failed to deserialize GCP notification config: {e}"),
+                })
+            })?;
+
+        Ok(())
+    }
+
+    async fn create(
+        &self,
+        config: &toml::Value,
+        _context: &NotificationPluginContext,
+    ) -> Result<NotificationPlugin, PluginError> {
+        let plugin_name = self.name();
+
+        let plugin_config: GcpNotificationPluginConfig =
+            config.clone().try_into().map_err(|e| {
+                PluginError::from(PluginConfigError {
+                    plugin_name: plugin_name.to_string(),
+                    message: format!("Failed to deserialize GCP notification config: {e}"),
+                })
+            })?;
+
+        let settings = PubSubSettings {
+            project: plugin_config.pubsub_project,
+            topic: plugin_config.pubsub_topic,
+            endpoint: plugin_config.pubsub_endpoint,
+            outcome_concurrency_limit: plugin_config.pubsub_outcome_concurrency_limit,
+        };
+
+        info!(
+            plugin_name = plugin_name,
+            topic = %settings.topic_resource_name(),
+            "Creating GCP notification sender"
+        );
+
+        let sender = PubSubNotificationSender::new(&settings)
+            .await
+            .map_err(|e| {
+                PluginError::from(PluginInitError {
+                    plugin_name: plugin_name.to_string(),
+                    message: format!("Failed to create Pub/Sub publisher: {e}"),
+                })
+            })?;
+
+        Ok(NotificationPlugin {
+            sender: Arc::new(sender),
+            receivers: Vec::new(),
+        })
+    }
+}
+
 // =============================================================================
 // Registration
 // =============================================================================
@@ -415,6 +515,7 @@ impl MutableStorePluginFactory for GcpMutableStorePluginFactory {
 pub fn register(registry: &mut PluginRegistry) {
     registry.register_immutable_store_plugin(Box::new(GcpImmutableStorePluginFactory));
     registry.register_mutable_store_plugin(Box::new(GcpMutableStorePluginFactory));
+    registry.register_notification_plugin(Box::new(GcpNotificationPluginFactory));
 }
 
 // =============================================================================
@@ -454,9 +555,66 @@ mod tests {
             "Expected 'gcp' in mutable store plugins, found: {mutable_plugins:?}"
         );
 
+        let notification_plugins = registry.list_notification_plugins();
+        assert!(
+            notification_plugins.contains(&PLUGIN_NAME.to_string()),
+            "Expected 'gcp' in notification plugins, found: {notification_plugins:?}"
+        );
+
         // No lock store plugin: a Firestore-backed lock store is out of scope.
         let lock_plugins = registry.list_lock_store_plugins();
         assert!(!lock_plugins.contains(&PLUGIN_NAME.to_string()));
+    }
+
+    #[test]
+    fn test_notification_factory_name() {
+        let factory = GcpNotificationPluginFactory;
+        assert_eq!(factory.name(), PLUGIN_NAME);
+    }
+
+    #[test]
+    fn test_notification_config_deserialization_with_all_fields() {
+        let config_str = r#"
+            pubsub_project = "my-project"
+            pubsub_topic = "lore-events"
+            pubsub_endpoint = "http://localhost:8085"
+            pubsub_outcome_concurrency_limit = 8
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: GcpNotificationPluginConfig = config.try_into().unwrap();
+
+        assert_eq!(plugin_config.pubsub_project, "my-project");
+        assert_eq!(plugin_config.pubsub_topic, "lore-events");
+        assert_eq!(
+            plugin_config.pubsub_endpoint,
+            Some("http://localhost:8085".to_string())
+        );
+        assert_eq!(plugin_config.pubsub_outcome_concurrency_limit, 8);
+    }
+
+    #[test]
+    fn test_notification_config_deserialization_with_defaults() {
+        let config_str = r#"
+            pubsub_project = "my-project"
+            pubsub_topic = "lore-events"
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: GcpNotificationPluginConfig = config.try_into().unwrap();
+
+        assert!(plugin_config.pubsub_endpoint.is_none());
+        assert_eq!(plugin_config.pubsub_outcome_concurrency_limit, 256);
+    }
+
+    /// The topic is not defaulted: publishing branch events to the wrong topic is
+    /// worse than refusing to start.
+    #[tokio::test]
+    async fn test_notification_config_requires_a_topic() {
+        let factory = GcpNotificationPluginFactory;
+        let config: toml::Value = toml::from_str(r#"pubsub_project = "my-project""#).unwrap();
+
+        assert!(factory.validate_config(&config).is_err());
     }
 
     #[tokio::test]

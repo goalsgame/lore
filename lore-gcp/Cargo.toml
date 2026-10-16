@@ -24,6 +24,7 @@ google-cloud-gax = { version = "1.14", default-features = false }
 # requests reqwest's "rustls-no-provider" feature, which — like firestore's path above — uses
 # whatever crypto provider the process already installed (ring).
 google-cloud-storage = { version = "1.18.0", default-features = false }
+google-cloud-pubsub = { version = "1.6.0", default-features = false }
 hex = { workspace = true }
 # gcloud-sdk (firestore's transport) depends on jsonwebtoken 10 with no crypto feature selected,
 # so it mints self-signed JWTs (used for Application Default Credentials with a service account
@@ -34,7 +35,11 @@ hex = { workspace = true }
 # gcloud-sdk also links against, via Cargo's feature unification — no runtime install call needed
 # for this crate specifically (unlike rustls's provider; see clients.rs's `ensure_crypto_provider`).
 jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto", "use_pem"] }
+lore-proto = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
 opentelemetry = { workspace = true }
+uuid = { workspace = true }
 # For the defensive rustls CryptoProvider check in clients.rs. Uses the workspace's own pinned
 # version/features (ring, not aws-lc-rs) rather than pulling in a second one.
 rustls = { workspace = true }
