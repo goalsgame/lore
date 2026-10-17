@@ -16,11 +16,14 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use google_cloud_gax::error::rpc::Code;
 use google_cloud_pubsub::client::Publisher;
+use google_cloud_pubsub::client::TopicAdmin;
 use google_cloud_pubsub::error::PublishError;
 use google_cloud_pubsub::model::Message as PubsubMessage;
 use lore_base::types::Address;
@@ -43,6 +46,8 @@ use tokio::sync::Semaphore;
 use tracing::debug;
 use tracing::warn;
 use uuid::Uuid;
+
+use crate::gcp_error::GcpError;
 
 /// Configuration for the Pub/Sub notification sender.
 #[derive(Clone, Debug)]
@@ -127,12 +132,17 @@ impl OutcomeGate {
 impl PubSubNotificationSender {
     /// Builds a publisher for `settings`' topic.
     ///
+    /// The publisher is built from the topic's *name* and never contacts it, so a
+    /// mistyped topic or a missing `roles/pubsub.publisher` grant yields a sender
+    /// that looks healthy and discards everything — delivery is best-effort, so
+    /// nothing downstream reports it either. [`report_topic_reachability`] logs
+    /// what it can about that at startup; read its documentation for why it cannot
+    /// refuse, and do not read this constructor as validating the destination.
+    ///
     /// # Errors
-    /// Returns the client's error if the topic's publisher cannot be built, which
-    /// covers unreachable credentials and a malformed endpoint.
-    pub async fn new(
-        settings: &PubSubSettings,
-    ) -> Result<Self, google_cloud_gax::client_builder::Error> {
+    /// [`GcpError::ClientBuild`] when a client cannot be constructed at all. No
+    /// outcome of the topic lookup fails construction.
+    pub async fn new(settings: &PubSubSettings) -> Result<Self, GcpError> {
         // As `build_storage_clients` and `build_firestore_db` do: a caller that
         // reaches this before any other GCP client must not depend on something
         // else having installed the rustls provider first.
@@ -143,8 +153,20 @@ impl PubSubNotificationSender {
             builder = builder.with_endpoint(endpoint.clone());
         }
 
+        let publisher = builder.build().await.map_err(GcpError::client_build)?;
+
+        let mut admin_builder = TopicAdmin::builder();
+        if let Some(endpoint) = settings.endpoint.as_ref() {
+            admin_builder = admin_builder.with_endpoint(endpoint.clone());
+        }
+        let admin = admin_builder
+            .build()
+            .await
+            .map_err(GcpError::client_build)?;
+        report_topic_reachability(&admin, &settings.topic_resource_name()).await;
+
         Ok(Self {
-            publisher: builder.build().await?,
+            publisher,
             outcomes: OutcomeGate::new(settings.outcome_concurrency_limit),
         })
     }
@@ -189,6 +211,66 @@ impl PubSubNotificationSender {
 
         self.outcomes
             .observe(self.publisher.publish(message), event_type, repository_hex);
+    }
+}
+
+/// How long the startup lookup may take before it is abandoned. It is advisory:
+/// the server is not waiting on it for anything it needs, so it must not be able
+/// to hold readiness behind a Pub/Sub that is slow or unreachable.
+const TOPIC_LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Looks the topic up at startup and says what it finds, so a mistyped topic has
+/// something pointing at it before anyone notices the silence.
+///
+/// Reports rather than refuses, and that is not timidity. `roles/pubsub.publisher`
+/// grants exactly `pubsub.topics.publish` -- not `pubsub.topics.get` -- so the
+/// correctly scoped, publisher-only identity this plugin is meant to run as is
+/// answered `PermissionDenied` here. Failing on that would refuse to start
+/// precisely the deployment the documentation asks for. Nor can the failure be
+/// narrowed to `NotFound`: without `topics.get`, Pub/Sub answers `PermissionDenied`
+/// for an absent topic just as for a present one, so the two cannot be told apart
+/// from here.
+///
+/// Verifying publish permission directly would need `TestIamPermissions`, which
+/// `google-cloud-pubsub`'s `TopicAdmin` does not expose. Until it does, or until
+/// the deployment also carries metadata read access, a startup log line is the
+/// honest extent of this: it catches a typo for anyone reading the log, and it
+/// never rejects a working configuration.
+///
+/// Takes the client rather than building one, so a test can supply the anonymous
+/// credentials an emulator needs without that being a production option.
+async fn report_topic_reachability(admin: &TopicAdmin, topic: &str) {
+    let lookup = admin.get_topic().set_topic(topic).send();
+    let Ok(result) = tokio::time::timeout(TOPIC_LOOKUP_TIMEOUT, lookup).await else {
+        warn!(
+            %topic,
+            timeout = ?TOPIC_LOOKUP_TIMEOUT,
+            "Gave up confirming the Pub/Sub topic at startup; continuing without it"
+        );
+        return;
+    };
+
+    match result {
+        Ok(_) => debug!(%topic, "Pub/Sub topic confirmed at startup"),
+        Err(error) => match error.status().map(|status| status.code) {
+            Some(Code::NotFound) => warn!(
+                %topic,
+                "Pub/Sub topic does not exist; it is not created automatically, and every \
+                 notification will publish into nothing until it is"
+            ),
+            // At warn, not debug: the server filters to warn by default, this is
+            // the answer the documented publisher-only identity always gets, and it
+            // is also the answer a wrong topic name gets. Logging it quietly would
+            // hide the startup line the configuration tells operators to look for.
+            // It says the check was inconclusive, not that publishing is broken.
+            Some(Code::PermissionDenied) => warn!(
+                %topic,
+                "Could not confirm the Pub/Sub topic: reading its metadata needs \
+                 pubsub.topics.get, which roles/pubsub.publisher does not grant. Whether it \
+                 exists and accepts writes is unverified -- check the name and the grant"
+            ),
+            _ => warn!(%topic, %error, "Could not reach Pub/Sub to confirm the topic at startup"),
+        },
     }
 }
 
@@ -550,6 +632,58 @@ mod emulator_tests {
         let event = notification::Event::decode(message.data.as_ref())
             .expect("the payload decodes as a lore.notification.Event");
         (event, message.attributes.clone())
+    }
+
+    /// An admin client against the emulator. The production constructor builds its
+    /// own, which reaches for Application Default Credentials -- fine on a server,
+    /// absent in CI -- so the check is driven directly here with anonymous ones.
+    async fn emulator_topic_admin() -> TopicAdmin {
+        TopicAdmin::builder()
+            .with_endpoint(endpoint())
+            .with_credentials(AnonymousCredentials::new().build())
+            .build()
+            .await
+            .expect("building the topic admin client")
+    }
+
+    /// A missing topic is reported, not refused -- see `report_topic_reachability`
+    /// for why refusing would reject the publisher-only identity this is meant to
+    /// run as. The log line is the whole deliverable, so the test asserts the call
+    /// completes against an absent topic rather than that it fails.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn a_missing_topic_is_reported_and_not_refused() {
+        let absent = format!(
+            "projects/{PROJECT}/topics/absent-{}",
+            uuid::Uuid::new_v4().simple()
+        );
+
+        report_topic_reachability(&emulator_topic_admin().await, &absent).await;
+
+        assert!(
+            logs_contain("Pub/Sub topic does not exist"),
+            "a missing topic must leave something in the log to find it by"
+        );
+    }
+
+    /// Asserts the confirmation, not just the absence of a complaint: a test that
+    /// only checked nothing was logged would pass against a function that did
+    /// nothing at all.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn an_existing_topic_is_confirmed() {
+        let (topic, _subscription) = topic_and_subscription().await;
+
+        report_topic_reachability(&emulator_topic_admin().await, &topic).await;
+
+        assert!(
+            logs_contain("Pub/Sub topic confirmed at startup"),
+            "a topic that exists must be reported as confirmed"
+        );
+        assert!(
+            !logs_contain("does not exist"),
+            "and must not be reported missing"
+        );
     }
 
     #[tokio::test]

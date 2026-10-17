@@ -35,8 +35,17 @@ mode = "local"
 # decoding the payload. Omit this section to keep the default in-process
 # sender.
 #
-# The topic must exist; the plugin does not create it. The service account
-# needs roles/pubsub.publisher on it.
+# The topic must exist; the plugin does not create it. The service account needs
+# roles/pubsub.publisher on it.
+#
+# Neither is enforced at startup. The plugin looks the topic up and logs what it
+# finds, but roles/pubsub.publisher grants pubsub.topics.publish and not
+# pubsub.topics.get, so the correctly scoped identity cannot read the topic's
+# metadata and the lookup is inconclusive for it. Refusing to start on that
+# would reject the very deployment this file describes. A wrong topic name
+# therefore still yields a server that runs normally and discards every event --
+# check the name and the grant yourself, and grep the startup log for the
+# topic.
 #
 # Events go to both: the server keeps delivering to the in-process sender, so
 # the gRPC Subscribe RPC works alongside the topic rather than being replaced
