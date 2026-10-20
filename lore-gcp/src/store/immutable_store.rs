@@ -1549,6 +1549,7 @@ impl ImmutableStoreTrait for GcpImmutableStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: Some(payload),
+            content: None,
         })
     }
 
