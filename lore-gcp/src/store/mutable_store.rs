@@ -473,6 +473,12 @@ impl FirestoreMutableStore {
 
 #[async_trait]
 impl MutableStoreTrait for FirestoreMutableStore {
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     #[lore_macro::lore_instrument]
     #[tracing::instrument(name = "FirestoreMutableStore::load" skip(self))]
     async fn load(

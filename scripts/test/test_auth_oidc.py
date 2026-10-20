@@ -31,7 +31,16 @@ from lore_server import (
     generate_server_config,
     launch_lore_server,
 )
-from mock_oidc_provider import DEVICE_CODE_GRANT, MockOidcProvider
+from mock_oidc_provider import (
+    ACCESS_TOKEN_TYPE,
+    API_KEY_TOKEN_TYPE,
+    DEVICE_CODE_GRANT,
+    KEY_USER,
+    PAIRWISE_USER,
+    TOKEN_EXCHANGE_GRANT,
+    MockOidcProvider,
+    OidcUser,
+)
 
 from lore import Lore
 
@@ -159,7 +168,13 @@ def test_login_without_a_browser_completes_the_device_grant(oidc_env, make_repo)
 
 
 @pytest.mark.smoke
-@pytest.mark.skipif(sys.platform != "linux", reason="Stubs the browser through xdg-open")
+@pytest.mark.skipif(
+    sys.platform != "linux", reason="Stubs the browser through xdg-open"
+)
+@pytest.mark.runs_in_process(
+    "stubs the browser on the PATH of the process carrying out the login, which a relayed "
+    "call does not carry"
+)
 def test_login_with_a_browser_opens_the_verification_url(
     oidc_env, make_repo, scratch_dir
 ):
@@ -200,6 +215,77 @@ def test_a_declined_login_stops_polling_at_once(oidc_env, make_repo):
     assert provider.user.user_id not in repo.run(urc_args=["auth", "list"])
 
 
+def login_with_token(repo: Lore, remote_url: str, token_type: str, token: str) -> str:
+    return repo.run(
+        urc_args=[
+            "auth",
+            "login",
+            remote_url,
+            "--token-type",
+            token_type,
+            "--token",
+            token,
+        ]
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("token_type", ["api-key", API_KEY_TOKEN_TYPE])
+def test_an_api_key_login_is_a_token_exchange(oidc_env, make_repo, token_type):
+    """`--token-type` reaches the token endpoint verbatim as
+    `subject_token_type`, the short name and the URI alike, with no device
+    grant, and the token of the user the key is bound to is stored."""
+    provider = oidc_env.provider
+    provider.api_keys["oidc-api-key"] = KEY_USER
+    repo = make_repo()
+
+    output = login_with_token(repo, oidc_env.remote_url, token_type, "oidc-api-key")
+
+    assert "Authentication successful" in output
+    assert not provider.requests_to("/device")
+    assert [r.form for r in provider.requests_to("/token")] == [
+        {
+            "grant_type": TOKEN_EXCHANGE_GRANT,
+            "client_id": provider.client_id,
+            "subject_token": "oidc-api-key",
+            "subject_token_type": token_type,
+            "requested_token_type": ACCESS_TOKEN_TYPE,
+        }
+    ]
+    listing = repo.run(urc_args=["auth", "list"])
+    assert f"oidc+{provider.issuer}" in listing
+    assert KEY_USER.user_id in listing
+
+
+@pytest.mark.smoke
+def test_an_unknown_api_key_is_refused(oidc_env, make_repo):
+    """The provider's `invalid_grant` for a key it does not know fails the
+    login as `NotAuthenticated`, and nothing is stored."""
+    repo = make_repo()
+
+    with pytest.raises(NotAuthenticatedError):
+        login_with_token(repo, oidc_env.remote_url, "api-key", "not-a-real-key")
+
+    assert len(oidc_env.provider.requests_to("/token")) == 1
+    assert "oidc+" not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_a_lore_token_is_stored_without_an_exchange(oidc_env, make_repo):
+    """`--token-type lore` validates the token and stores it, asking the
+    provider nothing."""
+    provider = oidc_env.provider
+    repo = make_repo()
+
+    output = login_with_token(
+        repo, oidc_env.remote_url, "lore", provider.mint_token(KEY_USER)
+    )
+
+    assert "Authentication successful" in output
+    assert not provider.requests
+    assert KEY_USER.user_id in repo.run(urc_args=["auth", "list"])
+
+
 @pytest.mark.smoke
 def test_an_expired_session_fails_the_login(oidc_env, make_repo):
     """`expired_token` ends the login on the poll that reports it, as a
@@ -213,3 +299,104 @@ def test_an_expired_session_fails_the_login(oidc_env, make_repo):
 
     assert not isinstance(failure.value, NotAuthenticatedError)
     assert_device_grant_on_the_wire(provider, polls=1)
+
+
+def seed_and_commit(repo: Lore, **kwargs) -> None:
+    """One file staged and committed, under the global options `kwargs`."""
+    with repo.open_file("seed.txt", "w+") as f:
+        f.write("seed\n")
+    repo.stage(scan=True, **kwargs)
+    repo.commit("seed", **kwargs)
+
+
+@pytest.mark.smoke
+def test_login_records_the_tokens_identity_claim(oidc_env, make_repo):
+    """The token carries `identity`, so it is stored under that value and
+    not the pairwise `sub`, and `auth list` reports it."""
+    provider = oidc_env.provider
+    provider.user = PAIRWISE_USER
+    repo = make_repo()
+
+    output = repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+
+    assert "Authentication successful" in output
+    listing = repo.run(urc_args=["auth", "list"])
+    assert PAIRWISE_USER.identity in listing
+    assert PAIRWISE_USER.user_id not in listing
+
+
+@pytest.mark.smoke
+def test_a_commit_after_login_records_the_tokens_identity(
+    oidc_env, new_lore_repo, scratch_dir
+):
+    """A revision made after login names the `identity` value as its creator,
+    and the server authorizes the creating request as the same identity."""
+    oidc_env.provider.user = PAIRWISE_USER
+    auth_store = scratch_dir("auth-store", create=True)
+    repo = new_lore_repo(
+        remote_url=oidc_env.remote_url,
+        environment_vars={"LORE_AUTH_PATH": str(auth_store)},
+        create_repo=False,
+    )
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    repo.repository_create()
+    seed_and_commit(repo)
+
+    rev = repo.revision_info(metadata=True)
+    assert rev.creator == PAIRWISE_USER.identity, rev.creator
+    server_log = Path(oidc_env.server_log).read_text(errors="replace")
+    assert f'user_id="{PAIRWISE_USER.identity}"' in server_log
+    assert f'user_id="{PAIRWISE_USER.user_id}"' not in server_log
+
+
+@pytest.mark.smoke
+def test_a_push_after_login_sends_the_login_token_unexchanged(oidc_env, make_repo):
+    """The server advertises no partition template, so the deployment is on
+    Tier 1: the login token authorizes the push itself, and the provider is
+    asked for no exchange."""
+    provider = oidc_env.provider
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    repo.repository_create()
+    seed_and_commit(repo)
+
+    repo.push()
+
+    grants = [r.form.get("grant_type") for r in provider.requests_to("/token")]
+    assert grants == [DEVICE_CODE_GRANT], grants
+
+
+@pytest.mark.smoke
+def test_a_supplied_token_and_an_offline_commit_record_the_identity(
+    oidc_env, new_lore_repo, scratch_dir
+):
+    """A token passed with `--identity-token`, and a commit made offline with
+    it, record the token's `identity` value too: the identity is read from
+    the token wherever the token is, with no environment response."""
+    token = oidc_env.provider.mint_token(PAIRWISE_USER)
+    auth_store = scratch_dir("auth-store", create=True)
+    repo = new_lore_repo(
+        remote_url=oidc_env.remote_url,
+        environment_vars={"LORE_AUTH_PATH": str(auth_store)},
+        create_repo=False,
+    )
+    repo.repository_create(identity_token=token)
+    seed_and_commit(repo, identity_token=token, offline=True)
+
+    rev = repo.revision_info(metadata=True, identity_token=token, offline=True)
+    assert rev.creator == PAIRWISE_USER.identity, rev.creator
+
+
+@pytest.mark.smoke
+def test_login_with_an_empty_identity_claim_is_refused(oidc_env, make_repo):
+    """An `identity` claim that is present but empty names no one: the login
+    fails, naming the claim, and nothing is stored."""
+    provider = oidc_env.provider
+    provider.user = OidcUser("empty-identity-sub", "Empty", "empty", identity="")
+    repo = make_repo()
+
+    with pytest.raises(LoreException) as refused:
+        repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+
+    assert "identity" in str(refused.value)
+    assert "empty-identity-sub" not in repo.run(urc_args=["auth", "list"])

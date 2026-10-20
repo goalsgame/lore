@@ -2,9 +2,6 @@
 // SPDX-License-Identifier: MIT
 use std::collections::BTreeSet;
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
 use std::task::Poll;
 use std::time::Duration;
 
@@ -15,216 +12,27 @@ use lore_base::types::Fragment;
 use lore_base::types::FragmentFlags;
 use lore_base::types::FragmentReference;
 use lore_base::types::Hash;
-use lore_base::types::HealResult;
-use lore_base::types::Partition;
 use lore_base::types::TypedBytes;
-use lore_base::types::VerifyResult;
 use lore_revision::immutable::*;
+use lore_revision::interface::LoreGlobalArgs;
 use lore_revision::repository::RemoteState;
 use lore_revision::repository::RepositoryContext;
 use lore_storage::options::ReadOptions;
 use lore_storage::options::WriteOptions;
-use lore_transport::Connection;
-use lore_transport::ProtocolError;
-use lore_transport::StorageSession;
 
+use super::serving::Serving;
+use super::serving::remote_copy;
+use super::serving::serving_remote;
+use super::serving::serving_session;
 use super::session_tests::context_with_state;
 use super::session_tests::under_execution_context;
-
-/// How a [`ServingStorage`] departs from serving what it holds: the address it answers with its
-/// payload altered, until a heal where it `heals`; the address whose first get it answers
-/// `SlowDown`; the gate it holds each get at until as many as the gate takes are in; and the
-/// content whose first get it holds for a notification.
-#[derive(Default)]
-struct Serving {
-    tampered: Option<Address>,
-    heals: bool,
-    slow_down: Option<Address>,
-    gate: Option<Arc<tokio::sync::Barrier>>,
-    hold: Option<(Hash, Arc<tokio::sync::Notify>)>,
-}
-
-/// A remote serving what `source` stores as `serving` says, recording each address asked of it and
-/// the most gets it held at once.
-struct ServingStorage {
-    source: Arc<RepositoryContext>,
-    serving: Serving,
-    asked: std::sync::Mutex<Vec<Address>>,
-    healed: AtomicBool,
-    slowed: AtomicBool,
-    in_flight: AtomicUsize,
-    peak: AtomicUsize,
-}
-
-#[async_trait::async_trait]
-impl lore_transport::Storage for ServingStorage {
-    async fn session_start(
-        &self,
-        _partition: Partition,
-        _correlation_id: &str,
-    ) -> Result<u32, ProtocolError> {
-        Ok(1)
-    }
-
-    async fn session_stop(&self, _session_id: u32) -> Result<(), ProtocolError> {
-        Ok(())
-    }
-
-    async fn get(
-        &self,
-        _session_id: u32,
-        address: &Address,
-    ) -> Result<(Fragment, Bytes), ProtocolError> {
-        let first = {
-            let mut asked = self.asked.lock().expect("asked");
-            asked.push(*address);
-            asked
-                .iter()
-                .filter(|asked| asked.hash == address.hash)
-                .count()
-                == 1
-        };
-        if first
-            && let Some((hash, hold)) = &self.serving.hold
-            && *hash == address.hash
-        {
-            hold.notified().await;
-        }
-        if self.serving.slow_down == Some(*address) && !self.slowed.swap(true, Ordering::SeqCst) {
-            return Err(ProtocolError::from(lore_base::error::SlowDown));
-        }
-        let in_flight = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
-        self.peak.fetch_max(in_flight, Ordering::SeqCst);
-        if let Some(gate) = &self.serving.gate {
-            gate.wait().await;
-        }
-        let served = self.serve(*address).await;
-        self.in_flight.fetch_sub(1, Ordering::SeqCst);
-        served
-    }
-
-    async fn put(
-        &self,
-        _session_id: u32,
-        _address: Address,
-        _fragment: Fragment,
-        _payload: Option<Bytes>,
-    ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::internal("the serving remote takes no puts"))
-    }
-
-    async fn query(&self, _session_id: u32, _address: &[Address]) -> Result<Bytes, ProtocolError> {
-        Err(ProtocolError::internal(
-            "the serving remote takes no queries",
-        ))
-    }
-
-    async fn verify(
-        &self,
-        _session_id: u32,
-        address: &Address,
-        heal: bool,
-    ) -> Result<VerifyResult, ProtocolError> {
-        if !(heal && self.serving.heals && self.serving.tampered == Some(*address)) {
-            return Err(ProtocolError::internal("the serving remote heals nothing"));
-        }
-        self.healed.store(true, Ordering::SeqCst);
-        Ok(VerifyResult {
-            corrupted: true,
-            healed: HealResult::Healed,
-        })
-    }
-
-    async fn copy(
-        &self,
-        _session_id: u32,
-        _source_partition: Partition,
-        _source_address: Address,
-        _target_context: Context,
-    ) -> Result<(), ProtocolError> {
-        Err(ProtocolError::internal(
-            "the serving remote takes no copies",
-        ))
-    }
-}
-
-impl ServingStorage {
-    /// What `source` stores at `address`, altered where it is the tampered address and not healed.
-    async fn serve(&self, address: Address) -> Result<(Fragment, Bytes), ProtocolError> {
-        let stored = self
-            .source
-            .immutable_store()
-            .get(self.source.id, address)
-            .await
-            .map_err(|err| ProtocolError::internal(err.to_string()))?;
-        let payload = stored
-            .payload
-            .ok_or_else(|| ProtocolError::internal("the source holds no payload"))?;
-        if self.serving.tampered == Some(address) && !self.healed.load(Ordering::SeqCst) {
-            let mut altered = payload.to_vec();
-            altered[0] ^= 0xff;
-            return Ok((stored.fragment, Bytes::from(altered)));
-        }
-        Ok((stored.fragment, payload))
-    }
-
-    /// The most gets the remote held at once.
-    fn peak(&self) -> usize {
-        self.peak.load(Ordering::SeqCst)
-    }
-
-    /// The distinct addresses asked of the remote.
-    fn asked(&self) -> BTreeSet<Address> {
-        self.asked.lock().expect("asked").iter().copied().collect()
-    }
-
-    /// How many gets the remote was asked.
-    fn gets(&self) -> usize {
-        self.asked.lock().expect("asked").len()
-    }
-
-    /// How many gets the remote was asked for `address`.
-    fn gets_of(&self, address: Address) -> usize {
-        self.asked
-            .lock()
-            .expect("asked")
-            .iter()
-            .filter(|asked| **asked == address)
-            .count()
-    }
-}
+use super::session_tests::under_globals;
 
 /// Yields until `condition` holds.
 async fn until(condition: impl Fn() -> bool) {
     while !condition() {
         tokio::task::yield_now().await;
     }
-}
-
-/// A session over a remote serving what `source` stores as `serving` says ([`ServingStorage`]),
-/// and that remote.
-async fn serving_session(
-    source: &Arc<RepositoryContext>,
-    serving: Serving,
-) -> (Arc<StorageSession>, Arc<ServingStorage>) {
-    let storage = Arc::new(ServingStorage {
-        source: source.clone(),
-        serving,
-        asked: std::sync::Mutex::default(),
-        healed: AtomicBool::new(false),
-        slowed: AtomicBool::new(false),
-        in_flight: AtomicUsize::new(0),
-        peak: AtomicUsize::new(0),
-    });
-    let connection = Connection::detached(vec![storage.clone()]);
-    let session = under_execution_context(|| async {
-        connection
-            .session(source.id, "cache")
-            .await
-            .expect("a session over the serving remote")
-    })
-    .await;
-    (session, storage)
 }
 
 /// A repository holding 1 MiB of content, unique to `seed`, stored as a fragment list, and that
@@ -259,13 +67,9 @@ async fn subfragments(written: &Arc<RepositoryContext>, root: Address) -> BTreeS
         list.fragment.flags & FragmentFlags::PayloadFragmented != 0,
         "the content is fragmented"
     );
-    let (_, references) = lore_storage::decompress_and_verify(
-        list.fragment,
-        list.payload.expect("the list payload"),
-        root,
-        ReadOptions::default().with_decompress(),
-    )
-    .expect("the list expands");
+    let (_, references) =
+        lore_storage::expand_payload(list.fragment, list.payload.expect("the list payload"))
+            .expect("the list expands");
     references
         .to_aligned::<FragmentReference>()
         .as_type_slice::<FragmentReference>()
@@ -308,14 +112,7 @@ async fn caching_a_local_list_asks_the_remote_for_its_missing_subfragments() {
     for cache_fragmented in [false, true] {
         let (session, remote) = serving_session(&written, Serving::default()).await;
         let fetched = under_execution_context(|| {
-            cache_through(
-                cached.clone(),
-                session,
-                None,
-                vec![root],
-                cache_fragmented,
-                false,
-            )
+            cache_through(cached.clone(), session, None, vec![root], cache_fragmented)
         })
         .await
         .into_result()
@@ -349,12 +146,11 @@ async fn caching_a_remote_list_fetches_its_subfragments() {
     let (session, remote) = serving_session(&written, Serving::default()).await;
     let before = lore_storage::remote_fetch_bytes();
 
-    let fetched = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![root], true, false)
-    })
-    .await
-    .into_result()
-    .expect("the cache fetches what it lacks");
+    let fetched =
+        under_execution_context(|| cache_through(cached.clone(), session, None, vec![root], true))
+            .await
+            .into_result()
+            .expect("the cache fetches what it lacks");
 
     assert_eq!(fetched, wanted.len());
     assert_eq!(remote.asked(), wanted);
@@ -366,6 +162,38 @@ async fn caching_a_remote_list_fetches_its_subfragments() {
         lore_storage::remote_fetch_bytes() > before,
         "the fetched bytes are counted"
     );
+}
+
+/// A cache whose command trusts the remote walks a fragment list it fetched and stores the
+/// subfragments the list references, hashing none of them.
+#[tokio::test]
+async fn a_cache_trusting_the_remote_walks_a_fetched_list_unhashed() {
+    let (written, root) = written_list(0x56).await;
+    let mut wanted = subfragments(&written, root).await;
+    wanted.insert(root);
+    let cached = context_with_state(RemoteState::Offline).await;
+    let (session, remote) = serving_session(&written, Serving::default()).await;
+    lore_storage::test_util::reset_counts();
+
+    let trusting = LoreGlobalArgs {
+        trust_remote: 1,
+        ..LoreGlobalArgs::default()
+    };
+    let fetched = under_globals(trusting, || {
+        cache_through(cached.clone(), session, None, vec![root], true)
+    })
+    .await
+    .into_result()
+    .expect("the cache fetches what it lacks");
+
+    assert_eq!(fetched, wanted.len());
+    assert_eq!(remote.asked(), wanted);
+    assert!(
+        held(&cached, &wanted).await,
+        "the list and its subfragments are stored"
+    );
+    let (_, decodes, hashes) = lore_storage::test_util::counts();
+    assert_eq!((decodes, hashes), (0, 0), "nothing is decoded or hashed");
 }
 
 /// `LORE_CACHE_GETS` takes a count; zero turns the cap off, and a value that is not a count
@@ -380,10 +208,10 @@ fn the_cache_get_cap_parses_and_defaults() {
     assert_eq!(cap(&usize::MAX.to_string()), usize::MAX);
 }
 
-/// A corrupt local list naming its own address is read verified, so it is never walked: the cache
-/// asks the remote for an intact copy of it alone, and with none to be had fails.
+/// A local list naming its own address is trusted as stored, and walked no deeper than any
+/// fragment tree is: the cache ends without asking the remote for anything, and fails.
 #[tokio::test]
-async fn caching_a_corrupt_local_list_naming_itself_ends() {
+async fn caching_a_local_list_naming_itself_ends() {
     let context = context_with_state(RemoteState::Offline).await;
     let root = Address {
         hash: Hash::from([0x3cu8; 32]),
@@ -409,23 +237,24 @@ async fn caching_a_corrupt_local_list_naming_itself_ends() {
     let (session, remote) = serving_session(&empty, Serving::default()).await;
     let cached = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        under_execution_context(|| {
-            cache_through(context.clone(), session, None, vec![root], true, false)
-        }),
+        under_execution_context(|| cache_through(context.clone(), session, None, vec![root], true)),
     )
     .await
     .expect("the cache of a list naming itself ends");
     assert!(
         cached.into_result().is_err(),
-        "a list with no intact copy fails the cache"
+        "a list naming itself fails the cache"
     );
-    assert_eq!(remote.asked(), BTreeSet::from([root]));
+    assert!(
+        remote.asked().is_empty(),
+        "the remote was asked for nothing"
+    );
 }
 
-/// A local fragment list that fails its check is fetched again, as a read replaces a corrupt
+/// A local fragment list that does not expand is fetched again, as a read replaces a corrupt
 /// fragment: the intact copy overwrites it, and the subfragments it references are fetched.
 #[tokio::test]
-async fn caching_a_corrupt_local_list_fetches_and_overwrites_it() {
+async fn caching_a_local_list_that_does_not_expand_fetches_and_overwrites_it() {
     let (written, root) = written_list(0x53).await;
     let mut wanted = subfragments(&written, root).await;
     wanted.insert(root);
@@ -434,28 +263,27 @@ async fn caching_a_corrupt_local_list_fetches_and_overwrites_it() {
         .get(written.id, root)
         .await
         .expect("the list is stored");
-    let mut corrupt = list.payload.expect("the list payload").to_vec();
-    corrupt[0] ^= 0xff;
+    let undecodable = Fragment {
+        flags: list.fragment.flags | FragmentFlags::PayloadCompressedZstd.bits(),
+        ..list.fragment
+    };
     let cached = context_with_state(RemoteState::Offline).await;
-    cached
-        .immutable_store()
-        .put(
-            cached.id,
-            root,
-            list.fragment,
-            Some(Bytes::from(corrupt)),
-            false,
-        )
-        .await
-        .expect("the corrupt list is stored");
+    lore_storage::test_util::accepting_unvalidated_puts(cached.immutable_store().put(
+        cached.id,
+        root,
+        undecodable,
+        list.payload,
+        false,
+    ))
+    .await
+    .expect("the list is stored in a form that does not expand");
     let (session, remote) = serving_session(&written, Serving::default()).await;
 
-    let fetched = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![root], true, false)
-    })
-    .await
-    .into_result()
-    .expect("the cache fetches what it lacks");
+    let fetched =
+        under_execution_context(|| cache_through(cached.clone(), session, None, vec![root], true))
+            .await
+            .into_result()
+            .expect("the cache fetches what it lacks");
 
     assert_eq!(fetched, wanted.len());
     assert_eq!(
@@ -468,44 +296,79 @@ async fn caching_a_corrupt_local_list_fetches_and_overwrites_it() {
         .get(cached.id, root)
         .await
         .expect("the list is stored");
-    lore_storage::decompress_and_verify(
+    lore_storage::read::verify_receipt(
         stored.fragment,
         stored.payload.expect("the list payload"),
         root,
-        ReadOptions::default().with_decompress().with_verify(),
     )
     .expect("the intact list replaced the corrupt one");
     assert!(held(&cached, &wanted).await, "the subfragments are stored");
 }
 
-/// `content` stored with its payload in a repository of its own, standing in for the remote's
-/// copy, and its address and fragment.
-async fn remote_copy(
-    content: &'static [u8],
-    seed: u8,
-) -> (Arc<RepositoryContext>, Address, Fragment) {
+/// A fragment tree as deep as a read walks, a chain of lists [`MAX_FRAGMENT_TREE_DEPTH`] deep below
+/// the root down to one leaf, is cached in full within the walk's bound on rounds.
+///
+/// [`MAX_FRAGMENT_TREE_DEPTH`]: lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH
+#[tokio::test]
+async fn caching_a_tree_as_deep_as_a_read_walks_caches_every_level() {
     let source = context_with_state(RemoteState::Offline).await;
-    let address = Address {
-        hash: lore_storage::hash::hash_slice(content),
-        context: Context::from([seed; 16]),
+    let context = Context::from([0x68; 16]);
+    let leaf = b"the leaf at the bottom of the deepest tree a read walks";
+    let mut address = Address {
+        hash: lore_storage::hash::hash_slice(leaf),
+        context,
     };
-    let fragment = Fragment {
+    let plain = Fragment {
         flags: 0,
-        size_payload: content.len() as u32,
-        size_content: content.len() as u64,
+        size_payload: leaf.len() as u32,
+        size_content: leaf.len() as u64,
     };
     source
         .immutable_store()
         .put(
             source.id,
             address,
-            fragment,
-            Some(Bytes::from_static(content)),
+            plain,
+            Some(Bytes::from_static(leaf)),
             false,
         )
         .await
-        .expect("the remote's copy is stored");
-    (source, address, fragment)
+        .expect("the leaf is stored");
+    let mut wanted = BTreeSet::from([address]);
+    for _ in 0..=lore_storage::defragment::MAX_FRAGMENT_TREE_DEPTH {
+        let reference = FragmentReference {
+            hash: address.hash,
+            offset_content: 0,
+        };
+        let list = Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&reference));
+        address = Address {
+            hash: lore_storage::hash::hash_slice(&list),
+            context,
+        };
+        let fragmented = Fragment {
+            flags: FragmentFlags::PayloadFragmented.bits(),
+            size_payload: list.len() as u32,
+            size_content: leaf.len() as u64,
+        };
+        source
+            .immutable_store()
+            .put(source.id, address, fragmented, Some(list), false)
+            .await
+            .expect("the list is stored");
+        wanted.insert(address);
+    }
+    let cached = context_with_state(RemoteState::Offline).await;
+    let (session, _) = serving_session(&source, Serving::default()).await;
+
+    let fetched = under_execution_context(|| {
+        cache_through(cached.clone(), session, None, vec![address], true)
+    })
+    .await
+    .into_result()
+    .expect("the deepest tree a read walks is cached");
+
+    assert_eq!(fetched, wanted.len());
+    assert!(held(&cached, &wanted).await, "every level is stored");
 }
 
 /// An index entry without its payload, as eviction leaves one, holds nothing to serve, so the
@@ -513,7 +376,7 @@ async fn remote_copy(
 #[tokio::test]
 async fn caching_an_entry_without_its_payload_fetches_it() {
     let (source, address, fragment) =
-        remote_copy(b"content whose payload the store does not hold", 0x5a).await;
+        remote_copy(b"content whose payload the store does not hold", 0x5a, 0).await;
     let context = context_with_state(RemoteState::Offline).await;
     context
         .immutable_store()
@@ -523,7 +386,7 @@ async fn caching_an_entry_without_its_payload_fetches_it() {
     let (session, remote) = serving_session(&source, Serving::default()).await;
 
     let fetched = under_execution_context(|| {
-        cache_through(context.clone(), session, None, vec![address], false, false)
+        cache_through(context.clone(), session, None, vec![address], false)
     })
     .await
     .into_result()
@@ -537,12 +400,40 @@ async fn caching_an_entry_without_its_payload_fetches_it() {
     );
 }
 
-/// A fetched payload no read follows is stored as fetched, unchecked, as a read checks what it
-/// loads: nothing decodes or hashes it, so even one altered on the way is stored.
+/// A cache goes through the repository's lazy session, so a session the remote no longer knows is
+/// started again once the fetch invalidates it, and the fetch succeeds.
 #[tokio::test]
-async fn a_fetched_payload_no_read_follows_is_stored_unchecked() {
-    let content = b"content the remote serves altered";
-    let (source, address, _) = remote_copy(content, 0x5c).await;
+async fn a_cache_starts_again_a_session_the_remote_forgot() {
+    let (source, address, _) =
+        remote_copy(b"content a remote serves once it forgot a session", 0x5e, 0).await;
+    let remote = serving_remote(
+        &source,
+        Serving {
+            forgets_first_session: true,
+            ..Serving::default()
+        },
+    );
+    let connection = lore_transport::Connection::detached(vec![remote.clone()]);
+    let context = context_with_state(RemoteState::Connected(connection)).await;
+
+    let cached = under_execution_context(|| cache_counted(context.clone(), vec![address], false))
+        .await
+        .expect("the remote is connected");
+
+    assert!(cached.failure.is_none(), "{:?}", cached.failure);
+    assert_eq!((cached.fragments, remote.starts()), (1, 2));
+    assert!(
+        is_stored_local(context.clone(), address).await,
+        "the payload is stored"
+    );
+}
+
+/// A cache whose command trusts the remote stores what it fetches as fetched: nothing decodes or
+/// hashes it, so even a payload altered on the way is stored.
+#[tokio::test]
+async fn a_cache_trusting_the_remote_stores_its_payload_unchecked() {
+    let content = b"content the remote serves altered to a trusting cache";
+    let (source, address, _) = remote_copy(content, 0x5c, 0).await;
     let cached = context_with_state(RemoteState::Offline).await;
     let (session, _) = serving_session(
         &source,
@@ -554,8 +445,12 @@ async fn a_fetched_payload_no_read_follows_is_stored_unchecked() {
     .await;
     lore_storage::test_util::reset_counts();
 
-    let fetched = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![address], false, false)
+    let trusting = LoreGlobalArgs {
+        trust_remote: 1,
+        ..LoreGlobalArgs::default()
+    };
+    let fetched = under_globals(trusting, || {
+        cache_through(cached.clone(), session, None, vec![address], false)
     })
     .await
     .into_result()
@@ -578,14 +473,61 @@ async fn a_fetched_payload_no_read_follows_is_stored_unchecked() {
     );
 }
 
-/// A verifying cache checks every payload on receipt, for readers that trust local bytes: one the
-/// remote serves altered, and still serves altered after the heal the check asks for, is gone to
-/// the remote for but neither counted as fetched bytes nor stored, and the cache answers the
+/// A cache trusting the remote still checks the sizes of what it fetches: a payload claiming more
+/// content than it holds is neither counted as fetched bytes nor stored, and the cache answers the
 /// failure.
 #[tokio::test]
-async fn a_verifying_cache_stores_no_payload_that_fails_its_check() {
-    let content = b"content the remote serves altered to a verifying cache";
-    let (source, address, _) = remote_copy(content, 0x5e).await;
+async fn a_cache_trusting_the_remote_stores_no_payload_whose_sizes_disagree() {
+    let content = b"content the remote holds under sizes that disagree";
+    let source = context_with_state(RemoteState::Offline).await;
+    let address = Address {
+        hash: lore_storage::hash::hash_slice(content),
+        context: Context::from([0x67; 16]),
+    };
+    let claims_more = Fragment {
+        flags: 0,
+        size_payload: content.len() as u32,
+        size_content: content.len() as u64 + 1,
+    };
+    lore_storage::test_util::accepting_unvalidated_puts(source.immutable_store().put(
+        source.id,
+        address,
+        claims_more,
+        Some(Bytes::from_static(content)),
+        false,
+    ))
+    .await
+    .expect("the remote's copy is stored");
+    let cached = context_with_state(RemoteState::Offline).await;
+    let (session, _) = serving_session(&source, Serving::default()).await;
+
+    let trusting = LoreGlobalArgs {
+        trust_remote: 1,
+        ..LoreGlobalArgs::default()
+    };
+    let outcome = under_globals(trusting, || {
+        cache_through(cached.clone(), session, None, vec![address], false)
+    })
+    .await;
+
+    assert_eq!((outcome.fragments, outcome.bytes), (1, 0));
+    assert!(
+        outcome.failure.is_some(),
+        "the cache answers the failed check"
+    );
+    assert!(
+        !is_stored_local(cached.clone(), address).await,
+        "the payload is not stored"
+    );
+}
+
+/// A cache checks every payload on receipt: one the remote serves altered, and still serves altered
+/// after the heal the check asks for, is gone to the remote for but neither counted as fetched
+/// bytes nor stored, and the cache answers the failure.
+#[tokio::test]
+async fn a_cache_stores_no_payload_that_fails_its_check() {
+    let content = b"content the remote serves altered to a cache";
+    let (source, address, _) = remote_copy(content, 0x5e, 0).await;
     let cached = context_with_state(RemoteState::Offline).await;
     let (session, _) = serving_session(
         &source,
@@ -597,7 +539,7 @@ async fn a_verifying_cache_stores_no_payload_that_fails_its_check() {
     .await;
 
     let outcome = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![address], false, true)
+        cache_through(cached.clone(), session, None, vec![address], false)
     })
     .await;
 
@@ -612,29 +554,33 @@ async fn a_verifying_cache_stores_no_payload_that_fails_its_check() {
     );
 }
 
-/// A cache answers what it came to, checking every payload or not: the fragments it went to the
+/// A cache answers what it came to, trusting the remote or not: the fragments it went to the
 /// remote for, the payload bytes it fetched of those, and none found local while it waited. It
 /// stores what it fetched.
 #[tokio::test]
 async fn a_cache_counts_the_fragments_and_payload_bytes_it_fetches() {
-    for (content, seed, verify) in [
+    for (content, seed, trust_remote) in [
         (
             &b"content whose payload bytes the cache counts"[..],
             0x5f,
-            false,
+            0,
         ),
         (
-            &b"content whose payload bytes a verifying cache counts"[..],
+            &b"content whose payload bytes a trusting cache counts"[..],
             0x6a,
-            true,
+            1,
         ),
     ] {
-        let (source, address, fragment) = remote_copy(content, seed).await;
+        let (source, address, fragment) = remote_copy(content, seed, 0).await;
         let cached = context_with_state(RemoteState::Offline).await;
         let (session, _) = serving_session(&source, Serving::default()).await;
+        let globals = LoreGlobalArgs {
+            trust_remote,
+            ..LoreGlobalArgs::default()
+        };
 
-        let outcome = under_execution_context(|| {
-            cache_through(cached.clone(), session, None, vec![address], false, verify)
+        let outcome = under_globals(globals, || {
+            cache_through(cached.clone(), session, None, vec![address], false)
         })
         .await;
 
@@ -642,11 +588,11 @@ async fn a_cache_counts_the_fragments_and_payload_bytes_it_fetches() {
         assert_eq!(
             (outcome.fragments, outcome.bytes, outcome.already_local),
             (1, u64::from(fragment.size_payload), 0),
-            "verify {verify}"
+            "trust_remote {trust_remote}"
         );
         assert!(
             is_stored_local(cached.clone(), address).await,
-            "verify {verify}"
+            "trust_remote {trust_remote}"
         );
     }
 }
@@ -690,14 +636,7 @@ async fn cache_get_permits_bound_the_gets_in_flight() {
     let fetched = tokio::time::timeout(
         Duration::from_secs(10),
         under_execution_context(|| {
-            cache_through(
-                cached.clone(),
-                session,
-                permits,
-                addresses.clone(),
-                false,
-                false,
-            )
+            cache_through(cached.clone(), session, permits, addresses.clone(), false)
         }),
     )
     .await
@@ -715,7 +654,7 @@ async fn cache_get_permits_bound_the_gets_in_flight() {
 #[tokio::test]
 async fn a_get_that_waited_for_its_permit_skips_a_fragment_stored_meanwhile() {
     let (source, address, fragment) =
-        remote_copy(b"content a demand read stores meanwhile", 0x5d).await;
+        remote_copy(b"content a demand read stores meanwhile", 0x5d, 0).await;
     let payload = source
         .immutable_store()
         .get(source.id, address)
@@ -733,7 +672,6 @@ async fn a_get_that_waited_for_its_permit_skips_a_fragment_stored_meanwhile() {
                 Some(permits.clone()),
                 address,
                 replace,
-                false,
             )
         }));
         assert!(
@@ -791,7 +729,6 @@ async fn a_root_stored_while_its_get_waits_is_walked_in_the_next_round() {
             Some(permits.clone()),
             vec![root],
             true,
-            false,
         )
     });
     let demand_read = async {
@@ -819,16 +756,14 @@ async fn a_root_stored_while_its_get_waits_is_walked_in_the_next_round() {
 /// so, which leaves it for the client store to evict.
 #[tokio::test]
 async fn a_cached_fragment_is_stored_durable() {
-    let (source, address, _) = remote_copy(b"content the remote serves unmarked", 0x5e).await;
+    let (source, address, _) = remote_copy(b"content the remote serves unmarked", 0x5e, 0).await;
     let cached = context_with_state(RemoteState::Offline).await;
     let (session, _) = serving_session(&source, Serving::default()).await;
 
-    under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![address], false, false)
-    })
-    .await
-    .into_result()
-    .expect("the cache fetches what it lacks");
+    under_execution_context(|| cache_through(cached.clone(), session, None, vec![address], false))
+        .await
+        .into_result()
+        .expect("the cache fetches what it lacks");
 
     let stored = cached
         .immutable_store()
@@ -860,12 +795,11 @@ async fn a_fetched_list_failing_its_check_is_healed_and_stored() {
     )
     .await;
 
-    let fetched = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![root], true, false)
-    })
-    .await
-    .into_result()
-    .expect("the healed list is cached");
+    let fetched =
+        under_execution_context(|| cache_through(cached.clone(), session, None, vec![root], true))
+            .await
+            .into_result()
+            .expect("the healed list is cached");
 
     assert_eq!(fetched, leaves.len() + 1);
     let stored = cached
@@ -873,11 +807,10 @@ async fn a_fetched_list_failing_its_check_is_healed_and_stored() {
         .get(cached.id, root)
         .await
         .expect("the list is stored");
-    lore_storage::decompress_and_verify(
+    lore_storage::read::verify_receipt(
         stored.fragment,
         stored.payload.expect("the list payload"),
         root,
-        ReadOptions::default().with_decompress().with_verify(),
     )
     .expect("the list is stored intact");
     assert!(held(&cached, &leaves).await, "its subfragments are stored");
@@ -892,7 +825,7 @@ async fn a_fetched_list_failing_its_check_is_healed_and_stored() {
 /// fetches.
 #[tokio::test]
 async fn a_cache_get_answered_slow_down_is_retried() {
-    let (source, address, _) = remote_copy(b"content the remote slows down once", 0x60).await;
+    let (source, address, _) = remote_copy(b"content the remote slows down once", 0x60, 0).await;
     let cached = context_with_state(RemoteState::Offline).await;
     let (session, remote) = serving_session(
         &source,
@@ -904,14 +837,14 @@ async fn a_cache_get_answered_slow_down_is_retried() {
     .await;
 
     let fetched = under_execution_context(|| {
-        cache_through(cached.clone(), session, None, vec![address], false, false)
+        cache_through(cached.clone(), session, None, vec![address], false)
     })
     .await
     .into_result()
     .expect("the retried get is cached");
 
     assert_eq!(fetched, 1);
-    assert_eq!(remote.asked.lock().expect("asked").len(), 2, "asked twice");
+    assert_eq!(remote.gets(), 2, "asked twice");
     assert!(
         is_stored_local(cached.clone(), address).await,
         "the fragment is stored"
@@ -922,7 +855,7 @@ async fn a_cache_get_answered_slow_down_is_retried() {
 /// follows the first's read flight, keyed by the content hash, and both are stored.
 #[tokio::test]
 async fn identical_content_under_two_contexts_is_fetched_once() {
-    let (source, address, fragment) = remote_copy(b"content two files hold alike", 0x61).await;
+    let (source, address, fragment) = remote_copy(b"content two files hold alike", 0x61, 0).await;
     let twin = Address {
         hash: address.hash,
         context: Context::from([0x62u8; 16]),
@@ -952,14 +885,7 @@ async fn identical_content_under_two_contexts_is_fetched_once() {
     let followers = lore_storage::test_util::followers();
 
     let cache = under_execution_context(|| {
-        cache_through(
-            cached.clone(),
-            session,
-            None,
-            vec![address, twin],
-            false,
-            false,
-        )
+        cache_through(cached.clone(), session, None, vec![address, twin], false)
     });
     let release = async {
         until(|| lore_storage::test_util::followers() > followers).await;
@@ -1030,14 +956,7 @@ async fn a_cache_fetch_and_a_read_of_the_same_content_share_one_get() {
                 until(|| remote.gets() == 1).await;
             }
             under_execution_context(|| {
-                cache_through(
-                    cached.clone(),
-                    session.clone(),
-                    None,
-                    vec![address],
-                    false,
-                    false,
-                )
+                cache_through(cached.clone(), session.clone(), None, vec![address], false)
             })
             .await
         };
@@ -1060,9 +979,9 @@ async fn a_cache_fetch_and_a_read_of_the_same_content_share_one_get() {
             until(|| lore_storage::test_util::followers() > followers).await;
             gate.wait().await;
         };
-        let (fetched, read, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+        let (fetched, read, ()) = Box::pin(tokio::time::timeout(Duration::from_secs(10), async {
             tokio::join!(cache, read, release)
-        })
+        }))
         .await
         .expect("the cache fetch and the read share one get");
 
@@ -1081,13 +1000,12 @@ async fn a_cache_fetch_and_a_read_of_the_same_content_share_one_get() {
     }
 }
 
-/// A payload a read's join has checked and found altered is healed for the cache, as a read's
-/// fetch is: the remote heals it, and the cache stores the intact copy, while the read, given
-/// nothing, fetches for itself and is served intact.
+/// A payload a cache fetch finds altered is healed before the read that joined the fetch is served:
+/// the remote heals it, the cache stores the intact copy, and the read is served it.
 #[tokio::test]
-async fn a_payload_a_joining_read_finds_altered_is_healed_and_stored() {
+async fn a_payload_a_cache_fetch_finds_altered_is_healed_for_the_read_that_joined_it() {
     let content = b"content a joining read finds altered";
-    let (source, address, _) = remote_copy(content, 0x65).await;
+    let (source, address, _) = remote_copy(content, 0x65, 0).await;
     let cached = context_with_state(RemoteState::Offline).await;
     let hold = Arc::new(tokio::sync::Notify::new());
     let (session, remote) = serving_session(
@@ -1103,14 +1021,7 @@ async fn a_payload_a_joining_read_finds_altered_is_healed_and_stored() {
     let followers = lore_storage::test_util::followers();
 
     let cache = under_execution_context(|| {
-        cache_through(
-            cached.clone(),
-            session.clone(),
-            None,
-            vec![address],
-            false,
-            false,
-        )
+        cache_through(cached.clone(), session.clone(), None, vec![address], false)
     });
     let read = async {
         until(|| remote.gets() == 1).await;
@@ -1139,6 +1050,7 @@ async fn a_payload_a_joining_read_finds_altered_is_healed_and_stored() {
         fetched.into_result().expect("the healed payload is cached"),
         1
     );
+    assert_eq!(remote.gets(), 2, "the read makes no get of its own");
     assert_eq!(read.expect("the read is served").1.as_ref(), content);
     let stored = cached
         .immutable_store()
@@ -1158,7 +1070,7 @@ async fn a_payload_a_joining_read_finds_altered_is_healed_and_stored() {
 #[tokio::test]
 async fn a_cache_fetch_joining_another_gives_its_permit_back() {
     let (source, address, fragment) =
-        remote_copy(b"content two files share, fetched once", 0x66).await;
+        remote_copy(b"content two files share, fetched once", 0x66, 0).await;
     let twin = Address {
         hash: address.hash,
         context: Context::from([0x67u8; 16]),
@@ -1218,7 +1130,6 @@ async fn a_cache_fetch_joining_another_gives_its_permit_back() {
             session,
             Some(permits),
             vec![address, twin, other],
-            false,
             false,
         )
     });

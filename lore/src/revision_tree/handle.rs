@@ -327,7 +327,7 @@ pub(crate) async fn synth_repository_context(
     repository: Partition,
 ) -> Arc<RepositoryContext> {
     let remote_result = match store.remote.as_ref() {
-        Some(endpoint) => endpoint.session_connection(repository).await,
+        Some(endpoint) => endpoint.connection(repository).await,
         None => Err(ProtocolError::from(NoRemote)),
     };
     Arc::new(
@@ -341,7 +341,8 @@ pub(crate) async fn synth_repository_context(
             filter: Arc::new(Filter::default()),
             filesystem_provider: None,
         })
-        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER)),
+        .with_write_token(RepositoryWriteToken::in_memory(&IN_MEMORY_MARKER))
+        .holding_its_sessions(),
     )
 }
 

@@ -123,7 +123,6 @@ fn auth_settings_authorization_fields_round_trip() {
             resource_id_claim = "rsname"
             resource_id_template = "repo:{id}"
             resource_wildcard = "urc-*"
-            identity_claim = "preferred_username"
             baseline_access = "reachable"
             repository_catalog = "auth_service"
             repository_catalog_url = "https://catalog.example.com"
@@ -136,7 +135,6 @@ fn auth_settings_authorization_fields_round_trip() {
     assert_eq!(auth.resource_id_claim, "rsname");
     assert_eq!(auth.resource_id_template, "repo:{id}");
     assert_eq!(auth.resource_wildcard, "urc-*");
-    assert_eq!(auth.identity_claim, "preferred_username");
     assert_eq!(auth.baseline_access, BaselineAccess::Reachable);
     assert_eq!(
         auth.repository_catalog,
@@ -149,8 +147,8 @@ fn auth_settings_authorization_fields_round_trip() {
 }
 
 /// A config setting none of the authorization fields gets the documented
-/// defaults: the `urc-` template and wildcard literals, `sub` as the
-/// identity claim, and no permission or resource claim selected.
+/// defaults: the `urc-` template and wildcard literals, and no permission or
+/// resource claim selected.
 #[test]
 fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     let auth: AuthSettings = toml::from_str(
@@ -167,7 +165,6 @@ fn auth_settings_authorization_fields_have_backward_compatible_defaults() {
     assert_eq!(auth.baseline_access, BaselineAccess::Denied);
     assert_eq!(auth.permission_claim, None);
     assert_eq!(auth.resource_claim, None);
-    assert_eq!(auth.identity_claim, "sub");
     assert_eq!(auth.repository_catalog, None);
     assert_eq!(auth.repository_catalog_url, None);
     assert_eq!(auth.jwt_typ, None);
@@ -418,6 +415,45 @@ fn oidc_invalid_tier_2_fails_validation_naming_both_settings() {
                 "the error must name {setting}: {message}"
             );
         }
+    }
+}
+
+/// A template without `{id}` names the same resource for every partition: the client
+/// would ask for one token for all of them, and the server would match one claim entry
+/// against every partition. Each is refused at startup, naming the setting.
+#[test]
+fn a_partition_template_without_its_placeholder_fails_validation() {
+    let cases = [
+        (
+            settings_with_oidc_keys(
+                TIER_2,
+                r#"resource_template = "https://lore.example.com/partitions/{ID}""#,
+            ),
+            "server.auth.oidc.resource_template",
+        ),
+        (
+            settings_with_oidc_keys(TIER_2, r#"scope_template = "partition""#),
+            "server.auth.oidc.scope_template",
+        ),
+        (
+            settings_with_oidc_keys(
+                r#"
+                    resource_claim = "resources"
+                    resource_id_template = "urc-all"
+                    "#,
+                r#"resource_template = "https://lore.example.com/partitions/{id}""#,
+            ),
+            "server.auth.resource_id_template",
+        ),
+    ];
+    for (settings, setting) in cases {
+        let error = validate_auth_config(&settings)
+            .expect_err("a template without {id} must fail validation");
+        let message = error.to_string();
+        assert!(
+            message.contains(setting) && message.contains("{id}"),
+            "the error must name {setting} and the placeholder: {message}"
+        );
     }
 }
 

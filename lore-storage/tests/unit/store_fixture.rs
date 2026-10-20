@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic;
+use std::time::Duration;
 
 use bytes::Bytes;
 use lore_storage::Address;
@@ -18,6 +19,7 @@ use lore_storage::immutable_store::StoreError;
 use lore_storage::local::immutable_store::CompactionInstruments;
 use lore_storage::local::immutable_store::ImmutableStoreEntry;
 use lore_storage::local::immutable_store::LocalImmutableStore;
+use lore_storage::local::store_lock::Intent;
 
 /// `count` payloads of 4 KiB whose hashes all fall in one group, and that group's index.
 pub(crate) fn payloads_in_one_group(count: usize) -> (usize, Vec<Vec<u8>>) {
@@ -83,6 +85,21 @@ pub(crate) async fn put_payload(
     payload: &[u8],
     durable: bool,
 ) -> Address {
+    try_put_payload(store, partition, context, payload, durable, false)
+        .await
+        .unwrap()
+}
+
+/// As [`put_payload`], writing the payload again even when one is stored for its hash with
+/// `force`, and returning the error the store fails with.
+pub(crate) async fn try_put_payload(
+    store: &Arc<LocalImmutableStore>,
+    partition: Partition,
+    context: Context,
+    payload: &[u8],
+    durable: bool,
+    force: bool,
+) -> Result<Address, StoreError> {
     let address = Address {
         hash: hash::hash_slice(payload),
         context,
@@ -103,11 +120,32 @@ pub(crate) async fn put_payload(
             address,
             fragment,
             Some(Bytes::copy_from_slice(payload)),
-            false,
+            force,
         )
-        .await
-        .unwrap();
-    address
+        .await?;
+    Ok(address)
+}
+
+/// Wait until `condition` holds, or `task` finishes, for at most 10 s.
+pub(crate) async fn wait_until<T>(condition: impl Fn() -> bool, task: &tokio::task::JoinHandle<T>) {
+    for _ in 0..10_000 {
+        if condition() || task.is_finished() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    panic!("the condition never held");
+}
+
+/// Wait until `condition` holds, failing with `failure` after 10 s.
+pub(crate) async fn wait_for(condition: impl AsyncFn() -> bool, failure: &str) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !condition().await {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect(failure);
 }
 
 /// Assert that each of `payloads`, an address and the bytes stored under it, reads back from
@@ -141,13 +179,15 @@ pub(crate) async fn compact_group_toward(
         .unwrap()
 }
 
-/// As [`compact_group_toward`], returning the error that ended a rewrite.
+/// As [`compact_group_toward`], returning the error that ended a rewrite. The group is compacted
+/// under a write claim, as a compaction pass compacts it.
 pub(crate) async fn try_compact_group_toward(
     store: &Arc<LocalImmutableStore>,
     group_index: usize,
     target_size: usize,
     protect_local_fragment: bool,
 ) -> Result<bool, StoreError> {
+    let _claim = store.hold(Intent::Write).await?;
     store
         .clone()
         .compact_group_packfiles(

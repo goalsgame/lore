@@ -384,11 +384,97 @@ async fn a_session_spreads_requests_over_every_storage_connection() {
     assert_eq!(server.gets_per_connection(), vec![100, 100, 100, 100]);
 }
 
-/// A reconnect numbers the server's sessions from 1 again, so the ids a stale pool holds may name
-/// the sessions its replacement starts. Replacing it stops none of them, and the replacement serves
-/// on every connection while the stale pool is still held.
+/// Calls under one correlation id share the pool the connection pins for a partition, so its
+/// sessions start once however many calls take it. A call under another correlation id pins a
+/// pool of its own in its place, and the sessions of the one it replaces stop.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving() {
+async fn a_pinned_pool_serves_its_correlation_id_until_another_replaces_it() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    for _ in 0..3 {
+        connection
+            .session_pool(test_partition(), "first")
+            .await
+            .expect("a pool");
+    }
+    assert_eq!(server.started_sessions_per_connection(), vec![1, 1]);
+
+    connection
+        .session_pool(test_partition(), "second")
+        .await
+        .expect("a pool");
+
+    assert_eq!(server.started_sessions_per_connection(), vec![2, 2]);
+    wait_until(
+        || server.live_sessions_per_connection() == [1, 1],
+        "the replaced pool's server sessions were left open",
+    )
+    .await;
+}
+
+/// A call under another correlation id replaces the pool pinned for its own partition alone: the
+/// pool pinned for another partition keeps serving its correlation id, and its sessions stay open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_replaced_pool_leaves_another_partitions_pool_pinned() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let other = Partition::from([0x7au8; 16]);
+    for (partition, correlation_id) in [
+        (other, "first"),
+        (test_partition(), "first"),
+        (test_partition(), "second"),
+        (other, "first"),
+    ] {
+        connection
+            .session_pool(partition, correlation_id)
+            .await
+            .expect("a pool");
+    }
+
+    assert_eq!(server.started_sessions_per_connection(), vec![3, 3]);
+    wait_until(
+        || server.live_sessions_per_connection() == [2, 2],
+        "the replaced pool's server sessions were left open",
+    )
+    .await;
+}
+
+/// An unpinned pool's server-side sessions stop once its last holder drops it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unpinned_pool_stops_its_server_sessions_when_dropped() {
+    use crate::quic::storage_service::test_server::TestStorageServer;
+    use crate::quic::storage_service::test_server::test_partition;
+    use crate::quic::storage_service::test_server::wait_until;
+
+    let server = TestStorageServer::start();
+    let connection = Connection::detached(server.connect(2).await);
+    let pool = connection
+        .unpinned_session_pool(test_partition(), "correlation")
+        .await
+        .expect("an unpinned pool");
+    assert_eq!(server.live_sessions_per_connection(), vec![1, 1]);
+
+    drop(pool);
+
+    wait_until(
+        || server.live_sessions_per_connection() == [0, 0],
+        "the unpinned pool's server sessions were left open",
+    )
+    .await;
+}
+
+/// The pool that replaces an invalidated one serves on every connection while the invalidated pool
+/// is still held.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_invalidated_pools_replacement_serves_on_every_connection() {
     use crate::quic::storage_service::test_server::TestStorageServer;
     use crate::quic::storage_service::test_server::test_address;
     use crate::quic::storage_service::test_server::test_partition;
@@ -401,7 +487,6 @@ async fn a_stale_pool_replaced_after_a_reconnect_leaves_its_replacement_serving(
         .expect("session over the detached storage");
     stale.get(&test_address(0)).await.expect("fetch");
 
-    server.restart_sessions();
     stale.invalidate().await;
     let fresh = connection
         .session(test_partition(), "correlation")

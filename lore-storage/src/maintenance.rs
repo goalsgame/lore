@@ -58,6 +58,8 @@ pub async fn evictor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
             // Background maintenance is silent — not tied to any command's event stream.
             if let Err(err) = real_store.evict(max_capacity, sync_data, None).await {
                 lore_base::lore_warn!("Store evictor failed: {err}");
@@ -93,6 +95,8 @@ pub async fn compactor(
             let Some(real_store) = store.upgrade() else {
                 break;
             };
+            #[cfg(feature = "test-util")]
+            let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
             // A pass that was stopped rather than finished leaves its resume point behind,
             // so re-reading after the wait picks that group back up instead of restarting.
             if at.is_none() {
@@ -130,6 +134,8 @@ pub async fn gc(
     sync_data: bool,
     sink: Option<GcEventSinkRef>,
 ) {
+    #[cfg(feature = "test-util")]
+    let _task = crate::test_util::store_task(crate::test_util::StoreTask::Collection);
     if max_capacity > 0 {
         let _ = store
             .clone()
@@ -231,6 +237,28 @@ impl GcCounters {
         let _ = self.store.set(Arc::downgrade(store));
     }
 
+    /// Forget everything loaded so far, so a store that is reloading from disk does
+    /// not count the same bytes twice.
+    ///
+    /// Both totals are cumulative `fetch_add`s fed by [`Self::add_loaded_size`] and
+    /// [`Self::add_loaded_fragments`], which are reached only from a packstore
+    /// `resume()` and a bucket deserialize. A store that discards its in-memory state
+    /// and re-reads the directory calls each of those a second time for the same
+    /// files, so without this the totals climb on every reload and the compaction and
+    /// eviction triggers fire against a number that describes no store.
+    ///
+    /// Zero is the right value rather than a subtraction because a reload discards
+    /// *all* of it: the caller has just invalidated every group, so the correct total
+    /// is the one a freshly constructed store has, and each group re-adds its own as
+    /// it is next touched.
+    ///
+    /// The fired-once latches are deliberately left alone. They exist to keep one
+    /// process from firing a pass per crossing, and a reload is not a new process.
+    pub fn reset_loaded(&self) {
+        self.total_size.store(0, Ordering::Relaxed);
+        self.fragment_count.store(0, Ordering::Relaxed);
+    }
+
     /// Account for `bytes` of just-loaded packstore data; fire one compaction pass if
     /// the running total crosses `max_size` (once per process).
     pub fn add_loaded_size(self: &Arc<Self>, bytes: u64) {
@@ -247,6 +275,30 @@ impl GcCounters {
         {
             self.clone().fire(true);
         }
+    }
+
+    /// Take `bytes` of packstore data back out of the running total, for a packstore
+    /// closing the files it had counted, so that loading them again is not counted on
+    /// top. The fired-once latch is left alone, as in [`Self::reset_loaded`].
+    pub fn remove_loaded_size(&self, bytes: u64) {
+        if bytes == 0 {
+            return;
+        }
+        let mut total = self.total_size.load(Ordering::Relaxed);
+        while let Err(current) = self.total_size.compare_exchange_weak(
+            total,
+            total.saturating_sub(bytes),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            total = current;
+        }
+    }
+
+    /// The bytes of packstore data counted as loaded. Test builds only.
+    #[cfg(feature = "test-util")]
+    pub fn loaded_size(&self) -> u64 {
+        self.total_size.load(Ordering::Relaxed)
     }
 
     /// Account for `count` just-deserialized bucket fragments; fire one eviction pass

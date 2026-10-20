@@ -38,7 +38,22 @@
 //
 // The library copies argument data before it starts the call. The caller may
 // free or reuse the argument memory once the call returns. This holds for
-// synchronous and asynchronous calls.
+// synchronous and asynchronous calls, except for the memory a lore_bytes_mut_t
+// names, which the library writes while the call runs: see lore_bytes_mut_t.
+//
+// Call lore_shutdown only once every call has completed: a synchronous call has
+// returned, and an asynchronous one has delivered END. The library makes a best
+// effort to cancel calls still executing safely, but a call it does not stop in
+// time may still use the library and the memory passed to it after
+// lore_shutdown returns.
+//
+// Structures
+//
+// Zero every byte of a structure before passing it to the library, padding
+// included, as memset does, then set the fields the call uses. A field left
+// zero selects the default its documentation names. A release can add a field
+// in a structure's padding, which code built against an earlier header leaves
+// unset: such code keeps its behavior only where it zeroed every byte.
 //
 // See lore_event_callback_config_t for how callbacks work.
 
@@ -4051,6 +4066,11 @@ typedef struct lore_event_t {
 } lore_event_t;
 
 // Common options shared by repository operations.
+//
+// Zero every byte of it, padding included, before setting the fields a call
+// uses, as every structure passed to the library: a field left zero selects
+// its default, and a field a release adds in its padding is left unset by
+// code built against an earlier header.
 typedef struct lore_global_args_t {
   // Repository path
   struct lore_string_t repository_path;
@@ -4094,9 +4114,13 @@ typedef struct lore_global_args_t {
   uint64_t compress_task_limit;
   // Keep store references alive after a repository call completes to avoid
   // repeated store open/close cycles for consecutive API calls in the same process.
+  // The stores stay locked meanwhile, so another process using them waits. With
+  // `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+  // the call, the stores are kept after every call whether or not this is set,
+  // unlocked, and the next call reloads them only if another process changed them.
   uint8_t store_keep_alive;
-  // Duration in seconds to keep store references alive. Only used when
-  // `store_keep_alive` is set. 0 means use the default (10 seconds).
+  // Duration in seconds to keep store references alive, when `store_keep_alive` or
+  // `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
   uint64_t store_keep_alive_seconds;
   // Force sync data to storage media during store flush
   uint8_t sync_data;
@@ -4134,6 +4158,13 @@ typedef struct lore_global_args_t {
   // Which authentication path to take if the server advertises both its
   // gRPC auth service and an OIDC issuer.
   enum lore_auth_mode_t auth_mode;
+  // Treat the remote as a trusted source, for a caller within its
+  // infrastructure where performance comes first: payloads fetched from it
+  // have only their sizes checked against their length, are never hashed,
+  // and are decompressed only where their content is read. A storage handle
+  // takes it from the globals it is opened with. Any non-zero value trusts
+  // the remote, so a caller zeroes the whole struct, padding included
+  uint8_t trust_remote;
 } lore_global_args_t;
 
 // Arguments for resolving user IDs to display names via the remote user service.
@@ -4355,6 +4386,10 @@ typedef struct lore_branch_merge_start_args_t {
   // revision. Empty carries nothing; the single entry `*` carries every
   // key that is not reserved to the merge itself.
   struct lore_string_array_t inherit_metadata;
+  // Array of link relative paths that have specific auto commit messages
+  struct lore_string_array_t link_paths;
+  // Array of messages corresponding to each link path (parallel array with `link_paths`)
+  struct lore_string_array_t link_messages;
 } lore_branch_merge_start_args_t;
 
 // Arguments for switching the working directory to a different branch or revision.
@@ -5176,14 +5211,9 @@ typedef struct lore_storage_open_args_t {
   struct lore_storage_remote_config_t remote_config;
   // Activate `remote_config`; otherwise the handle has no remote
   uint8_t has_remote_config;
-  // Skip re-hashing a loaded payload and checking it against the address it was read from.
-  //
-  // Zero keeps the check, which is the default: a store handing back bytes under a content
-  // address should be able to say they are the bytes that address names. A caller whose own
-  // layer already assures integrity - one that scrubs its store on a schedule, say - pays for
-  // the check on every byte of every read and learns nothing new from it, and can set this.
-  //
-  // Applies to every read on the handle.
+  // Alias of `globals.trust_remote` for this handle: the handle trusts its remote when either is
+  // set, so payloads fetched from it have only their sizes checked against their length and are
+  // never hashed. Payloads the local store holds are never hashed either way.
   uint8_t skip_verify;
   // Soft cap on total immutable-store bytes (compactor target). A non-zero cache target enables
   // incremental background GC for the handle; `0` then selects the default. Shared disk backends
@@ -5243,9 +5273,10 @@ typedef struct lore_storage_put_args_t {
 // A null pointer or zero length means no buffer is supplied, which is what a zero-initialized
 // value says, as does a length no allocation can have.
 //
-// The memory must stay valid, and reach nobody else, for the duration of the call it is passed to.
-// The buffers supplied by the items of one call must not overlap: the items run alongside each
-// other, so two covering the same byte would write it at once.
+// The memory must stay valid, and reach nobody else, until the call it is passed to completes: a
+// synchronous call returns, and an asynchronous one delivers `END`. The buffers supplied by the
+// items of one call must not overlap: the items run alongside each other, so two covering the same
+// byte would write it at once.
 typedef struct lore_bytes_mut_t {
   // Pointer to the start of the writable slice.
   void *ptr;
@@ -9737,9 +9768,10 @@ void lore_repository_gc_async(const struct lore_global_args_t *globals,
 
 // Release all cached store references for the given repository path.
 //
-// Frees in-memory store data and releases file-backed store cache entries.
-// Any active repository contexts for this path remain valid, but once they
-// are dropped the stores will be freed. Subsequent opens will create fresh stores.
+// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+// each is released once nothing uses it, and a later open reuses one that is still
+// alive, which the store epoch keeps current with what other processes wrote.
+// Any active repository contexts for this path remain valid.
 //
 // # Events
 //
@@ -11582,6 +11614,11 @@ void lore_shared_store_set_use_automatically_async(const struct lore_global_args
 
 // Open a content-addressed storage handle.
 //
+// A disk-backed handle claims its stores for this process until it is released, so
+// another process using the same stores waits until then. The claim ends once the
+// flush `lore_storage_close` starts has finished and every revision tree loaded
+// against the handle has been closed.
+//
 // # Events
 //
 // | Tag | Data Type | Description |
@@ -11728,7 +11765,12 @@ void lore_storage_put_resolved_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`.
 // Close does not block on the flush it spawns — `Complete` fires after
-// the in-flight counter drains, not after the flush finishes.
+// the in-flight counter drains, not after the flush finishes. The handle's
+// claim on its stores ends once that flush has finished and every revision
+// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
+// set to `1` or `true`, a disk-backed handle's stores stay in memory without
+// the claim for the window `store_keep_alive_seconds` gives, so a
+// `lore_storage_open` of the same repository in that window reuses them.
 int32_t lore_storage_close(const struct lore_global_args_t *globals,
                            const struct lore_storage_close_args_t *args,
                            struct lore_event_callback_config_t callback);
@@ -12053,7 +12095,9 @@ void lore_service_start_async(const struct lore_global_args_t *globals,
 // Stop the running Lore background service.
 //
 // Does not start a service in order to stop one. Returns `0` when no service
-// is running, since that is the state the call asks for.
+// is running, since that is the state the call asks for. A mount the service
+// cannot release because something holds it refuses the stop with `MountsBusy`,
+// unless the global `force` argument is set, which detaches busy mounts lazily.
 //
 // # Events
 //
@@ -12364,7 +12408,10 @@ void lore_notification_unsubscribe_async(const struct lore_global_args_t *global
 int32_t lore_log_configure(const struct lore_log_config_t *config);
 
 // Shut the library down, stopping its worker threads and releasing the
-// resources it holds. Call this once, when no further calls will be made.
+// resources it holds. Call this once, when no further calls will be made and
+// every call made has completed. The library makes a best effort to cancel
+// calls still executing safely, but a call it does not stop in time may still
+// use the memory passed to it after this returns.
 //
 // Returns 0 on success and a non-zero value on failure.
 int32_t lore_shutdown(void);
@@ -12519,6 +12566,9 @@ void lore_repository_config_get_async(const struct lore_global_args_t *globals,
 // `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
 // empty tree suitable for committing an initial revision.
 //
+// The tree keeps the storage handle's claim on its stores for as long as it is
+// open, past `lore_storage_close` on that handle.
+//
 // | Terminal event                       | Payload                                | Notes                                              |
 // |--------------------------------------|----------------------------------------|----------------------------------------------------|
 // | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
@@ -12535,7 +12585,9 @@ void lore_revision_tree_load_async(const struct lore_global_args_t *globals,
 //
 // Subsequent calls against the same handle return `InvalidArguments`. The
 // call blocks until every in-flight op on the handle has paired its
-// decrement.
+// decrement. Closing a tree on a storage handle that is already closed
+// flushes what the tree wrote since, and closing the last one releases
+// what was keeping that handle's claim on its stores.
 //
 // | Terminal event                              | Payload                                       | Notes                                              |
 // |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|

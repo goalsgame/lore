@@ -1436,6 +1436,12 @@ impl GcpImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for GcpImmutableStore {
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }

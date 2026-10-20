@@ -147,6 +147,16 @@ mod storage_remote_tests {
 
     #[async_trait::async_trait]
     impl lore_storage::ImmutableStore for InterceptPutStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         fn is_local(&self) -> bool {
             self.inner.clone().is_local()
         }
@@ -995,6 +1005,155 @@ mod storage_remote_tests {
             .await
     }
 
+    /// A handle replaces a connection the transport has marked stale once its connect's back-off
+    /// has passed, as the QUIC client marks one once it gives up reconnecting, though its calls
+    /// carry one correlation id and the handle holds a pool on the stale connection for it. The
+    /// test marks it by hand.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_handle_replaces_a_stale_connection() -> TestResult {
+        use std::sync::atomic::Ordering;
+
+        let execution = setup_execution("storage-remote-stale-connection".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = lore_base::types::Partition::from([0xd5u8; 16]);
+                    let payload = bytes::Bytes::from_static(b"served after a stale connection");
+                    let address = seed_server(&server, partition, &payload).await;
+                    let handle_id = open_remote_handle(&server).await;
+                    let endpoint =
+                        lore::storage::handle::lookup(lore::storage::handle::LoreStore {
+                            handle_id,
+                        })
+                        .and_then(|store| store.remote.clone())
+                        .expect("a handle with a remote");
+
+                    let get = async |id| {
+                        let globals = LoreGlobalArgs {
+                            correlation_id: "stale-connection".into(),
+                            ..Default::default()
+                        };
+                        run_get_batch_under(
+                            globals,
+                            handle_id,
+                            vec![get_item(id, partition, address)],
+                        )
+                        .await
+                    };
+                    let first = get(1).await;
+                    assert_eq!(first.codes.get(&1), Some(&0), "{transport:?}: first get");
+                    crate::common::net_common::wait_out_connect_back_off().await;
+                    crate::common::net_common::cached_connection(&server.url)
+                        .expect("the handle must have connected through the connection cache")
+                        .stale
+                        .store(true, Ordering::Relaxed);
+
+                    let second = get(2).await;
+                    assert_eq!(second.codes.get(&2), Some(&0), "{transport:?}: second get");
+                    let current = crate::common::net_common::cached_connection(&server.url).expect(
+                        "the handle must have replaced the stale connection through the cache",
+                    );
+                    let held = endpoint
+                        .connection(partition)
+                        .await
+                        .expect("the handle's connection");
+                    assert!(
+                        Arc::ptr_eq(&held, &current),
+                        "{transport:?}: the handle must hold the replacement",
+                    );
+                    assert!(
+                        !endpoint
+                            .pools
+                            .get(partition, "stale-connection")
+                            .expect("the handle holds the pool its gets took")
+                            .connection_is_stale(),
+                        "{transport:?}: the handle's pool must run on the replacement",
+                    );
+
+                    close_handle(handle_id).await;
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A storage handle holds the session pool its calls to a partition under one correlation id
+    /// share, replaces it for a call under another, and drops it when it closes. A replacement
+    /// leaves the pool held for another partition in place. Each get asks for an address of its
+    /// own, so each reaches the remote and takes a session.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_storage_handle_keeps_its_session_pool_for_its_correlation_id() -> TestResult {
+        let execution = setup_execution("storage-remote-session-per-handle".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let server = start_server(transport).await;
+                    let partition = lore_base::types::Partition::from([0xd4u8; 16]);
+                    let other = lore_base::types::Partition::from([0xd5u8; 16]);
+                    let handle_id = open_remote_handle(&server).await;
+                    let endpoint =
+                        lore::storage::handle::lookup(lore::storage::handle::LoreStore {
+                            handle_id,
+                        })
+                        .and_then(|store| store.remote.clone())
+                        .expect("a handle with a remote");
+                    let get_under = async |id: u64, partition, correlation_id: &str| {
+                        let payload = bytes::Bytes::from(format!("{transport:?} get {id}"));
+                        let address = seed_server(&server, partition, &payload).await;
+                        let globals = LoreGlobalArgs {
+                            correlation_id: correlation_id.into(),
+                            ..Default::default()
+                        };
+                        let results = run_get_batch_under(
+                            globals,
+                            handle_id,
+                            vec![get_item(id, partition, address)],
+                        )
+                        .await;
+                        assert_eq!(
+                            results.codes.get(&id),
+                            Some(&0),
+                            "{transport:?}: get {id} must succeed",
+                        );
+                        Arc::downgrade(
+                            &endpoint
+                                .pools
+                                .get(partition, correlation_id)
+                                .expect("the handle holds the pool its get took"),
+                        )
+                    };
+
+                    let first = get_under(1, partition, "first").await;
+                    let again = get_under(2, partition, "first").await;
+                    assert!(
+                        first.ptr_eq(&again),
+                        "{transport:?}: calls under one correlation id must share a pool",
+                    );
+                    let kept = get_under(3, other, "first").await;
+
+                    let second = get_under(4, partition, "second").await;
+                    assert!(!first.ptr_eq(&second));
+                    assert!(
+                        first.upgrade().is_none(),
+                        "{transport:?}: the replaced pool must be dropped",
+                    );
+                    assert!(
+                        kept.ptr_eq(&get_under(5, other, "first").await),
+                        "{transport:?}: a replacement must keep another partition's pool",
+                    );
+
+                    close_handle(handle_id).await;
+                    assert!(
+                        second.upgrade().is_none() && kept.upgrade().is_none(),
+                        "{transport:?}: closing the handle must drop its pools",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
     /// What an item delivering into its own buffer reported: whether any `GET_DATA` arrived, the
     /// content size the header carried, and the code the item completed with.
     #[derive(Clone, Copy, Default)]
@@ -1826,6 +1985,380 @@ mod storage_remote_tests {
                 Ok(())
             })
             .await
+    }
+
+    /// A revision a block warm-up test fetches ([`spanning_revision`]).
+    struct SpanningRevision {
+        revision: lore_base::types::Hash,
+        state: Arc<lore_revision::state::State>,
+        /// The node blocks its address list holds, by index.
+        nodes: Vec<(usize, lore_base::types::Address)>,
+        /// The file-metadata blocks its address list holds, by index.
+        file_metadata: Vec<(usize, lore_base::types::Address)>,
+    }
+
+    /// A revision of 1,200 root files on `test`'s server, spanning several node blocks with file
+    /// metadata in two of them, as the client deserializes it. `seed` sets its names and file
+    /// metadata apart from every other test's, so no read flight joins blocks of another test.
+    async fn spanning_revision(
+        test: &CacheTest,
+        seed: u8,
+    ) -> Result<SpanningRevision, Box<dyn Error>> {
+        use lore_base::types::Address;
+        use lore_base::types::Hash;
+        use lore_base::types::TypedBytes;
+        use lore_revision::node::Node;
+        use lore_revision::node::NodeFileMetadata;
+        use lore_revision::node::NodeFileMetadataBlock;
+        use lore_revision::node::ROOT_NODE;
+        use lore_revision::node::node_to_file_metadata;
+        use lore_revision::repository::RepositoryWriteToken;
+        use lore_revision::state::State;
+        use lore_storage::hash::hash_string;
+
+        let write_token = RepositoryWriteToken::acquire(std::path::Path::new(&format!(
+            "block-warm-up-test-{seed}"
+        )))
+        .await;
+        let state = State::new();
+        for index in 0..1200 {
+            let name = format!("file{seed}-{index}");
+            let node = Node {
+                name_hash: hash_string(&name),
+                ..Default::default()
+            };
+            let node = state
+                .node_add(test.server_repository.clone(), ROOT_NODE, node, &name)
+                .await?;
+            if [0, 1100].contains(&index) {
+                let metadata_node = node_to_file_metadata(node);
+                let block_index = NodeFileMetadataBlock::index(metadata_node);
+                let block = state
+                    .block_file_metadata(test.server_repository.clone(), block_index)
+                    .await?;
+                {
+                    let mut writer = block.write();
+                    let slot = writer.node(NodeFileMetadata::index(metadata_node));
+                    slot.revision[0] = Hash::from_u64((u64::from(seed) << 32) | (index + 1));
+                    writer.mark_dirty();
+                }
+                state.block_file_metadata_modified(block, block_index);
+            }
+        }
+        state.mark_dirty();
+        let revision = state
+            .serialize(test.server_repository.clone(), &write_token)
+            .await?;
+
+        let client = test.client_repository.clone();
+        let client_state = State::deserialize(client.clone(), revision).await?;
+        let (nodes, file_metadata) = client_state.block_address_lists(client).await?;
+        let present = |hashes: &[Hash]| {
+            hashes
+                .iter()
+                .enumerate()
+                .filter(|(_, hash)| !hash.is_zero())
+                .map(|(index, hash)| (index, Address::zero_context_hash(*hash)))
+                .collect::<Vec<_>>()
+        };
+        let nodes = present(nodes.as_type_slice::<Hash>());
+        let file_metadata = present(file_metadata.as_type_slice::<Hash>());
+        assert!(nodes.len() > 1, "the tree spans several node blocks");
+        assert!(!file_metadata.is_empty(), "the tree holds file metadata");
+        Ok(SpanningRevision {
+            revision,
+            state: client_state,
+            nodes,
+            file_metadata,
+        })
+    }
+
+    /// A block warm-up fetches every node block of a state with its name table and its
+    /// file-metadata block, so once the state's own records are cached as well the whole tree reads
+    /// without a remote. A warm-up told to stop fetches nothing, and one given block indices
+    /// fetches only the blocks the lists hold among them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_warm_up_makes_the_tree_available_offline() -> TestResult {
+        use lore_revision::immutable::is_stored_local;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::repository::prefetch::warm_blocks;
+        use lore_revision::state::State;
+
+        let execution = setup_execution("storage-remote-block-warm-up".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd5u8; 16])).await?;
+                    let SpanningRevision {
+                        revision,
+                        state: client_state,
+                        nodes,
+                        file_metadata,
+                    } = spanning_revision(&test, 1).await?;
+                    let client = test.client_repository.clone();
+
+                    let stopped = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        None,
+                        Arc::new(|| true),
+                    )
+                    .await?;
+                    assert_eq!(stopped.blocks, 0, "a stopped warm-up starts no block");
+                    let offline = test.offline();
+                    assert!(!is_stored_local(offline.clone(), nodes[0].1).await);
+
+                    let chosen = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        Some(&[usize::MAX, nodes[1].0]),
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (chosen.blocks, chosen.failures),
+                        (1, 0),
+                        "an index past the lists is skipped"
+                    );
+                    assert!(is_stored_local(offline.clone(), nodes[1].1).await);
+                    assert!(!is_stored_local(offline.clone(), nodes[0].1).await);
+
+                    let warmed = warm_blocks(
+                        client.clone(),
+                        client_state.clone(),
+                        None,
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (warmed.blocks, warmed.name_tables, warmed.file_metadata),
+                        (
+                            nodes.len() as u64,
+                            nodes.len() as u64,
+                            file_metadata.len() as u64
+                        )
+                    );
+                    assert!(warmed.block_bytes > 0 && warmed.name_table_bytes > 0);
+                    assert_eq!(warmed.failures, 0);
+
+                    client_state.cache_fragments(client, false).await?;
+                    let offline_state = State::deserialize(offline.clone(), revision).await?;
+                    for (index, _) in &nodes {
+                        offline_state
+                            .block_with_nametable(offline.clone(), *index)
+                            .await?;
+                    }
+                    for (index, _) in &file_metadata {
+                        offline_state
+                            .block_file_metadata(offline.clone(), *index)
+                            .await?;
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// A block warm-up counts each fetch the remote cannot serve and goes on: a node block the
+    /// remote lacks leaves its name table unfetched, a file-metadata block it lacks is counted
+    /// alone, and every other block and name table is stored.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_block_warm_up_counts_what_the_remote_lacks_and_goes_on() -> TestResult {
+        use lore_revision::immutable::is_stored_local;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::repository::prefetch::warm_blocks;
+        use lore_storage::StoreObliterateStats;
+
+        let execution = setup_execution("storage-remote-block-warm-up-lacking".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                for transport in TRANSPORTS {
+                    let test =
+                        CacheTest::start(transport, RepositoryId::from([0xd3u8; 16])).await?;
+                    let spanning = spanning_revision(&test, 2).await?;
+                    let &(lacking_node, node_address) = spanning
+                        .nodes
+                        .iter()
+                        .find(|(index, _)| {
+                            spanning
+                                .file_metadata
+                                .iter()
+                                .all(|(metadata, _)| metadata != index)
+                        })
+                        .expect("a node block without file metadata");
+                    let &(lacking_metadata, metadata_address) = spanning
+                        .file_metadata
+                        .iter()
+                        .find(|(index, _)| *index != lacking_node)
+                        .expect("the file metadata of another node block");
+                    for address in [node_address, metadata_address] {
+                        test.server
+                            .backend_immutable
+                            .clone()
+                            .obliterate(
+                                test.repository_id,
+                                address,
+                                Arc::new(StoreObliterateStats::default()),
+                            )
+                            .await?;
+                    }
+
+                    let warmed = warm_blocks(
+                        test.client_repository.clone(),
+                        spanning.state.clone(),
+                        None,
+                        Arc::new(|| false),
+                    )
+                    .await?;
+                    assert_eq!(
+                        (
+                            warmed.blocks,
+                            warmed.name_tables,
+                            warmed.file_metadata,
+                            warmed.failures
+                        ),
+                        (
+                            spanning.nodes.len() as u64,
+                            spanning.nodes.len() as u64 - 1,
+                            spanning.file_metadata.len() as u64,
+                            2
+                        )
+                    );
+                    let offline = test.offline();
+                    for &(index, address) in &spanning.nodes {
+                        assert_eq!(
+                            is_stored_local(offline.clone(), address).await,
+                            index != lacking_node,
+                            "node block {index}"
+                        );
+                    }
+                    for &(index, address) in &spanning.file_metadata {
+                        assert_eq!(
+                            is_stored_local(offline.clone(), address).await,
+                            index != lacking_metadata,
+                            "file-metadata block {index}"
+                        );
+                    }
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// The diagnostic immutable query checks the payload the remote serves as the command's trust of
+    /// its remote asks: a list that does not hash to its address is reported as served and not
+    /// walked, and a command trusting the remote walks it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_immutable_query_walks_a_remote_list_only_where_it_passes_its_check() -> TestResult
+    {
+        use lore_base::types::Address;
+        use lore_base::types::Context;
+        use lore_base::types::Fragment;
+        use lore_base::types::FragmentReference;
+        use lore_base::types::Hash;
+        use lore_base::types::fragment_flags::FragmentFlags;
+        use lore_revision::event::LoreEndEventData;
+        use lore_revision::interface::ExecutionContext;
+        use lore_revision::lore::RepositoryId;
+        use lore_revision::relay::EventDispatcher;
+
+        for (trust_remote, walked) in [(0u8, false), (1, true)] {
+            let subfragments: Arc<Mutex<Vec<u8>>> = Arc::default();
+            let ended = Arc::new(tokio::sync::Notify::new());
+            let (queried, end) = (subfragments.clone(), ended.clone());
+            let callback: LoreEventCallback =
+                Some(Box::new(move |event: &LoreEvent| match event {
+                    LoreEvent::RepositoryStoreImmutableQuery(data) => {
+                        queried.lock().unwrap().push(data.subfragment);
+                    }
+                    LoreEvent::End(_) => end.notify_one(),
+                    _ => {}
+                }));
+            let execution = Arc::new(ExecutionContext::new_server(
+                LoreGlobalArgs {
+                    trust_remote,
+                    ..LoreGlobalArgs::default()
+                },
+                EventDispatcher::new(callback),
+                "storage-remote-immutable-query".to_string(),
+            ));
+            LORE_CONTEXT
+                .scope(execution, async move {
+                    let repository_id = RepositoryId::from([0xd6 + trust_remote; 16]);
+                    let test = CacheTest::start(Transport::Grpc, repository_id).await?;
+                    let context = Context::from([0xd6; 16]);
+                    let leaf = b"a leaf named by a list the remote serves altered";
+                    let leaf_address = Address {
+                        hash: lore_storage::hash::hash_slice(leaf),
+                        context,
+                    };
+                    let plain = Fragment {
+                        flags: 0,
+                        size_payload: leaf.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(
+                            repository_id,
+                            leaf_address,
+                            plain,
+                            Some(bytes::Bytes::from_static(leaf)),
+                            false,
+                        )
+                        .await?;
+                    let reference = FragmentReference {
+                        hash: leaf_address.hash,
+                        offset_content: 0,
+                    };
+                    let list =
+                        bytes::Bytes::copy_from_slice(zerocopy::IntoBytes::as_bytes(&reference));
+                    let list_address = Address {
+                        hash: Hash::from([0xd6u8; 32]),
+                        context,
+                    };
+                    let fragmented = Fragment {
+                        flags: FragmentFlags::PayloadFragmented.bits(),
+                        size_payload: list.len() as u32,
+                        size_content: leaf.len() as u64,
+                    };
+                    test.server
+                        .backend_immutable
+                        .clone()
+                        .put(repository_id, list_address, fragmented, Some(list), false)
+                        .await?;
+
+                    lore_revision::repository::store::immutable_query(
+                        test.client_repository.clone(),
+                        list_address.to_string(),
+                        false,
+                        true,
+                    )
+                    .await?;
+                    LoreEvent::End(LoreEndEventData::default()).send();
+                    Ok::<(), Box<dyn Error>>(())
+                })
+                .await?;
+
+            tokio::time::timeout(Duration::from_secs(10), ended.notified()).await?;
+            let subfragments = subfragments.lock().unwrap().clone();
+            assert_eq!(
+                subfragments
+                    .iter()
+                    .filter(|&&subfragment| subfragment == 0)
+                    .count(),
+                2,
+                "the list is queried locally and remotely"
+            );
+            assert_eq!(
+                subfragments.contains(&1),
+                walked,
+                "the list is walked, trust_remote {trust_remote}"
+            );
+        }
+        Ok(())
     }
 
     /// `local_cache=1` on a put item tags the resulting fragment with
@@ -6815,6 +7348,15 @@ mod storage_remote_tests {
         handle_id: u64,
         items: Vec<lore::storage::get::LoreStorageGetItem>,
     ) -> GetBatchResults {
+        run_get_batch_under(LoreGlobalArgs::default(), handle_id, items).await
+    }
+
+    /// [`run_get_batch`] under `globals`.
+    async fn run_get_batch_under(
+        globals: LoreGlobalArgs,
+        handle_id: u64,
+        items: Vec<lore::storage::get::LoreStorageGetItem>,
+    ) -> GetBatchResults {
         let codes: Arc<Mutex<HashMap<u64, i32>>> = Arc::new(Mutex::new(HashMap::new()));
         let bytes: Arc<Mutex<HashMap<u64, Vec<u8>>>> = Arc::new(Mutex::new(HashMap::new()));
         let headers: Arc<Mutex<HashMap<u64, u64>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -6857,7 +7399,7 @@ mod storage_remote_tests {
         }));
 
         lore::storage::get::get(
-            LoreGlobalArgs::default(),
+            globals,
             lore::storage::get::LoreStorageGetArgs {
                 handle: lore::storage::handle::LoreStore { handle_id },
                 items: lore_revision::interface::LoreArray::from_vec(items),
@@ -7277,6 +7819,16 @@ mod storage_remote_tests {
 
     #[async_trait::async_trait]
     impl lore_storage::ImmutableStore for SlowDownOnce {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         // Answered from the wrapped store rather than the trait defaults: these describe how widely
         // the store behind this one reads and reports, and the `query` contract is written against
         // them. A decorator that let them default would misdescribe whatever it wraps.
@@ -7503,6 +8055,186 @@ mod storage_remote_tests {
                 }
 
                 close_handle(handle_id).await;
+                Ok(())
+            })
+            .await
+    }
+
+    /// A `lore://` connection to `server` over `storage_connections` storage connections, for the
+    /// tests of sessions across connections lost to a close ([`Connection::close_transport`]).
+    /// They run over QUIC alone, as its server keeps sessions per connection, where gRPC keeps
+    /// them on the client.
+    ///
+    /// [`Connection::close_transport`]: lore_transport::Connection::close_transport
+    async fn connect_quic(
+        server: &TestServer,
+        storage_connections: usize,
+    ) -> Arc<lore_transport::Connection> {
+        lore_transport::connection::connect(
+            server.url.as_str(),
+            "reconnect-test",
+            lore_base::types::Partition::default(),
+            storage_connections,
+            "",
+            "",
+            lore_transport::auth::AuthMode::Auto,
+        )
+        .await
+        .expect("connect to the test server")
+    }
+
+    /// `count` payloads seeded on `server` for `partition`, unique to `test`, with their
+    /// addresses.
+    async fn seed_payloads(
+        server: &TestServer,
+        partition: lore_base::types::Partition,
+        test: &str,
+        count: usize,
+    ) -> Vec<(lore_base::types::Address, bytes::Bytes)> {
+        let mut seeded = Vec::with_capacity(count);
+        for index in 0..count {
+            let payload = bytes::Bytes::from(format!("{test} payload {index}"));
+            seeded.push((seed_server(server, partition, &payload).await, payload));
+        }
+        seeded
+    }
+
+    /// A pool's sessions spread over several storage connections serve once every connection is
+    /// lost, as often as they are: gets, the existing-fragment query a push makes, and a mutable
+    /// store all succeed through the session the pool started.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_session_pool_serves_after_its_connections_are_lost() -> TestResult {
+        use lore_transport::quic::storage_service::QueryStatus;
+
+        let execution = setup_execution("storage-remote-lost-connections".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let partition = lore_base::types::Partition::from([0xc1u8; 16]);
+                let seeded = seed_payloads(&server, partition, "lost-connections", 16).await;
+                let addresses: Vec<_> = seeded.iter().map(|(address, _)| *address).collect();
+                let connection = connect_quic(&server, 4).await;
+                let session = connection.session(partition, "lost-connections").await?;
+
+                for round in 0..3u8 {
+                    if round > 0 {
+                        connection.close_transport().await;
+                    }
+                    for (address, payload) in &seeded {
+                        let (_, fetched) = session.get(address).await?;
+                        assert_eq!(
+                            &fetched, payload,
+                            "round {round}: a get returns its payload"
+                        );
+                    }
+                    let found = session.query(&addresses).await?;
+                    assert!(
+                        found
+                            .iter()
+                            .all(|&status| status == QueryStatus::ExistFullMatch as u8),
+                        "round {round}: the query finds every fragment: {found:?}",
+                    );
+                    let key = Hash::from([0xc2 + round; 32]);
+                    let value = Hash::from([0xd2 + round; 32]);
+                    session.mutable_store(key, value, REMOTE_KEY_TYPE).await?;
+                    assert_eq!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(partition, key, REMOTE_KEY_TYPE)
+                            .await?,
+                        value,
+                        "round {round}: the server holds the stored key",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Sessions of two partitions and two correlation ids on one storage connection each serve
+    /// under their own partition once it is lost. The session used first after the loss is issued
+    /// the id the session used next held on the lost connection, and that session's command must
+    /// not run under it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn sessions_on_a_lost_connection_keep_their_partitions() -> TestResult {
+        let execution = setup_execution("storage-remote-lost-connection-partitions".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let connection = connect_quic(&server, 1).await;
+                let first = lore_base::types::Partition::from([0xc3u8; 16]);
+                let second = lore_base::types::Partition::from([0xc4u8; 16]);
+                let mut sessions = Vec::new();
+                for (partition, correlation_id) in
+                    [(first, "first"), (second, "first"), (first, "second")]
+                {
+                    let pool = connection
+                        .unpinned_session_pool(partition, correlation_id)
+                        .await?;
+                    sessions.push((partition, lore_transport::StorageSession::pooled(pool)));
+                }
+
+                connection.close_transport().await;
+                for index in [1usize, 0, 2] {
+                    let (partition, session) = &sessions[index];
+                    let key = Hash::from([0xe0 + index as u8; 32]);
+                    let value = Hash::from([0xf0 + index as u8; 32]);
+                    session.mutable_store(key, value, REMOTE_KEY_TYPE).await?;
+                    let other = if *partition == first { second } else { first };
+                    assert_eq!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(*partition, key, REMOTE_KEY_TYPE)
+                            .await?,
+                        value,
+                        "session {index} stores under its own partition",
+                    );
+                    assert!(
+                        server
+                            .backend_mutable
+                            .clone()
+                            .load(other, key, REMOTE_KEY_TYPE)
+                            .await
+                            .is_err(),
+                        "session {index} stores nothing under another partition",
+                    );
+                }
+                Ok(())
+            })
+            .await
+    }
+
+    /// Gets racing the loss of every storage connection each return their payload, whether sent
+    /// before the loss or after it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn gets_racing_a_connection_loss_complete() -> TestResult {
+        use lore_base::lore_spawn;
+
+        let execution = setup_execution("storage-remote-lost-connections-in-flight".to_string());
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let server = start_quic_test_server().await;
+                let partition = lore_base::types::Partition::from([0xc5u8; 16]);
+                let seeded = seed_payloads(&server, partition, "in-flight", 64).await;
+                let connection = connect_quic(&server, 4).await;
+                let session = connection.session(partition, "in-flight").await?;
+
+                let mut gets = tokio::task::JoinSet::new();
+                for (address, payload) in seeded {
+                    let session = session.clone();
+                    lore_spawn!(gets, async move {
+                        session
+                            .get(&address)
+                            .await
+                            .map(|(_, fetched)| fetched == payload)
+                    });
+                }
+                connection.close_transport().await;
+                while let Some(fetched) = gets.join_next().await {
+                    assert!(fetched??, "a get returns its payload");
+                }
                 Ok(())
             })
             .await
