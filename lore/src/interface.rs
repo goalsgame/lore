@@ -4440,9 +4440,10 @@ pub type LoreRepositoryReleaseArgs = crate::repository::LoreRepositoryReleaseArg
 
 /// Release all cached store references for the given repository path.
 ///
-/// Frees in-memory store data and releases file-backed store cache entries.
-/// Any active repository contexts for this path remain valid, but once they
-/// are dropped the stores will be freed. Subsequent opens will create fresh stores.
+/// Frees cached in-memory store data. Disk-backed stores are not forced closed:
+/// each is released once nothing uses it, and a later open reuses one that is still
+/// alive, which the store epoch keeps current with what other processes wrote.
+/// Any active repository contexts for this path remain valid.
 ///
 /// # Events
 ///
@@ -6684,6 +6685,11 @@ pub type LoreStorageOpenArgs = crate::storage::open::LoreStorageOpenArgs;
 
 /// Open a content-addressed storage handle.
 ///
+/// A disk-backed handle claims its stores for this process until it is released, so
+/// another process using the same stores waits until then. The claim ends once the
+/// flush `lore_storage_close` starts has finished and every revision tree loaded
+/// against the handle has been closed.
+///
 /// # Events
 ///
 /// | Tag | Data Type | Description |
@@ -6894,7 +6900,12 @@ pub type LoreStorageCloseArgs = crate::storage::close::LoreStorageCloseArgs;
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`.
 /// Close does not block on the flush it spawns — `Complete` fires after
-/// the in-flight counter drains, not after the flush finishes.
+/// the in-flight counter drains, not after the flush finishes. The handle's
+/// claim on its stores ends once that flush has finished and every revision
+/// tree loaded against the handle has been closed. With `LORE_STORE_RETAIN`
+/// set to `1` or `true`, a disk-backed handle's stores stay in memory without
+/// the claim for the window `store_keep_alive_seconds` gives, so a
+/// `lore_storage_open` of the same repository in that window reuses them.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_storage_close(
     globals: &LoreGlobalArgs,
@@ -7412,7 +7423,9 @@ pub type LoreServiceStopArgs = crate::service::LoreServiceStopArgs;
 /// Stop the running Lore background service.
 ///
 /// Does not start a service in order to stop one. Returns `0` when no service
-/// is running, since that is the state the call asks for.
+/// is running, since that is the state the call asks for. A mount the service
+/// cannot release because something holds it refuses the stop with `MountsBusy`,
+/// unless the global `force` argument is set, which detaches busy mounts lazily.
 ///
 /// # Events
 ///
@@ -7796,7 +7809,10 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 }
 
 /// Shut the library down, stopping its worker threads and releasing the
-/// resources it holds. Call this once, when no further calls will be made.
+/// resources it holds. Call this once, when no further calls will be made and
+/// every call made has completed. The library makes a best effort to cancel
+/// calls still executing safely, but a call it does not stop in time may still
+/// use the memory passed to it after this returns.
 ///
 /// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]
@@ -8087,6 +8103,9 @@ pub type LoreRevisionTreeLoadArgs = crate::revision_tree::load::LoreRevisionTree
 /// `(store, repository, revision_hash)` tuple. `revision_hash == 0` opens an
 /// empty tree suitable for committing an initial revision.
 ///
+/// The tree keeps the storage handle's claim on its stores for as long as it is
+/// open, past `lore_storage_close` on that handle.
+///
 /// | Terminal event                       | Payload                                | Notes                                              |
 /// |--------------------------------------|----------------------------------------|----------------------------------------------------|
 /// | `LORE_EVENT_REVISION_TREE_LOADED`    | `lore_revision_tree_loaded_event_data_t` | Emitted on success carrying the opened handle id |
@@ -8115,7 +8134,9 @@ pub type LoreRevisionTreeCloseArgs = crate::revision_tree::close::LoreRevisionTr
 ///
 /// Subsequent calls against the same handle return `InvalidArguments`. The
 /// call blocks until every in-flight op on the handle has paired its
-/// decrement.
+/// decrement. Closing a tree on a storage handle that is already closed
+/// flushes what the tree wrote since, and closing the last one releases
+/// what was keeping that handle's claim on its stores.
 ///
 /// | Terminal event                              | Payload                                       | Notes                                              |
 /// |---------------------------------------------|-----------------------------------------------|----------------------------------------------------|

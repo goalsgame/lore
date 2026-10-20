@@ -1863,6 +1863,26 @@ impl State {
         Box::pin(self.read_node_block_addresses(repository, hash_node, block_count)).await
     }
 
+    /// Every node block's address hash and every file-metadata block's address hash, by block
+    /// index, each list read once per state. A zero hash, or an index past a list's end, is a block
+    /// with nothing stored.
+    pub async fn block_address_lists(
+        &self,
+        repository: Arc<RepositoryContext>,
+    ) -> Result<(Bytes, Bytes), StateError> {
+        let Tree {
+            block_count,
+            hash_node,
+            hash_file_metadata,
+            ..
+        } = self.tree(repository.clone()).await?;
+        let block_count = block_count as usize;
+        tokio::try_join!(
+            self.node_block_addresses(&repository, hash_node, block_count),
+            self.file_metadata_addresses(&repository, hash_file_metadata, block_count),
+        )
+    }
+
     /// Reads the node block address list `hash_node` names, padded with zero addresses to
     /// `block_count`, and holds it. The caller holds `block_deserialize`.
     async fn read_node_block_addresses(
@@ -7417,11 +7437,14 @@ impl RecordedModifiedTimes {
             if items.is_empty() {
                 continue;
             }
+            // Each task holds the context, and with it the command's claims on the store, so
+            // that none outlives them when this is dropped part way and its tasks run on to
+            // their next await.
             lore_spawn!(tasks, {
                 let store = store.clone();
-                let partition = repository.root_id();
+                let repository = repository.clone();
                 async move {
-                    file_modified_time_store_group(store, partition, items).await;
+                    file_modified_time_store_group(store, repository.root_id(), items).await;
                 }
             });
         }

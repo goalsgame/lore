@@ -651,6 +651,11 @@ pub enum LoreLoadConfig {
 pub const DEFAULT_EVENT_INTERVAL_MS: u64 = 100;
 
 /// Common options shared by repository operations.
+///
+/// Zero every byte of it, padding included, before setting the fields a call
+/// uses, as every structure passed to the library: a field left zero selects
+/// its default, and a field a release adds in its padding is left unset by
+/// code built against an earlier header.
 #[repr(C)]
 #[derive(Default, Debug, Clone, PartialEq, bitcode::Encode, bitcode::Decode)]
 pub struct LoreGlobalArgs {
@@ -696,9 +701,13 @@ pub struct LoreGlobalArgs {
     pub compress_task_limit: u64,
     /// Keep store references alive after a repository call completes to avoid
     /// repeated store open/close cycles for consecutive API calls in the same process.
+    /// The stores stay locked meanwhile, so another process using them waits. With
+    /// `LORE_STORE_RETAIN` set to `1` or `true` in the environment of the process running
+    /// the call, the stores are kept after every call whether or not this is set,
+    /// unlocked, and the next call reloads them only if another process changed them.
     pub store_keep_alive: u8,
-    /// Duration in seconds to keep store references alive. Only used when
-    /// `store_keep_alive` is set. 0 means use the default (10 seconds).
+    /// Duration in seconds to keep store references alive, when `store_keep_alive` or
+    /// `LORE_STORE_RETAIN` is set. 0 means use the default (10 seconds).
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
@@ -736,7 +745,17 @@ pub struct LoreGlobalArgs {
     /// Which authentication path to take if the server advertises both its
     /// gRPC auth service and an OIDC issuer.
     pub auth_mode: AuthMode,
+    /// Treat the remote as a trusted source, for a caller within its
+    /// infrastructure where performance comes first: payloads fetched from it
+    /// have only their sizes checked against their length, are never hashed,
+    /// and are decompressed only where their content is read. A storage handle
+    /// takes it from the globals it is opened with. Any non-zero value trusts
+    /// the remote, so a caller zeroes the whole struct, padding included
+    pub trust_remote: u8,
 }
+
+// Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
+const _: () = assert!(std::mem::size_of::<LoreGlobalArgs>() == 192);
 
 impl LoreGlobalArgs {
     pub fn repository_path(&self) -> &str {
@@ -866,6 +885,11 @@ impl LoreGlobalArgs {
         self.cache != 0
     }
 
+    /// Whether the command trusts its remote.
+    pub fn trust_remote(&self) -> bool {
+        self.trust_remote != 0
+    }
+
     /// Whether an operation should emit statistics events at all.
     pub fn stats(&self) -> bool {
         self.stats > 0
@@ -888,11 +912,11 @@ impl LoreGlobalArgs {
         std::time::Duration::from_millis(interval_ms)
     }
 
-    /// Returns the store keep-alive duration if enabled.
-    /// When `store_keep_alive` is not set, returns `None`.
-    /// When set with `store_keep_alive_seconds` of 0, uses the default duration.
+    /// Returns how long stores are kept after a call: `None` when neither `store_keep_alive`
+    /// is set nor this process retains stores ([`crate::store::retain_stores`]), and the
+    /// default duration where `store_keep_alive_seconds` is 0.
     pub fn store_keep_alive_duration(&self) -> Option<std::time::Duration> {
-        if self.store_keep_alive == 0 {
+        if self.store_keep_alive == 0 && !crate::store::retain_stores() {
             return None;
         }
         let seconds = if self.store_keep_alive_seconds == 0 {

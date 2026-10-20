@@ -491,7 +491,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -532,7 +532,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -553,6 +553,7 @@ mod defragment_integration {
             0..offset,
             DefragmentSink::Stream { sender },
             options,
+            None,
             None,
         );
         let consumer = async move {
@@ -593,7 +594,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -689,7 +691,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -821,7 +824,7 @@ mod defragment_integration {
         }
         let root_address = put_list(&store, partition, context, &refs, offset).await;
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -850,6 +853,7 @@ mod defragment_integration {
             },
             options,
             None,
+            None,
         )
         .await
         .expect_err("a write past the end of the sink fails the read");
@@ -871,6 +875,16 @@ mod defragment_integration {
 
     #[async_trait::async_trait]
     impl ImmutableStore for CountingGetStore {
+        /// Joins the claim of the store this one wraps.
+        async fn hold_for_command(
+            self: std::sync::Arc<Self>,
+        ) -> std::result::Result<
+            Option<lore_storage::local::store_lock::StoreGuard>,
+            lore_storage::StoreError,
+        > {
+            lore_storage::ImmutableStore::hold_for_command(self.inner.clone()).await
+        }
+
         async fn get(
             self: Arc<Self>,
             partition: Partition,
@@ -1044,7 +1058,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1068,6 +1082,7 @@ mod defragment_integration {
             0..total,
             leaf_tx,
             options,
+            None,
             None,
         )
         .await
@@ -1103,7 +1118,7 @@ mod defragment_integration {
             gets: gets.clone(),
         });
 
-        let options = ReadOptions::default().no_verify().with_decompress();
+        let options = ReadOptions::default().with_decompress();
         let (root_fragment, root_buffer) = lore_storage::read::load_fragment(
             store.clone(),
             partition,
@@ -1125,6 +1140,7 @@ mod defragment_integration {
             0..total,
             leaf_tx,
             options,
+            None,
             None,
         ));
 
@@ -1175,7 +1191,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1261,7 +1277,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1328,7 +1344,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1372,7 +1388,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1415,7 +1431,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1459,7 +1475,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1493,21 +1509,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                sub_empty,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty sublist");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            sub_empty,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty sublist");
         let sub_b = put_list(&store, partition, context, &refs_at(&[(leaf_b, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1526,7 +1540,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1555,7 +1569,14 @@ mod defragment_integration {
         // The root's own entries are strictly increasing, so the only fault in this tree is
         // the one under test. A root placing both sublists at the same offset would be
         // rejected for that instead, before either is ever loaded.
-        let sub_zero = put_list(&store, partition, context, &refs_at(&[(leaf_b, 0)]), 0).await;
+        let sub_zero = lore_storage::test_util::accepting_unvalidated_puts(put_list(
+            &store,
+            partition,
+            context,
+            &refs_at(&[(leaf_b, 0)]),
+            0,
+        ))
+        .await;
         let sub_a = put_list(&store, partition, context, &refs_at(&[(leaf_a, 100)]), 100).await;
         let root = put_list(
             &store,
@@ -1574,7 +1595,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1617,7 +1638,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1663,7 +1684,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1709,7 +1730,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1735,21 +1756,19 @@ mod defragment_integration {
             hash: hash::hash_slice(stub.as_ref()),
             context,
         };
-        store
-            .clone()
-            .put(
-                partition,
-                root,
-                Fragment {
-                    flags: FragmentFlags::PayloadFragmented.bits(),
-                    size_payload: stub.len() as u32,
-                    size_content: 100,
-                },
-                Some(stub),
-                false,
-            )
-            .await
-            .expect("put empty root list");
+        lore_storage::test_util::accepting_unvalidated_puts(store.clone().put(
+            partition,
+            root,
+            Fragment {
+                flags: FragmentFlags::PayloadFragmented.bits(),
+                size_payload: stub.len() as u32,
+                size_content: 100,
+            },
+            Some(stub),
+            false,
+        ))
+        .await
+        .expect("put empty root list");
 
         let out_path = dir.join("empty-root.bin");
         let err = lore_storage::read::read_into_file(
@@ -1759,7 +1778,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1803,7 +1822,7 @@ mod defragment_integration {
             &out_path,
             ".tmp",
             None,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
             None,
         )
         .await
@@ -1863,7 +1882,8 @@ mod defragment_integration {
             partition,
             leaf_rx,
             data_tx,
-            ReadOptions::default().no_verify(),
+            ReadOptions::default(),
+            None,
             None,
         ));
 
@@ -1978,13 +1998,18 @@ mod defragment_integration {
             let (address, fragment, payload) =
                 put_stored_leaf(&store, partition, context, part, mode).await;
             entries.push((address, (index * 4096) as u64));
-            leaves.push((fragment, payload));
+            // Read back local, as the store holds the payload.
+            let held = Fragment {
+                flags: fragment.flags | FragmentFlags::PayloadStoredLocal.bits(),
+                ..fragment
+            };
+            leaves.push((held, payload));
         }
         assert_ne!(leaves[0].0.flags & FragmentFlags::PayloadCompressed, 0);
         assert_ne!(leaves[1].0.flags & FragmentFlags::PayloadCompressed, 0);
 
         for options in [
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
             ReadOptions::default(),
         ] {
             let (fragment, list) = list_over(&entries, content.len() as u64);
@@ -1997,6 +2022,7 @@ mod defragment_integration {
                 list,
                 tx,
                 options,
+                None,
                 None,
             )
             .await
@@ -2039,7 +2065,8 @@ mod defragment_integration {
             fragment,
             list,
             tx,
-            ReadOptions::default().no_decompress().no_verify(),
+            ReadOptions::default().no_decompress(),
+            None,
             None,
         )
         .await;

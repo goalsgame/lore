@@ -1436,6 +1436,12 @@ impl GcpImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for GcpImmutableStore {
+    async fn hold_for_command(
+        self: Arc<Self>,
+    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
+        Ok(None)
+    }
+
     fn isolates_partitions(&self) -> bool {
         true
     }
@@ -1543,6 +1549,7 @@ impl ImmutableStoreTrait for GcpImmutableStore {
             match_made: StoreMatch::MatchFull,
             partition,
             payload: Some(payload),
+            content: None,
         })
     }
 

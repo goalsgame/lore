@@ -61,7 +61,8 @@ fn warn_entry(message: &str, entry: &ImmutableStoreEntry) {
 /// Re-encode local-only Oodle payloads reachable from one bucket, rewriting its entries in place.
 ///
 /// Iteration follows `sorted_index`, so entries sharing a hash are visited consecutively and the
-/// payload they share is decoded and re-encoded once for the whole run.
+/// payload they share is decoded and re-encoded once for the whole run. A tombstone in the run is
+/// left as it is.
 ///
 /// Marks the bucket dirty if anything changed; persisting it is the caller's job.
 #[lore_macro::test_pub]
@@ -75,7 +76,7 @@ async fn migrate_bucket(
 ) -> Result<MigrationCounts, LocalImmutableStoreError> {
     if !bucket.deserialized {
         Box::pin(bucket.deserialize(
-            &group.dirty[bucket_index],
+            &group,
             path.as_path(),
             group_index,
             bucket_index,
@@ -222,12 +223,13 @@ async fn migrate_bucket(
             if bucket.entry[sibling_index].address.hash != entry.address.hash {
                 break;
             }
-            bucket.entry[sibling_index]
-                .data
-                .assign_deduplicated_payload(migrated_data);
             next_entry += 1;
             num_entries += 1;
-            counts.migrated += 1;
+            let sibling = &mut bucket.entry[sibling_index].data;
+            if sibling.flags & FragmentFlags::PayloadObliterated == 0 {
+                sibling.assign_deduplicated_payload(migrated_data);
+                counts.migrated += 1;
+            }
         }
     }
 
@@ -256,7 +258,7 @@ async fn migrate_group(
 ) -> Result<(), LocalImmutableStoreError> {
     let group = &store.group[group_index];
 
-    let _flush_guard = group.flush_lock.clone().lock_owned().await;
+    let flush_guard = crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
 
     let num_buckets = group.bucket_count.load(Ordering::Relaxed);
     let mut guards: Vec<OwnedRwLockWriteGuard<ImmutableStoreBucket>> =
@@ -301,11 +303,12 @@ async fn migrate_group(
     }
     result?;
 
-    flush_locked_group(
+    flush_locked_group_to_end(
         group.clone(),
         group_index,
         path.clone(),
         true, /* sync data */
+        flush_guard,
     )
     .await?;
 
@@ -334,7 +337,16 @@ pub async fn migrate_groups(
         // The walk covers a range of indices, but a group is materialized by the hash byte that
         // selects it, so on a store holding few fragments most of that range was never written.
         // Migrating one regardless would create its directory and level marker to hold nothing.
-        if crate::local::fan_out::group_has_buckets(&group_path).await {
+        let has_buckets = match crate::local::fan_out::group_has_buckets(&group_path).await {
+            Ok(has_buckets) => has_buckets,
+            Err(err) => {
+                lore_error!(
+                    "Oodle local migration: failed to list group {group_to_migrate}: {err:?}"
+                );
+                return Ok(false);
+            }
+        };
+        if has_buckets {
             lore_info!("Oodle local migration: migrating group {group_to_migrate}");
 
             // there could unknown errors with old Immutable stores. If we have problem
@@ -357,4 +369,24 @@ pub async fn migrate_groups(
     }
     lore_info!("Oodle local migration: complete");
     Ok(true)
+}
+
+/// [`flush_locked_group`] in a task of its own holding `flush_guard`, so that a flush its caller
+/// drops still runs to its end under the group's flush lock, and no write it started lands after
+/// the lock is released.
+async fn flush_locked_group_to_end(
+    group: Arc<ImmutableStoreGroup>,
+    group_index: usize,
+    path: Arc<PathBuf>,
+    sync_data: bool,
+    flush_guard: tokio::sync::OwnedMutexGuard<()>,
+) -> Result<(), LocalImmutableStoreError> {
+    lore_base::lore_spawn!(async move {
+        let _flush_guard = flush_guard;
+        flush_locked_group(group, group_index, path, sync_data).await
+    })
+    .await
+    .internal("Group flush task failed")
+    .map_err(LocalImmutableStoreError::from)
+    .flatten()
 }

@@ -223,8 +223,17 @@ fn validate_auth_config(settings: &Settings) -> Result<(), config::ConfigError> 
             ));
         }
     }
+    if !auth.resource_id_template.contains(PARTITION_PLACEHOLDER) {
+        return Err(config::ConfigError::Message(format!(
+            "server.auth.resource_id_template must contain {PARTITION_PLACEHOLDER}, which stands \
+             for the partition ID"
+        )));
+    }
     validate_oidc_config(auth, authorizer)
 }
+
+/// Where a partition template puts the partition ID.
+const PARTITION_PLACEHOLDER: &str = "{id}";
 
 /// Tier 1 and Tier 2 have no login path besides OIDC, so they require
 /// `[server.auth.oidc]`. If grpc auth service is configured, it is optional.
@@ -267,6 +276,23 @@ fn validate_oidc_config(
         }
         (resource, scope) => resource || scope,
     };
+    for (setting, template) in [
+        (
+            "server.auth.oidc.resource_template",
+            &oidc.resource_template,
+        ),
+        ("server.auth.oidc.scope_template", &oidc.scope_template),
+    ] {
+        if is_set(template)
+            && !template
+                .as_deref()
+                .is_some_and(|template| template.contains(PARTITION_PLACEHOLDER))
+        {
+            return error(&format!(
+                "{setting} must contain {PARTITION_PLACEHOLDER}, which stands for the partition ID"
+            ));
+        }
+    }
     if is_set(&oidc.token_exchange_issuer) && !has_template {
         return error(
             "server.auth.oidc.token_exchange_issuer is set without \
@@ -376,9 +402,6 @@ pub struct AuthSettings {
     /// The resource name that matches every repository.
     #[serde(default = "AuthSettings::default_resource_wildcard")]
     pub resource_wildcard: String,
-    /// The claim recorded and compared as the caller's identity.
-    #[serde(default = "AuthSettings::default_identity_claim")]
-    pub identity_claim: String,
     /// What the repository listing answers for an authenticated caller with
     /// no explicit grant. Gates listing of the IDs only, never grants
     /// access to the contents. Consulted by the `baseline` catalog only.
@@ -430,10 +453,6 @@ impl AuthSettings {
 
     fn default_resource_wildcard() -> String {
         crate::auth::jwt::DEFAULT_RESOURCE_WILDCARD.to_string()
-    }
-
-    fn default_identity_claim() -> String {
-        "sub".to_string()
     }
 }
 
