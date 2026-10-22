@@ -157,12 +157,6 @@ where
             lore_spawn!(async move {
                 let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
                 while let Some(request) = stream.next().await {
-                    if let Some(guard) = guard.as_mut()
-                        && let Err(status) = guard.check().await
-                    {
-                        let _ = tx.send(Err(status)).await;
-                        break;
-                    }
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,
                         Err(error) => {
@@ -170,6 +164,13 @@ where
                             break;
                         }
                     };
+
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
 
                     let immutable_store = immutable_store.clone();
                     let tx = tx.clone();

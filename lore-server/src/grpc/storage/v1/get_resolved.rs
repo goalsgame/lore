@@ -52,6 +52,8 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::info_span;
 
+use crate::authnz::repository_authorizer::IncarnationGuard;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -131,11 +133,13 @@ pub async fn handler(
     request: Request<Streaming<storage_v1::GetResolvedRequest>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<GetResolvedResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let mut guard = IncarnationGuard::from_extensions(authorizer, request.extensions(), repository);
     let mut stream = request.into_inner();
 
     let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
@@ -158,6 +162,13 @@ pub async fn handler(
                             break;
                         }
                     };
+
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
 
                     let mutable_store = mutable_store.clone();
                     let immutable_store = immutable_store.clone();

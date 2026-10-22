@@ -32,6 +32,7 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
 use crate::grpc::extract_correlation_id;
@@ -148,16 +149,54 @@ pub async fn handler(
     // Owned halves of the verified token: the per-item tasks outlive the
     // request extensions the borrowed form points into.
     let auth_token = get_verified_token(request.extensions()).map(|token| Arc::new(token.owned()));
+    let guard = IncarnationGuard::from_extensions(
+        repository_authorizer.clone(),
+        request.extensions(),
+        destination_repository,
+    );
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
 
-    let mut stream = request.into_inner();
-
-    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
-    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
+    let stream = request.into_inner();
     let histogram = Arc::new(
         instrument_provider.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY),
     );
+
+    Ok(Response::new(
+        serve(
+            stream,
+            destination_repository,
+            auth_token,
+            repository_authorizer,
+            correlation_id,
+            user_id,
+            immutable_store,
+            guard,
+            histogram,
+        )
+        .await,
+    ))
+}
+
+/// Processes the request stream item by item, checking `guard` before each.
+#[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
+async fn serve<S>(
+    mut stream: S,
+    destination_repository: RepositoryId,
+    auth_token: Option<Arc<VerifiedTokenOwned>>,
+    repository_authorizer: Arc<dyn RepositoryAuthorizer>,
+    correlation_id: String,
+    user_id: String,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mut guard: Option<IncarnationGuard>,
+    histogram: Arc<opentelemetry::metrics::Histogram<f64>>,
+) -> CopyResponseStream
+where
+    S: Stream<Item = Result<storage_v1::CopyRequest, Status>> + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
+    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -171,6 +210,13 @@ pub async fn handler(
                             break;
                         }
                     };
+
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
 
                     let immutable_store = immutable_store.clone();
                     let repository_authorizer = repository_authorizer.clone();
@@ -223,5 +269,5 @@ pub async fn handler(
         .await;
 
     let recv_stream = ReceiverStream::from(rx);
-    Ok(Response::new(Box::pin(recv_stream) as CopyResponseStream))
+    Box::pin(recv_stream)
 }

@@ -32,6 +32,8 @@ use tracing::info_span;
 use super::get::GetResponseStream;
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::IncarnationGuard;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -106,11 +108,13 @@ async fn get_metadata_item(
 pub async fn handler(
     request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<GetResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let mut guard = IncarnationGuard::from_extensions(authorizer, request.extensions(), repository);
     let mut stream = request.into_inner();
 
     let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
@@ -133,6 +137,13 @@ pub async fn handler(
                             break;
                         }
                     };
+
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
 
                     let immutable_store = immutable_store.clone();
                     let tx = tx.clone();

@@ -40,12 +40,14 @@ use tracing::instrument;
 use zerocopy::IntoBytes;
 
 use super::extract_correlation_id;
+use super::get_repository;
 use super::interpret_streaming_error;
 use super::metadata_to_attribute;
 use super::rpc_code_to_str;
 use super::send_err;
 use super::simple_map_message_handle_error;
 use super::warn_error_to_status;
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::get_user_id;
 use crate::legacy::rpc::storage_service_server::StorageService;
@@ -118,6 +120,15 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::Address>>,
     ) -> Result<Response<Self::GetStream>, Status> {
+        let mut guard = get_repository(request.metadata())
+            .ok()
+            .and_then(|repository| {
+                IncarnationGuard::from_extensions(
+                    self.repository_authorizer.clone(),
+                    request.extensions(),
+                    repository,
+                )
+            });
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -138,6 +149,12 @@ impl StorageService for LoreStorageService {
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(request) = stream.next().await {
+                if let Some(guard) = guard.as_mut()
+                    && let Err(status) = guard.check().await
+                {
+                    let _ = tx.send(Err(status)).await;
+                    break;
+                }
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
                 let tx = tx.clone();
@@ -263,6 +280,15 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::PutRequest>>,
     ) -> Result<Response<Self::PutStream>, Status> {
+        let mut guard = get_repository(request.metadata())
+            .ok()
+            .and_then(|repository| {
+                IncarnationGuard::from_extensions(
+                    self.repository_authorizer.clone(),
+                    request.extensions(),
+                    repository,
+                )
+            });
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -285,6 +311,12 @@ impl StorageService for LoreStorageService {
 
         lore_spawn!(LORE_CONTEXT.scope(execution, async move {
             while let Some(req) = stream.next().await {
+                if let Some(guard) = guard.as_mut()
+                    && let Err(status) = guard.check().await
+                {
+                    let _ = tx.send(Err(status)).await;
+                    break;
+                }
                 let immutable_store = immutable_store.clone();
                 let repository_authorizer = repository_authorizer.clone();
                 let tx = tx.clone();
@@ -478,6 +510,15 @@ impl StorageService for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::CopyRequest>>,
     ) -> Result<Response<Self::CopyStream>, Status> {
+        let mut guard = get_repository(request.metadata())
+            .ok()
+            .and_then(|repository| {
+                IncarnationGuard::from_extensions(
+                    self.repository_authorizer.clone(),
+                    request.extensions(),
+                    repository,
+                )
+            });
         let attrs = Arc::new(metadata_to_attribute(
             request.metadata(),
             request.extensions(),
@@ -499,6 +540,12 @@ impl StorageService for LoreStorageService {
                 execution,
                 async move {
                     while let Some(req) = stream.next().await {
+                        if let Some(guard) = guard.as_mut()
+                            && let Err(status) = guard.check().await
+                        {
+                            let _ = tx.send(Err(status)).await;
+                            break;
+                        }
                         let immutable_store = immutable_store.clone();
                         let repository_authorizer = repository_authorizer.clone();
                         let tx = tx.clone();

@@ -16,6 +16,7 @@ use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
+use lore_base::types::RepositoryId;
 use lore_proto::lore::storage::v1 as storage_v1;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::create_operation_context_attribute;
@@ -42,6 +43,8 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::info_span;
 
+use crate::authnz::repository_authorizer::IncarnationGuard;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -167,20 +170,52 @@ pub async fn handler(
     request: Request<Streaming<storage_v1::PutResolvedRequest>>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResolvedResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
-    let mut stream = request.into_inner();
-
-    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
-
-    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
-
+    let guard = IncarnationGuard::from_extensions(authorizer, request.extensions(), repository);
+    let stream = request.into_inner();
     let histogram = Arc::new(
         instrument_provider.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY),
     );
+
+    Ok(Response::new(
+        serve(
+            stream,
+            repository,
+            correlation_id,
+            user_id,
+            mutable_store,
+            immutable_store,
+            guard,
+            histogram,
+        )
+        .await,
+    ))
+}
+
+/// Processes the request stream item by item, checking `guard` before each.
+#[lore_macro::test_pub]
+#[allow(clippy::too_many_arguments)]
+async fn serve<S>(
+    mut stream: S,
+    repository: RepositoryId,
+    correlation_id: String,
+    user_id: String,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mut guard: Option<IncarnationGuard>,
+    histogram: Arc<opentelemetry::metrics::Histogram<f64>>,
+) -> PutResolvedResponseStream
+where
+    S: Stream<Item = Result<storage_v1::PutResolvedRequest, Status>> + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
+
+    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 
     LORE_CONTEXT
         .scope(execution, async move {
@@ -194,6 +229,13 @@ pub async fn handler(
                             break;
                         }
                     };
+
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
 
                     let mutable_store = mutable_store.clone();
                     let immutable_store = immutable_store.clone();
@@ -292,9 +334,7 @@ pub async fn handler(
         .await;
 
     let recv_stream = ReceiverStream::from(rx);
-    Ok(Response::new(
-        Box::pin(recv_stream) as PutResolvedResponseStream
-    ))
+    Box::pin(recv_stream)
 }
 
 /// Store one item's fragment and publish its key. The returned `Status` is reported in-band

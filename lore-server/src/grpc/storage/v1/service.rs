@@ -48,7 +48,13 @@ impl StorageServiceV1 for LoreStorageService {
         &self,
         request: Request<Streaming<lore_proto::lore::model::v1::Address>>,
     ) -> Result<Response<Self::GetMetadataStream>, Status> {
-        get_metadata::handler(request, self.immutable_store().clone(), self).await
+        get_metadata::handler(
+            request,
+            self.immutable_store().clone(),
+            self.repository_authorizer().clone(),
+            self,
+        )
+        .await
     }
 
     type GetResolvedStream = GetResolvedResponseStream;
@@ -61,6 +67,7 @@ impl StorageServiceV1 for LoreStorageService {
             request,
             self.mutable_store().clone(),
             self.immutable_store().clone(),
+            self.repository_authorizer().clone(),
             self,
         )
         .await
@@ -76,6 +83,7 @@ impl StorageServiceV1 for LoreStorageService {
             request,
             self.mutable_store().clone(),
             self.immutable_store().clone(),
+            self.repository_authorizer().clone(),
             self,
         )
         .await
