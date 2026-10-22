@@ -293,3 +293,117 @@ mod authorized_connect {
         assert!(context.get::<PartitionGrants>().is_none());
     }
 }
+
+mod revalidation {
+    use std::collections::HashSet;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+
+    use lore_base::types::Hash;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_authorizer::Grants;
+    use lore_server::authnz::repository_authorizer::PartitionGrants;
+    use lore_server::authnz::repository_name_resolver::RepositoryNameResolver;
+    use tonic::Status;
+
+    use super::*;
+
+    struct SwitchableResolver {
+        state: Mutex<(Hash, Arc<str>)>,
+        resolves: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl RepositoryNameResolver for SwitchableResolver {
+        async fn resolve(&self, _repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
+            self.resolves.fetch_add(1, Ordering::SeqCst);
+            Ok(Some(self.state.lock().unwrap().1.clone()))
+        }
+
+        async fn incarnation(&self, _repository_id: RepositoryId) -> Result<Option<Hash>, Status> {
+            Ok(Some(self.state.lock().unwrap().0))
+        }
+    }
+
+    fn connection(repository: RepositoryId, incarnation: Option<Hash>) -> Arc<AttributeMap> {
+        let context = Arc::new(AttributeMap::default());
+        context.insert(PartitionGrants {
+            repository_id: repository,
+            grants: Grants::Actions(HashSet::from(["read".to_string()])),
+            incarnation,
+        });
+        context.insert(RawToken("raw.jwt".to_string()));
+        context.insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-name:goalables/*".to_string(),
+                permission: vec!["read".to_string()],
+            }]),
+            ..Default::default()
+        });
+        context
+    }
+
+    fn fixture() -> (Arc<SwitchableResolver>, Arc<dyn RepositoryAuthorizer>) {
+        let resolver = Arc::new(SwitchableResolver {
+            state: Mutex::new((Hash::from([1u8; 32]), Arc::from("goalables/app"))),
+            resolves: AtomicUsize::new(0),
+        });
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+            AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                .with_name_resolver(resolver.clone()),
+        );
+        (resolver, authorizer)
+    }
+
+    #[tokio::test]
+    async fn a_connection_whose_repository_was_recreated_is_refused() {
+        let (resolver, authorizer) = fixture();
+        let repository = random::<RepositoryId>();
+        let context = connection(repository, Some(Hash::from([1u8; 32])));
+
+        revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap();
+
+        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("game"));
+        let err = revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, MessageHandleError::AuthorizationFailure(_)));
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_incarnation_enumerates_nothing_again() {
+        let (resolver, authorizer) = fixture();
+        let context = connection(random(), Some(Hash::from([1u8; 32])));
+
+        for _ in 0..3 {
+            revalidate_connection_grants(&context, &authorizer)
+                .await
+                .unwrap();
+        }
+        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 0);
+
+        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("goalables/other"));
+        for _ in 0..3 {
+            revalidate_connection_grants(&context, &authorizer)
+                .await
+                .unwrap();
+        }
+        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_connection_without_an_incarnation_is_never_checked() {
+        let (resolver, authorizer) = fixture();
+        let context = connection(random(), None);
+
+        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("game"));
+        revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap();
+        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 0);
+    }
+}

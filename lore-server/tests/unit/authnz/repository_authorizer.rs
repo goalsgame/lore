@@ -392,6 +392,7 @@ mod permits_helper {
             Some(PartitionGrants {
                 repository_id: repository(),
                 grants: Grants::Actions(HashSet::new()),
+                incarnation: None,
             }),
             true,
         );
@@ -414,6 +415,7 @@ mod permits_helper {
             Some(PartitionGrants {
                 repository_id: other,
                 grants: Grants::Denied,
+                incarnation: None,
             }),
             true,
         );
@@ -753,6 +755,13 @@ mod name_scoped_grants {
         async fn resolve(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
             Ok(self.0.get(&repository_id).cloned())
         }
+
+        async fn incarnation(
+            &self,
+            _repository_id: RepositoryId,
+        ) -> Result<Option<lore_base::types::Hash>, Status> {
+            Ok(None)
+        }
     }
 
     struct Fixture {
@@ -874,6 +883,13 @@ mod name_scoped_grants {
     impl RepositoryNameResolver for FailingNames {
         async fn resolve(&self, _repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
             Err(self.0.clone())
+        }
+
+        async fn incarnation(
+            &self,
+            _repository_id: RepositoryId,
+        ) -> Result<Option<lore_base::types::Hash>, Status> {
+            Ok(None)
         }
     }
 

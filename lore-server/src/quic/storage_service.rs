@@ -35,6 +35,7 @@ use crate::correlation::CorrelationId;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::UserAgentValue;
+use crate::protocol::storage::connect::revalidate_connection_grants;
 use crate::protocol::storage::messages::LoreResponse;
 use crate::protocol::storage::messages::Message;
 use crate::protocol::storage::messages::MessageHandleError;
@@ -516,6 +517,7 @@ impl QuicService for StorageService {
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
         if !matches!(request, ParsedStorageRequest::Connect(_)) {
             reject_expired_connection(&context)?;
+            revalidate_connection_grants(&context, &self.repository_authorizer).await?;
         }
 
         let lore_response = match request {

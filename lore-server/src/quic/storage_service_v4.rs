@@ -193,6 +193,7 @@ impl QuicService for StorageServiceV4 {
             } => {
                 let mut user_id = String::new();
                 let mut grants = None;
+                let mut incarnation = None;
                 let mut token = None;
 
                 if let Some(jwt_verifier) = self.jwt_verifier.as_ref() {
@@ -215,6 +216,11 @@ impl QuicService for StorageServiceV4 {
                         raw: &token_str,
                         claims: &authorization,
                     };
+                    incarnation = self
+                        .repository_authorizer
+                        .session_incarnation(&verified, repository)
+                        .await
+                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
                     grants = self
                         .repository_authorizer
                         .granted_access(Some(&verified), repository)
@@ -226,7 +232,14 @@ impl QuicService for StorageServiceV4 {
                 }
 
                 let session_map = self.session_map.clone();
-                match session_map.start(repository, correlation_id, user_id, grants, token) {
+                match session_map.start(
+                    repository,
+                    correlation_id,
+                    user_id,
+                    grants,
+                    incarnation,
+                    token,
+                ) {
                     Ok((session_id, correlation_id)) => {
                         debug!(
                             session_id,
@@ -269,7 +282,23 @@ impl QuicService for StorageServiceV4 {
                 let user_id = session.user_id.clone();
                 let token = session.token.clone();
                 let authorized_sources = session.authorized_sources.clone();
+                let seen_incarnation = session.incarnation;
                 drop(session);
+
+                if let (Some(seen), Some(owned)) = (seen_incarnation, token.as_deref()) {
+                    let regranted = self
+                        .repository_authorizer
+                        .regrant_if_incarnation_changed(&owned.as_token(), repository, seen)
+                        .await
+                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
+                    if let Some(regranted) = regranted {
+                        let _ = session_map.regrant(
+                            session_id,
+                            regranted.grants,
+                            regranted.incarnation,
+                        );
+                    }
+                }
 
                 // Parse the storage command payload using v4-aware parsers — Copy carries an
                 // extra `target_context` field on the wire that the legacy parser cannot decode.

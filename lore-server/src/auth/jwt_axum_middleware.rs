@@ -61,6 +61,7 @@ pub async fn jwt_axum_verify_authorization(
                         request.extensions_mut().insert(PartitionGrants {
                             repository_id: repository,
                             grants,
+                            incarnation: None,
                         });
                     }
                     // Set `user_info` as a request extension so it can be used down the stack

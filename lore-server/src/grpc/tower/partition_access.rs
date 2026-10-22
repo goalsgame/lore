@@ -185,6 +185,7 @@ where
                         request.extensions_mut().insert(PartitionGrants {
                             repository_id: repository,
                             grants,
+                            incarnation: None,
                         });
                     }
                     // Entered unbounded: the decode of the request body

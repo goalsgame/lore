@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use anyhow::bail;
 use async_trait::async_trait;
+use lore_base::types::Hash;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
@@ -103,6 +104,25 @@ impl Grants {
 pub struct PartitionGrants {
     pub repository_id: RepositoryId,
     pub grants: Grants,
+    /// The repository's metadata hash when the grants were enumerated, for a
+    /// name-scoped token on a long-lived connection. `None` on the
+    /// per-request paths, which enumerate again on every request.
+    pub incarnation: Option<Hash>,
+}
+
+/// Grants enumerated again for a long-lived session or connection.
+pub struct Regranted {
+    pub grants: Option<Grants>,
+    pub incarnation: Option<Hash>,
+}
+
+/// Whether `token`'s `resources` claim has `urc-name:` entries.
+pub fn token_is_name_scoped(token: &VerifiedToken<'_>) -> bool {
+    token
+        .claims
+        .resources
+        .as_deref()
+        .is_some_and(has_name_scoped)
 }
 
 #[async_trait]
@@ -139,6 +159,16 @@ pub trait RepositoryAuthorizer: Send + Sync {
         _token: Option<&VerifiedToken<'_>>,
         _repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
+        Ok(None)
+    }
+
+    /// The hash of the repository's current metadata, read fresh, for
+    /// authorizers whose grants depend on the repository's name. `Ok(None)`
+    /// when the authorizer's grants do not depend on it.
+    async fn repository_incarnation(
+        &self,
+        _repository_id: RepositoryId,
+    ) -> Result<Option<Hash>, Status> {
         Ok(None)
     }
 
@@ -192,6 +222,40 @@ impl dyn RepositoryAuthorizer {
             Err(status) => Err(crate::grpc::access_failure_status(status)),
             Ok(Some(_)) => Err(crate::grpc::no_repository_access_status()),
         }
+    }
+
+    /// The incarnation a long-lived session on `repository_id` records at
+    /// start: `Some` only for a name-scoped token, so other sessions never
+    /// pay for the read.
+    pub async fn session_incarnation(
+        &self,
+        token: &VerifiedToken<'_>,
+        repository_id: RepositoryId,
+    ) -> Result<Option<Hash>, Status> {
+        if !token_is_name_scoped(token) {
+            return Ok(None);
+        }
+        self.repository_incarnation(repository_id).await
+    }
+
+    /// Enumerates the caller's access again when `repository_id`'s
+    /// incarnation is no longer `seen`; `Ok(None)` when it is unchanged.
+    /// The error is [`granted_access`](Self::granted_access)'s.
+    pub async fn regrant_if_incarnation_changed(
+        &self,
+        token: &VerifiedToken<'_>,
+        repository_id: RepositoryId,
+        seen: Hash,
+    ) -> Result<Option<Regranted>, Status> {
+        let current = self.repository_incarnation(repository_id).await?;
+        if current == Some(seen) {
+            return Ok(None);
+        }
+        let grants = self.granted_access(Some(token), repository_id).await?;
+        Ok(Some(Regranted {
+            grants,
+            incarnation: current.or(Some(seen)),
+        }))
     }
 
     /// Whether the caller may perform `action` on `repository_id` — the one
@@ -513,6 +577,16 @@ fn evaluate_check_user_permission(
 
 #[async_trait]
 impl RepositoryAuthorizer for AuthClientAuthorizer {
+    async fn repository_incarnation(
+        &self,
+        repository_id: RepositoryId,
+    ) -> Result<Option<Hash>, Status> {
+        match &self.name_resolver {
+            Some(resolver) => resolver.incarnation(repository_id).await,
+            None => Ok(None),
+        }
+    }
+
     async fn check_repository_access(
         &self,
         token: Option<&VerifiedToken<'_>>,

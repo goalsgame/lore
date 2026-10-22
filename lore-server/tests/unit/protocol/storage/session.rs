@@ -46,6 +46,7 @@ mod entry_permits {
             correlation_id: "corr".to_string(),
             user_id: String::new(),
             grants,
+            incarnation: None,
             token,
             authorized_sources: Arc::new(DashSet::new()),
         }
@@ -99,7 +100,7 @@ mod entry_permits {
 fn start_assigns_session_id_from_one() {
     let map = SessionMap::default();
     let (id, _) = map
-        .start(random(), "corr-1".into(), String::new(), None, None)
+        .start(random(), "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     assert_eq!(id, 1);
 }
@@ -109,10 +110,10 @@ fn start_increments_session_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     let (id2, _) = map
-        .start(repo, "corr-2".into(), String::new(), None, None)
+        .start(repo, "corr-2".into(), String::new(), None, None, None)
         .unwrap();
     assert_eq!(id1, 1);
     assert_eq!(id2, 2);
@@ -123,10 +124,10 @@ fn start_always_allocates_new_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     let (id2, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     assert_ne!(id1, id2);
 }
@@ -136,10 +137,10 @@ fn start_empty_correlation_generates_uuid() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, corr1) = map
-        .start(repo, String::new(), String::new(), None, None)
+        .start(repo, String::new(), String::new(), None, None, None)
         .unwrap();
     let (id2, corr2) = map
-        .start(repo, String::new(), String::new(), None, None)
+        .start(repo, String::new(), String::new(), None, None, None)
         .unwrap();
     assert_ne!(id1, id2);
     assert!(!corr1.is_empty());
@@ -152,7 +153,7 @@ fn stop_removes_session() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     assert!(map.get(id).is_some());
     map.stop(id).unwrap();
@@ -169,7 +170,7 @@ fn stop_unknown_returns_not_found() {
 fn stop_already_stopped_returns_not_found() {
     let map = SessionMap::default();
     let (id, _) = map
-        .start(random(), "corr-1".into(), String::new(), None, None)
+        .start(random(), "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     map.stop(id).unwrap();
     assert_eq!(map.stop(id), Err(SessionError::NotFound));
@@ -180,11 +181,11 @@ fn start_after_stop_allocates_new_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id1, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     map.stop(id1).unwrap();
     let (id2, _) = map
-        .start(repo, "corr-1".into(), String::new(), None, None)
+        .start(repo, "corr-1".into(), String::new(), None, None, None)
         .unwrap();
     assert_ne!(id1, id2);
 }
@@ -194,7 +195,7 @@ fn get_returns_entry_with_user_id() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     let (id, _) = map
-        .start(repo, "corr-1".into(), "user-42".into(), None, None)
+        .start(repo, "corr-1".into(), "user-42".into(), None, None, None)
         .unwrap();
     let entry = map.get(id).unwrap();
     assert_eq!(entry.repository, repo);
@@ -213,11 +214,11 @@ fn concurrent_session_limit() {
     let map = SessionMap::default();
     let repo = random::<RepositoryId>();
     for i in 0..MAX_CONCURRENT_SESSIONS {
-        map.start(repo, format!("corr-{i}"), String::new(), None, None)
+        map.start(repo, format!("corr-{i}"), String::new(), None, None, None)
             .unwrap();
     }
     assert_eq!(
-        map.start(repo, "one-more".into(), String::new(), None, None),
+        map.start(repo, "one-more".into(), String::new(), None, None, None),
         Err(SessionError::LimitReached)
     );
 }
@@ -229,15 +230,15 @@ fn limit_freed_by_stop() {
     let mut ids = Vec::new();
     for i in 0..MAX_CONCURRENT_SESSIONS {
         let (id, _) = map
-            .start(repo, format!("corr-{i}"), String::new(), None, None)
+            .start(repo, format!("corr-{i}"), String::new(), None, None, None)
             .unwrap();
         ids.push(id);
     }
     assert_eq!(
-        map.start(repo, "blocked".into(), String::new(), None, None),
+        map.start(repo, "blocked".into(), String::new(), None, None, None),
         Err(SessionError::LimitReached)
     );
     map.stop(ids[0]).unwrap();
-    map.start(repo, "freed".into(), String::new(), None, None)
+    map.start(repo, "freed".into(), String::new(), None, None, None)
         .unwrap();
 }

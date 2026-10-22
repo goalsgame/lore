@@ -6,6 +6,7 @@ use std::sync::atomic::Ordering;
 
 use dashmap::DashMap;
 use dashmap::DashSet;
+use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
 
 use crate::authnz::repository_authorizer::Grants;
@@ -24,6 +25,10 @@ pub struct SessionEntry {
     /// enumerate them at session start. `None` means per-action checks fall
     /// back to the authorizer with `token`.
     pub grants: Option<Grants>,
+    /// The repository's metadata hash when `grants` were enumerated. `Some`
+    /// only for a name-scoped token; a change means the grants must be
+    /// enumerated again.
+    pub incarnation: Option<Hash>,
     /// The verified token the session was authorized with. `None` on a
     /// server with no verifier configured. Shared: the dispatch clones it per
     /// command, so the clone must stay a refcount bump.
@@ -92,6 +97,7 @@ impl SessionMap {
         correlation_id: String,
         user_id: String,
         grants: Option<Grants>,
+        incarnation: Option<Hash>,
         token: Option<Arc<VerifiedTokenOwned>>,
     ) -> Result<(u32, String), SessionError> {
         if self.entries.len() >= MAX_CONCURRENT_SESSIONS as usize {
@@ -116,6 +122,7 @@ impl SessionMap {
                 correlation_id: correlation_id.clone(),
                 user_id,
                 grants,
+                incarnation,
                 token,
                 authorized_sources: Arc::new(DashSet::new()),
             },
@@ -130,6 +137,22 @@ impl SessionMap {
             Some(_) => Ok(()),
             None => Err(SessionError::NotFound),
         }
+    }
+
+    /// Replaces a session's grants and incarnation.
+    pub fn regrant(
+        &self,
+        session_id: u32,
+        grants: Option<Grants>,
+        incarnation: Option<Hash>,
+    ) -> Result<(), SessionError> {
+        let mut entry = self
+            .entries
+            .get_mut(&session_id)
+            .ok_or(SessionError::NotFound)?;
+        entry.grants = grants;
+        entry.incarnation = incarnation;
+        Ok(())
     }
 
     pub fn get(&self, session_id: u32) -> Option<dashmap::mapref::one::Ref<'_, u32, SessionEntry>> {

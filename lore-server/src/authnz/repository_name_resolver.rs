@@ -27,6 +27,11 @@ pub const NAME_CACHE_CAPACITY: usize = 4096;
 pub trait RepositoryNameResolver: Send + Sync {
     /// The name of `repository_id`, or `Ok(None)` when no such repository exists.
     async fn resolve(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status>;
+
+    /// The hash of the repository's current metadata, read fresh. It changes
+    /// when the repository is deleted and recreated, so a holder of grants
+    /// derived from a name can tell they may no longer apply.
+    async fn incarnation(&self, repository_id: RepositoryId) -> Result<Option<Hash>, Status>;
 }
 
 /// The two store reads behind a name lookup: the repository's current
@@ -166,6 +171,10 @@ impl RepositoryNameResolver for CachedNameResolver {
         }
         names.insert(hash, name.clone());
         Ok(Some(name))
+    }
+
+    async fn incarnation(&self, repository_id: RepositoryId) -> Result<Option<Hash>, Status> {
+        self.source.metadata_hash(repository_id).await
     }
 }
 

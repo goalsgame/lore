@@ -345,6 +345,153 @@ mod authorized_session {
         }
     }
 
+    /// Serves a switchable name and incarnation for one repository and counts
+    /// the reads.
+    struct SwitchableResolver {
+        state: std::sync::Mutex<(Option<lore_base::types::Hash>, Arc<str>)>,
+        resolves: std::sync::atomic::AtomicUsize,
+        incarnations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl SwitchableResolver {
+        fn new(hash: lore_base::types::Hash, name: &str) -> Arc<Self> {
+            Arc::new(Self {
+                state: std::sync::Mutex::new((Some(hash), Arc::from(name))),
+                resolves: Default::default(),
+                incarnations: Default::default(),
+            })
+        }
+
+        fn flip(&self, hash: lore_base::types::Hash, name: &str) {
+            *self.state.lock().unwrap() = (Some(hash), Arc::from(name));
+        }
+
+        fn resolves(&self) -> usize {
+            self.resolves.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn incarnations(&self) -> usize {
+            self.incarnations.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl lore_server::authnz::repository_name_resolver::RepositoryNameResolver for SwitchableResolver {
+        async fn resolve(
+            &self,
+            _repository_id: lore_revision::lore::RepositoryId,
+        ) -> Result<Option<Arc<str>>, tonic::Status> {
+            self.resolves
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(self.state.lock().unwrap().1.clone()))
+        }
+
+        async fn incarnation(
+            &self,
+            _repository_id: lore_revision::lore::RepositoryId,
+        ) -> Result<Option<lore_base::types::Hash>, tonic::Status> {
+            self.incarnations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self.state.lock().unwrap().0)
+        }
+    }
+
+    async fn service_with_resolver(resolver: Arc<SwitchableResolver>) -> StorageServiceV4 {
+        let (immutable_store, mutable_store, _execution) =
+            test_store_create().await.expect("Failed to create stores");
+        StorageServiceV4::new(
+            Arc::new(Some(verifier())),
+            Arc::new(
+                AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                    .with_name_resolver(resolver),
+            ),
+            immutable_store.clone(),
+            immutable_store,
+            mutable_store,
+            Arc::new(UserAgentFilter::default()),
+        )
+    }
+
+    fn hash_of(byte: u8) -> lore_base::types::Hash {
+        lore_base::types::Hash::from([byte; 32])
+    }
+
+    async fn serve(
+        service: &StorageServiceV4,
+        session_id: u32,
+        repository: lore_revision::lore::RepositoryId,
+    ) -> MessageHandleError {
+        service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(session_id, repository),
+            )
+            .await
+            .expect_err("the absent address is the only success-path failure")
+    }
+
+    /// A name-scoped session whose repository id is deleted and recreated
+    /// under another name stops being served; an id-scoped session on the
+    /// same repository is unaffected and never reads the pointer.
+    #[tokio::test]
+    async fn a_recreated_repository_ends_name_scoped_access() {
+        let resolver = SwitchableResolver::new(hash_of(1), "goalables/app");
+        let service = service_with_resolver(resolver.clone()).await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let by_name = signed_token(&["urc-name:goalables/*"], &["read", "write"]);
+        let by_id = signed_token(&[&format!("urc-{repository}")], &["read", "write"]);
+
+        let name_session = start_session(&service, repository, &by_name).await.unwrap();
+        let id_session = start_session(&service, repository, &by_id).await.unwrap();
+        let reads_after_start = resolver.incarnations();
+
+        assert!(matches!(
+            serve(&service, name_session, repository).await,
+            MessageHandleError::FragmentNotFound
+        ));
+
+        resolver.flip(hash_of(2), "game");
+
+        assert!(matches!(
+            serve(&service, name_session, repository).await,
+            MessageHandleError::AuthorizationFailure(_)
+        ));
+        assert!(matches!(
+            serve(&service, id_session, repository).await,
+            MessageHandleError::FragmentNotFound
+        ));
+        assert_eq!(resolver.incarnations(), reads_after_start + 2);
+    }
+
+    /// A changed incarnation that still grants access refreshes the session
+    /// and is not enumerated again until it changes once more.
+    #[tokio::test]
+    async fn an_unchanged_incarnation_enumerates_nothing_again() {
+        let resolver = SwitchableResolver::new(hash_of(1), "goalables/app");
+        let service = service_with_resolver(resolver.clone()).await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let token = signed_token(&["urc-name:goalables/*"], &["read", "write"]);
+
+        let session = start_session(&service, repository, &token).await.unwrap();
+        let resolves_after_start = resolver.resolves();
+        for _ in 0..3 {
+            assert!(matches!(
+                serve(&service, session, repository).await,
+                MessageHandleError::FragmentNotFound
+            ));
+        }
+        assert_eq!(resolver.resolves(), resolves_after_start);
+
+        resolver.flip(hash_of(2), "goalables/other");
+        for _ in 0..3 {
+            assert!(matches!(
+                serve(&service, session, repository).await,
+                MessageHandleError::FragmentNotFound
+            ));
+        }
+        assert_eq!(resolver.resolves(), resolves_after_start + 1);
+    }
+
     /// One connection, two sessions with different credentials: the
     /// destination session's own token decides the copy source, so a
     /// grant another session brought to the connection must not vouch

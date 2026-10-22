@@ -9,6 +9,7 @@ use lore_telemetry::tracing::fields::USER_ID;
 use tracing::debug;
 use tracing::warn;
 
+use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
@@ -102,6 +103,10 @@ impl Message for Connect {
                         raw: auth_token,
                         claims: &authorization,
                     };
+                    let incarnation = repository_authorizer
+                        .session_incarnation(&token, self.repository)
+                        .await
+                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
                     let grants = repository_authorizer
                         .granted_access(Some(&token), self.repository)
                         .await
@@ -110,6 +115,7 @@ impl Message for Connect {
                         context.insert(PartitionGrants {
                             repository_id: self.repository,
                             grants,
+                            incarnation,
                         });
                     }
                     // Both halves of the verified token, so a later command's
@@ -140,4 +146,44 @@ impl Response for ConnectResponse {
     fn data(&self) -> Vec<Bytes> {
         vec![]
     }
+}
+
+/// Enumerates the connection's grants again when its name-scoped token was
+/// enumerated against a repository incarnation that has since changed.
+/// Connections that carry no incarnation cost nothing.
+pub async fn revalidate_connection_grants(
+    context: &Arc<AttributeMap>,
+    repository_authorizer: &Arc<dyn RepositoryAuthorizer>,
+) -> Result<(), MessageHandleError> {
+    let Some(recorded) = context.get::<PartitionGrants>() else {
+        return Ok(());
+    };
+    let Some(seen) = recorded.incarnation else {
+        return Ok(());
+    };
+    let (Some(raw), Some(claims)) = (
+        context.get::<RawToken>(),
+        context.get::<AuthorizationToken>(),
+    ) else {
+        return Ok(());
+    };
+    let token = VerifiedToken {
+        raw: &raw.0,
+        claims: &claims,
+    };
+    let regranted = repository_authorizer
+        .regrant_if_incarnation_changed(&token, recorded.repository_id, seen)
+        .await
+        .map_err(|status| MessageHandleError::from_authorization(&status))?;
+    if let Some(regranted) = regranted {
+        let grants = regranted.grants.ok_or_else(|| {
+            MessageHandleError::AuthorizationFailure("grants cannot be enumerated".to_string())
+        })?;
+        context.insert(PartitionGrants {
+            repository_id: recorded.repository_id,
+            grants,
+            incarnation: regranted.incarnation,
+        });
+    }
+    Ok(())
 }
