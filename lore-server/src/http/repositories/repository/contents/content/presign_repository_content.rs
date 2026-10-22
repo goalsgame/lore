@@ -26,6 +26,7 @@ use thiserror::Error;
 use tracing::warn;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::http::log_http_error;
 use crate::http::presign_token::CURRENT_TOKEN_VERSION;
 use crate::http::presign_token::PresignTokenPayload;
@@ -40,6 +41,8 @@ pub enum PresignError {
     ParseRepository(FromHexError),
     #[error("Failed to parse address: {0}")]
     ParseAddress(FromHexError),
+    #[error("Access to the repository changed: {0}")]
+    AccessChanged(tonic::Status),
     #[error("Presign feature is not configured")]
     NotConfigured,
     #[error("Only service accounts may vend presigned URLs")]
@@ -63,6 +66,13 @@ impl IntoResponse for PresignError {
             | PresignError::ParseAddress(_)
             | PresignError::DisallowedContentType(_)
             | PresignError::InvalidHeaderValue(_) => (StatusCode::BAD_REQUEST, self.to_string()),
+            PresignError::AccessChanged(status) => {
+                if status.code() == tonic::Code::ResourceExhausted {
+                    (StatusCode::TOO_MANY_REQUESTS, "slow down".to_string())
+                } else {
+                    (StatusCode::FORBIDDEN, "Unauthorized".to_string())
+                }
+            }
             PresignError::NotConfigured => (
                 StatusCode::NOT_FOUND,
                 "presigned URL feature is not enabled".to_string(),
@@ -117,9 +127,14 @@ pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path((repository_id, address)): Path<(String, String)>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    Extension(mut guard): Extension<Option<IncarnationGuard>>,
     headers: HeaderMap,
     Json(body): Json<PresignRequest>,
 ) -> Result<impl IntoResponse, PresignError> {
+    if let Some(guard) = guard.as_mut() {
+        guard.check().await.map_err(PresignError::AccessChanged)?;
+    }
+
     let presign_config = state
         .presign_config
         .as_ref()

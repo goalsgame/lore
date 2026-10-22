@@ -206,6 +206,7 @@ async fn an_item_waiting_for_a_permit_is_checked_after_the_wait() {
             let resolver = SwitchableResolver::new();
             resolver.set(repository, first(), "goalables/app");
             let guard = guard_for(&resolver, repository, "urc-name:goalables/*".into()).await;
+            let admission_reads = resolver.incarnations();
             let (requests, rx) = tokio::sync::mpsc::channel(2 * CAPACITY + 8);
             let mut responses = lore_server::grpc::storage::v1::get::serve(
                 ReceiverStream::new(rx),
@@ -224,7 +225,13 @@ async fn an_item_waiting_for_a_permit_is_checked_after_the_wait() {
                     .await
                     .unwrap();
             }
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while resolver.incarnations() < admission_reads + 2 * CAPACITY {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the first 2 * CAPACITY items never all passed the guard");
 
             resolver.set(repository, second(), "game");
 

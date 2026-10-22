@@ -130,6 +130,7 @@ pub fn token_is_name_scoped(token: &VerifiedToken<'_>) -> bool {
 /// Keeps a long-lived stream's name-derived grants tied to the metadata hash
 /// they were enumerated against: [`check`](Self::check) reads the pointer and
 /// enumerates again, pinned at the new hash, when it has changed.
+#[derive(Clone)]
 pub struct IncarnationGuard {
     authorizer: Arc<dyn RepositoryAuthorizer>,
     token: VerifiedTokenOwned,

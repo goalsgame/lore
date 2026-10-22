@@ -16,6 +16,7 @@ use serde::Deserialize;
 use tracing::Span;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
 use crate::authnz::repository_authorizer::VerifiedToken;
@@ -45,23 +46,29 @@ pub async fn jwt_axum_verify_authorization(
                 };
                 let access = state
                     .repository_authorizer
-                    .granted_access(Some(&token), repository)
+                    .granted_access_tracked(Some(&token), repository)
                     .await;
                 if let Err(status) = &access
                     && status.code() == tonic::Code::ResourceExhausted
                 {
-                    return Response::builder()
-                        .status(StatusCode::TOO_MANY_REQUESTS)
-                        .body(Body::empty())
-                        .unwrap();
+                    return access_failure_response(status);
                 }
-                if let Ok(grants) = access {
+                if let Ok(regranted) = access {
                     Span::current().record(USER_ID, user_info.identity());
-                    if let Some(grants) = grants {
+                    // Handlers that read a request body re-check the
+                    // incarnation after it arrives.
+                    let guard = IncarnationGuard::new(
+                        state.repository_authorizer.clone(),
+                        Some(&token),
+                        repository,
+                        regranted.incarnation,
+                    );
+                    request.extensions_mut().insert(guard);
+                    if let Some(grants) = regranted.grants {
                         request.extensions_mut().insert(PartitionGrants {
                             repository_id: repository,
                             grants,
-                            incarnation: None,
+                            incarnation: regranted.incarnation,
                         });
                     }
                     // Set `user_info` as a request extension so it can be used down the stack
@@ -84,8 +91,23 @@ pub async fn jwt_axum_verify_authorization(
     } else {
         let no_user_info: Option<AuthorizationToken> = None;
         request.extensions_mut().insert(no_user_info);
+        request.extensions_mut().insert(None::<IncarnationGuard>);
         next.run(request).await
     }
+}
+
+/// The HTTP answer for an authorization failure: 429 for backpressure, 403
+/// for everything else.
+pub fn access_failure_response(status: &tonic::Status) -> Response {
+    let code = if status.code() == tonic::Code::ResourceExhausted {
+        StatusCode::TOO_MANY_REQUESTS
+    } else {
+        StatusCode::FORBIDDEN
+    };
+    Response::builder()
+        .status(code)
+        .body(Body::empty())
+        .unwrap()
 }
 
 fn extract_bearer_token(request: &Request) -> Option<String> {

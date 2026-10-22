@@ -24,6 +24,8 @@ use tracing::debug;
 use tracing::info;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt_axum_middleware::access_failure_response;
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::http::server::ServerState;
 use crate::util::get_user_id_from_token;
 use crate::util::setup_execution;
@@ -42,11 +44,18 @@ pub async fn handler(
     State(state): State<Arc<ServerState>>,
     Path(repository_id): Path<String>,
     Extension(user_info): Extension<Option<AuthorizationToken>>,
+    Extension(mut guard): Extension<Option<IncarnationGuard>>,
     headers: HeaderMap,
     data: Bytes,
 ) -> Response {
     info!("Put repository {} data {} bytes", repository_id, data.len());
     info!("User info: {:?}", user_info);
+
+    if let Some(guard) = guard.as_mut()
+        && let Err(status) = guard.check().await
+    {
+        return access_failure_response(&status);
+    }
 
     let mut header_error = HeaderMap::new();
     header_error.insert("content-type", HeaderValue::from_str("text/plain").unwrap());
