@@ -574,8 +574,8 @@ fn auth_settings(extra: &str) -> AuthSettings {
 
 const AUTH_URL: Option<&str> = Some("https://legacy-auth.example.com");
 
-#[test]
-fn selection_follows_the_flowchart() {
+#[tokio::test]
+async fn selection_follows_the_flowchart() {
     // (auth settings, legacy auth_url) → selected implementation.
     let table = [
         (None, None, AuthorizerSelection::AllowAll),
@@ -607,7 +607,17 @@ fn selection_follows_the_flowchart() {
             "auth: {auth:?}, auth_url: {auth_url:?}"
         );
         // Construction agrees with selection for every valid row.
-        repository_authorizer(auth.as_ref(), auth_url.map(ToString::to_string)).unwrap();
+        let (immutable_store, mutable_store, _execution) =
+            crate::store::test_support::test_store_create()
+                .await
+                .unwrap();
+        repository_authorizer(
+            auth.as_ref(),
+            auth_url.map(ToString::to_string),
+            immutable_store,
+            mutable_store,
+        )
+        .unwrap();
     }
 }
 
@@ -725,5 +735,243 @@ mod authorize_create {
         check(&claims, "goalables/app").unwrap();
         check(&claims, "tools/a/b").unwrap();
         assert!(check(&claims, "game").is_err());
+    }
+}
+
+mod name_scoped_grants {
+    use std::collections::HashMap;
+
+    use lore_server::auth::jwt::ResourcePermission as ClaimEntry;
+    use lore_server::authnz::repository_name_resolver::RepositoryNameResolver;
+
+    use super::*;
+
+    struct FixedNames(HashMap<RepositoryId, Arc<str>>);
+
+    #[async_trait]
+    impl RepositoryNameResolver for FixedNames {
+        async fn resolve(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
+            Ok(self.0.get(&repository_id).cloned())
+        }
+    }
+
+    struct Fixture {
+        authorizer: AuthClientAuthorizer,
+        app: RepositoryId,
+        game: RepositoryId,
+        unknown: RepositoryId,
+    }
+
+    fn fixture() -> Fixture {
+        let app: RepositoryId = rand::random();
+        let game: RepositoryId = rand::random();
+        let names = FixedNames(HashMap::from([
+            (app, Arc::from("goalables/app")),
+            (game, Arc::from("game")),
+        ]));
+        Fixture {
+            // A URL nothing listens on: a verdict proves the claim answered in place.
+            authorizer: AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                .with_name_resolver(Arc::new(names)),
+            app,
+            game,
+            unknown: rand::random(),
+        }
+    }
+
+    fn claims(entries: &[(&str, &[&str])]) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: Some(
+                entries
+                    .iter()
+                    .map(|(resource_id, permissions)| ClaimEntry {
+                        resource_id: resource_id.to_string(),
+                        permission: permissions.iter().map(ToString::to_string).collect(),
+                    })
+                    .collect(),
+            ),
+            ..Default::default()
+        }
+    }
+
+    async fn check(
+        authorizer: &AuthClientAuthorizer,
+        claims: &AuthorizationToken,
+        repository: RepositoryId,
+        action: Option<&str>,
+    ) -> bool {
+        authorizer
+            .check_repository_access(
+                Some(&VerifiedToken {
+                    raw: "raw.jwt",
+                    claims,
+                }),
+                repository,
+                action,
+            )
+            .await
+            .is_ok()
+    }
+
+    #[tokio::test]
+    async fn a_matching_name_grants_the_listed_permissions() {
+        let f = fixture();
+        let token = claims(&[("urc-name:goalables/*", &["read", "push"])]);
+
+        assert!(check(&f.authorizer, &token, f.app, None).await);
+        assert!(check(&f.authorizer, &token, f.app, Some("read")).await);
+        assert!(check(&f.authorizer, &token, f.app, Some("push")).await);
+        assert!(!check(&f.authorizer, &token, f.app, Some("obliterate")).await);
+    }
+
+    #[tokio::test]
+    async fn a_non_matching_name_is_denied() {
+        let f = fixture();
+        let token = claims(&[("urc-name:goalables/*", &["read", "push"])]);
+
+        assert!(!check(&f.authorizer, &token, f.game, None).await);
+        assert!(!check(&f.authorizer, &token, f.game, Some("read")).await);
+        assert!(!check(&f.authorizer, &token, f.unknown, None).await);
+    }
+
+    #[tokio::test]
+    async fn an_entry_with_no_permissions_still_reaches_the_repository() {
+        let f = fixture();
+        let token = claims(&[("urc-name:goalables/*", &[])]);
+
+        assert!(check(&f.authorizer, &token, f.app, None).await);
+        assert!(!check(&f.authorizer, &token, f.app, Some("read")).await);
+    }
+
+    #[tokio::test]
+    async fn name_and_id_grants_merge() {
+        let f = fixture();
+        let token = claims(&[
+            ("urc-name:goalables/*", &["read"]),
+            (&format!("urc-{}", f.app), &["push"]),
+            (&format!("urc-{}", f.game), &["read"]),
+        ]);
+
+        assert!(check(&f.authorizer, &token, f.app, Some("read")).await);
+        assert!(check(&f.authorizer, &token, f.app, Some("push")).await);
+        assert!(check(&f.authorizer, &token, f.game, Some("read")).await);
+        assert!(!check(&f.authorizer, &token, f.game, Some("push")).await);
+    }
+
+    #[tokio::test]
+    async fn without_a_resolver_name_entries_grant_nothing() {
+        let f = fixture();
+        let bare = AuthClientAuthorizer::new("https://auth.invalid".to_string());
+        let token = claims(&[("urc-name:goalables/*", &["read"])]);
+
+        assert!(!check(&bare, &token, f.app, None).await);
+        assert!(!check(&bare, &token, f.app, Some("read")).await);
+    }
+
+    #[tokio::test]
+    async fn enumeration_merges_name_and_id_grants() {
+        let f = fixture();
+        let token = claims(&[
+            ("urc-name:goalables/*", &["read"]),
+            (&format!("urc-{}", f.app), &["push"]),
+        ]);
+        let verified = VerifiedToken {
+            raw: "raw.jwt",
+            claims: &token,
+        };
+
+        let app = f
+            .authorizer
+            .granted_actions(Some(&verified), f.app)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(app.permits("read") && app.permits("push") && !app.permits("admin"));
+
+        let game = f
+            .authorizer
+            .granted_actions(Some(&verified), f.game)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!game.reachable());
+    }
+
+    #[tokio::test]
+    async fn enumeration_agrees_with_the_per_question_path() {
+        let f = fixture();
+        let tokens = [
+            claims(&[("urc-name:goalables/*", &["read", "push"])]),
+            claims(&[("urc-name:goalables/*", &["read"]), ("urc-*", &["admin"])]),
+            claims(&[("urc-name:game", &[])]),
+        ];
+        for token in &tokens {
+            let verified = VerifiedToken {
+                raw: "raw.jwt",
+                claims: token,
+            };
+            for repository in [f.app, f.game, f.unknown] {
+                let grants = f
+                    .authorizer
+                    .granted_actions(Some(&verified), repository)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    grants.reachable(),
+                    check(&f.authorizer, token, repository, None).await
+                );
+                for action in ["read", "push", "admin"] {
+                    assert_eq!(
+                        grants.permits(action),
+                        check(&f.authorizer, token, repository, Some(action)).await,
+                        "{action} on {repository}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sync_check_denies_rather_than_guesses() {
+        let f = fixture();
+        let sync = |token: &AuthorizationToken, action: Option<&str>| {
+            f.authorizer.check_repository_access_sync(
+                Some(&VerifiedToken {
+                    raw: "raw.jwt",
+                    claims: token,
+                }),
+                f.app,
+                action,
+            )
+        };
+
+        let name_only = claims(&[("urc-name:goalables/*", &["read"])]);
+        assert!(sync(&name_only, None).is_none());
+        assert!(sync(&name_only, Some("read")).is_none());
+
+        let by_id = claims(&[
+            ("urc-name:goalables/*", &["read"]),
+            (&format!("urc-{}", f.app), &["read"]),
+        ]);
+        assert!(sync(&by_id, Some("read")).unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn tokens_without_name_entries_are_unchanged() {
+        let f = fixture();
+        let by_id = claims(&[(&format!("urc-{}", f.app), &["read"])]);
+
+        assert!(check(&f.authorizer, &by_id, f.app, Some("read")).await);
+        assert!(!check(&f.authorizer, &by_id, f.game, None).await);
+        let sync = f.authorizer.check_repository_access_sync(
+            Some(&VerifiedToken {
+                raw: "raw.jwt",
+                claims: &by_id,
+            }),
+            f.game,
+            None,
+        );
+        assert!(sync.unwrap().is_err());
     }
 }

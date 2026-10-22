@@ -140,3 +140,38 @@ pub async fn test_store_create() -> Result<
         })
         .await
 }
+
+/// Stores the metadata record and the name mapping of repository `id`, so
+/// the repository exists under `name`.
+pub async fn seed_repository(
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    id: lore_base::types::RepositoryId,
+    name: &str,
+) {
+    use lore_revision::repository;
+    use lore_revision::repository::RepositoryContext;
+    use lore_revision::repository::RepositoryMetadata;
+
+    let repository = Arc::new(RepositoryContext::new_server_context(
+        immutable_store,
+        mutable_store,
+        id,
+    ));
+    let metadata_hash = repository::metadata_store(
+        repository.clone(),
+        RepositoryMetadata {
+            name: name.to_string(),
+            creator: "alice".into(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("Failed to store repository metadata");
+    repository::metadata_store_hash(repository.clone(), metadata_hash)
+        .await
+        .expect("Failed to store repository metadata hash");
+    repository::store_name_to_id(repository, name, id)
+        .await
+        .expect("Failed to store repository name to id mapping");
+}

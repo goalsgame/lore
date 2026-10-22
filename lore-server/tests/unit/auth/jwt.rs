@@ -1434,3 +1434,52 @@ mod name_scoped_create {
         );
     }
 }
+
+mod name_scoped_matching {
+    use super::*;
+
+    fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
+        ResourcePermission {
+            resource_id: resource_id.to_string(),
+            permission: permissions.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn has_name_scoped_only_for_name_entries() {
+        assert!(!has_name_scoped(&[]));
+        assert!(!has_name_scoped(&[entry("urc-*", &["read"])]));
+        assert!(has_name_scoped(&[
+            entry("urc-*", &["read"]),
+            entry("urc-name:goalables/*", &[]),
+        ]));
+    }
+
+    #[test]
+    fn matches_only_entries_whose_glob_fits_the_name() {
+        let resources = vec![
+            entry("urc-name:goalables/*", &["read"]),
+            entry("urc-name:tools/**", &["push"]),
+            entry("urc-*", &["admin"]),
+        ];
+        let permissions = |name: &str| -> Vec<Vec<String>> {
+            name_scoped_matches(&resources, name)
+                .map(|entry| entry.permission.clone())
+                .collect()
+        };
+        assert_eq!(permissions("goalables/app"), vec![vec!["read".to_string()]]);
+        assert_eq!(permissions("tools/a/b"), vec![vec!["push".to_string()]]);
+        assert!(permissions("game").is_empty());
+        assert!(permissions("goalables").is_empty());
+        assert!(permissions("goalables/a/b").is_empty());
+    }
+
+    #[test]
+    fn every_matching_entry_is_returned() {
+        let resources = vec![
+            entry("urc-name:goalables/*", &["read"]),
+            entry("urc-name:goalables/app", &["push"]),
+        ];
+        assert_eq!(name_scoped_matches(&resources, "goalables/app").count(), 2);
+    }
+}

@@ -9,6 +9,8 @@ use async_trait::async_trait;
 use lore_base::types::RepositoryId;
 use lore_proto::auth::CheckUserPermissionRequest;
 use lore_proto::auth::CheckUserPermissionResponse;
+use lore_storage::ImmutableStore;
+use lore_storage::MutableStore;
 use tonic::Code;
 use tonic::Status;
 use tracing::info;
@@ -16,10 +18,14 @@ use tracing::info;
 use super::auth::grpc_get_auth_client;
 use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
+use super::repository_name_resolver::RepositoryNameResolver;
+use super::repository_name_resolver::repository_name_resolver;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::NameVerdict;
 use crate::auth::jwt::ResourceMatcher;
+use crate::auth::jwt::has_name_scoped;
+use crate::auth::jwt::name_scoped_matches;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
 
@@ -139,7 +145,8 @@ pub trait RepositoryAuthorizer: Send + Sync {
     /// [`check_repository_access`](Self::check_repository_access) for call
     /// sites that cannot await: the cross-partition link-read closure runs
     /// inside revision-graph traversal, potentially many times per request.
-    /// `None` means the answer needs I/O this authorizer cannot do here.
+    /// `None` means the answer needs I/O this authorizer cannot do here,
+    /// such as resolving the repository name for a name-scoped grant.
     /// Such callers must deny, and the online paths keep today's behaviour
     /// because they never granted a link read without an in-token claim.
     ///
@@ -247,14 +254,53 @@ impl RepositoryAuthorizer for AllowAllRepositoryAuthorizer {
     }
 }
 
-/// Checks repository access against the Lore auth service.
+/// Checks repository access against the Lore auth service. Access tokens are
+/// answered from their `resources` claim, including `urc-name:` entries, which
+/// need `name_resolver` to turn the repository id into a name.
 pub struct AuthClientAuthorizer {
     auth_url: String,
+    name_resolver: Option<Arc<dyn RepositoryNameResolver>>,
 }
 
 impl AuthClientAuthorizer {
     pub fn new(auth_url: String) -> Self {
-        Self { auth_url }
+        Self {
+            auth_url,
+            name_resolver: None,
+        }
+    }
+
+    /// Enables `urc-name:` grants on existing repositories. Without a
+    /// resolver those entries grant nothing.
+    pub fn with_name_resolver(mut self, name_resolver: Arc<dyn RepositoryNameResolver>) -> Self {
+        self.name_resolver = Some(name_resolver);
+        self
+    }
+
+    /// The name of `repository_id`, `None` when it has none or no resolver is set.
+    async fn resolve_name(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
+        match &self.name_resolver {
+            Some(resolver) => resolver.resolve(repository_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// Answers an access question from a `resources` claim: the id-based
+    /// entries first, then the `urc-name:` entries matching the repository's name.
+    async fn evaluate_claim(
+        &self,
+        resources: &[crate::auth::jwt::ResourcePermission],
+        repository_id: RepositoryId,
+        action: Option<&str>,
+    ) -> Result<(), Status> {
+        let by_id = evaluate_resources_claim(resources, repository_id, action);
+        if by_id.is_ok() || !has_name_scoped(resources) {
+            return by_id;
+        }
+        match self.resolve_name(repository_id).await? {
+            Some(name) if name_grants_action(resources, &name, action) => Ok(()),
+            _ => by_id,
+        }
     }
 
     /// Takes the `authorization` header value verbatim.
@@ -350,6 +396,51 @@ fn grants_from_resources_claim(
     )
 }
 
+/// The grants the `urc-name:` entries matching `name` hold: unreachable when
+/// none matches, otherwise the permissions merged across the matching entries.
+fn grants_from_name_entries(
+    resources: &[crate::auth::jwt::ResourcePermission],
+    name: &str,
+) -> Grants {
+    let mut matching = name_scoped_matches(resources, name).peekable();
+    if matching.peek().is_none() {
+        return Grants::Denied;
+    }
+    Grants::Actions(
+        matching
+            .flat_map(|entry| entry.permission.iter().cloned())
+            .collect(),
+    )
+}
+
+/// The union of two enumerations of the same partition.
+fn merge_grants(first: Grants, second: Grants) -> Grants {
+    match (first, second) {
+        (Grants::All, _) | (_, Grants::All) => Grants::All,
+        (Grants::Denied, other) | (other, Grants::Denied) => other,
+        (Grants::Actions(mut first), Grants::Actions(second)) => {
+            first.extend(second);
+            Grants::Actions(first)
+        }
+    }
+}
+
+/// Whether a `urc-name:` entry matching `name` grants `action`, or any
+/// entry matches at all for `action: None`.
+fn name_grants_action(
+    resources: &[crate::auth::jwt::ResourcePermission],
+    name: &str,
+    action: Option<&str>,
+) -> bool {
+    let mut matching = name_scoped_matches(resources, name);
+    match action {
+        None => matching.next().is_some(),
+        Some(action) => {
+            matching.any(|entry| entry.permission.iter().any(|granted| granted == action))
+        }
+    }
+}
+
 /// Grants from a `CheckUserPermission` response: unreachable when no
 /// allowed entry names the resource, otherwise the permissions merged across
 /// every entry for the resource.
@@ -434,16 +525,18 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         // claim and are checked online — the identity-token paths are where
         // revocation is observable. An access token's grants hold for its
         // lifetime, on this path as on QUIC.
-        if let Some(verdict) = self.check_repository_access_sync(token, repository_id, action) {
-            return verdict;
+        if let Some(resources) = token.and_then(|token| token.claims.resources.as_deref()) {
+            return self.evaluate_claim(resources, repository_id, action).await;
         }
         self.check_access_with_header(bearer_header(token), repository_id, action)
             .await
     }
 
     /// An access token is answered from its `resources` claim, exactly as
-    /// the async path does. An identity token needs `CheckUserPermission`,
-    /// so `None`.
+    /// the async path does, except that a token whose id-based entries do not
+    /// grant the access but which holds `urc-name:` entries needs the
+    /// repository name, so `None`. An identity token needs
+    /// `CheckUserPermission`, so `None`.
     fn check_repository_access_sync(
         &self,
         token: Option<&VerifiedToken<'_>>,
@@ -451,7 +544,11 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         action: Option<&str>,
     ) -> Option<Result<(), Status>> {
         let resources = token.and_then(|token| token.claims.resources.as_deref())?;
-        Some(evaluate_resources_claim(resources, repository_id, action))
+        let by_id = evaluate_resources_claim(resources, repository_id, action);
+        if by_id.is_err() && has_name_scoped(resources) {
+            return None;
+        }
+        Some(by_id)
     }
 
     async fn granted_actions(
@@ -465,7 +562,13 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
             return Ok(None);
         };
         if let Some(resources) = token.claims.resources.as_deref() {
-            return Ok(Some(grants_from_resources_claim(resources, repository_id)));
+            let mut grants = grants_from_resources_claim(resources, repository_id);
+            if has_name_scoped(resources)
+                && let Some(name) = self.resolve_name(repository_id).await?
+            {
+                grants = merge_grants(grants, grants_from_name_entries(resources, &name));
+            }
+            return Ok(Some(grants));
         }
         // An identity token: the one CheckUserPermission response carries the
         // full permission list.
@@ -541,14 +644,19 @@ pub fn select_repository_authorizer(
 pub fn repository_authorizer(
     auth: Option<&AuthSettings>,
     auth_url: Option<String>,
+    immutable_store: Arc<dyn ImmutableStore>,
+    mutable_store: Arc<dyn MutableStore>,
 ) -> anyhow::Result<Arc<dyn RepositoryAuthorizer>> {
     let selection = select_repository_authorizer(auth, auth_url.as_deref())?;
     info!("Repository authorizer: {selection}");
     Ok(match selection {
         AuthorizerSelection::AllowAll => Arc::new(AllowAllRepositoryAuthorizer),
-        AuthorizerSelection::AuthClient => Arc::new(AuthClientAuthorizer::new(
-            auth_url.expect("AuthClient is only selected when auth_url is set"),
-        )),
+        AuthorizerSelection::AuthClient => Arc::new(
+            AuthClientAuthorizer::new(
+                auth_url.expect("AuthClient is only selected when auth_url is set"),
+            )
+            .with_name_resolver(repository_name_resolver(immutable_store, mutable_store)),
+        ),
         AuthorizerSelection::GlobalGrants => {
             let auth = auth.expect("GlobalGrants is only selected under [server.auth]");
             Arc::new(GlobalGrantsAuthorizer::new(auth.permission_claim.clone()))

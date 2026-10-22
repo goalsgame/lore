@@ -2129,6 +2129,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let repository_authorizer = crate::authnz::repository_authorizer::repository_authorizer(
         settings.server.auth.as_ref(),
         auth_url.clone(),
+        immutable_store.clone(),
+        mutable_store.clone(),
     )?;
     let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
         settings.server.auth.as_ref(),
