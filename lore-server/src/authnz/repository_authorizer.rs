@@ -175,6 +175,22 @@ impl IncarnationGuard {
         )
     }
 
+    /// Fails when the repository was recreated since the grants were
+    /// enumerated: with the denial when access is gone, with `Aborted` when
+    /// it remains but the retained grants are stale.
+    pub async fn ensure_unchanged(&mut self) -> Result<(), Status> {
+        let regranted = self
+            .authorizer
+            .regrant_if_incarnation_changed(&self.token.as_token(), self.repository_id, self.seen)
+            .await?;
+        if regranted.is_some() {
+            return Err(Status::aborted(
+                "the repository changed while the request was being sent",
+            ));
+        }
+        Ok(())
+    }
+
     /// Whether the caller still has access to the repository.
     pub async fn check(&mut self) -> Result<(), Status> {
         let regranted = self

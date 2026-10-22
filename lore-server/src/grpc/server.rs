@@ -63,6 +63,8 @@ use crate::grpc::revision_service::LoreRevisionService;
 use crate::grpc::storage_service::LoreStorageService;
 use crate::grpc::thinclient::LoreThinClientV1Service;
 use crate::grpc::tower::grpc_response_trace::GrpcResponseTraceLayer;
+use crate::grpc::tower::incarnation_body::IncarnationBodyLayer;
+use crate::grpc::tower::incarnation_body::IncarnationBodyService;
 use crate::grpc::tower::malformed_request::MalformedRequestLayer;
 use crate::grpc::tower::partition_access::PartitionAccessLayer;
 use crate::grpc::tower::partition_access::PartitionAccessService;
@@ -646,10 +648,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         jwt_interceptor: &JWTInterceptor,
         authorizer: &Arc<dyn RepositoryAuthorizer>,
         authorization_timeout: Duration,
-    ) -> tonic::service::interceptor::InterceptedService<PartitionAccessService<S>, JWTInterceptor>
-    {
+    ) -> tonic::service::interceptor::InterceptedService<
+        PartitionAccessService<IncarnationBodyService<S>>,
+        JWTInterceptor,
+    > {
         tonic::service::interceptor::InterceptedService::new(
-            PartitionAccessLayer::new(authorizer.clone(), authorization_timeout).layer(service),
+            PartitionAccessLayer::new(authorizer.clone(), authorization_timeout)
+                .layer(IncarnationBodyLayer::new(authorizer.clone()).layer(service)),
             jwt_interceptor.clone(),
         )
     }
