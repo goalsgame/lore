@@ -162,6 +162,37 @@ async fn a_denied_partition_never_reaches_the_service() {
     assert_eq!(inner.calls(), 0);
 }
 
+/// Answers every question with backpressure.
+struct ThrottledAuthorizer;
+
+#[async_trait]
+impl RepositoryAuthorizer for ThrottledAuthorizer {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Option<&str>,
+    ) -> Result<(), Status> {
+        Err(Status::resource_exhausted("slow down"))
+    }
+}
+
+#[tokio::test]
+async fn backpressure_reaches_the_client_and_not_the_service() {
+    let (mut service, inner) = service_with(PartitionAccessLayer::new(
+        Arc::new(ThrottledAuthorizer),
+        TEST_TIMEOUT,
+    ));
+
+    let response = service
+        .call(request(Some(repository()), true))
+        .await
+        .unwrap();
+
+    assert_eq!(status_of(&response).code(), Code::ResourceExhausted);
+    assert_eq!(inner.calls(), 0);
+}
+
 #[tokio::test]
 async fn a_permitted_partition_reaches_the_service() {
     let authorizer = RecordingAuthorizer::new(true);

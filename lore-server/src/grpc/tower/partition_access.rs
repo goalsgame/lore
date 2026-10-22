@@ -12,6 +12,7 @@ use http::Response;
 use lore_revision::lore::RepositoryId;
 use lore_transport::grpc::PARTITION_ID_KEY;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
+use tonic::Code;
 use tonic::Status;
 use tonic::metadata::MetadataMap;
 use tonic::server::NamedService;
@@ -33,7 +34,8 @@ use crate::grpc::no_repository_access_status;
 /// verifies the token and inserts it as extensions, this service reads them.
 /// The validator takes the partition from the request metadata and asks the
 /// configured [`RepositoryAuthorizer`] whether the caller may reach it.
-/// Returns [`no_repository_access_status`] on denial.
+/// Returns [`no_repository_access_status`] on denial, and the authorizer's
+/// `ResourceExhausted` status unchanged when it is shedding load.
 ///
 /// The check lives here rather than in the interceptor because
 /// tonic's `Interceptor::call` is synchronous and cannot await an online
@@ -114,6 +116,8 @@ enum Access {
     /// Reachable; the enumerated grants when the authorizer had them.
     Granted(Option<Grants>),
     Denied,
+    /// The authorizer is shedding load; the status is returned as is.
+    Throttled(Status),
 }
 
 /// The partition the request names, [`None`] when doesn't name one.
@@ -154,17 +158,19 @@ where
                 Err(status) => return Ok(status.into_http()),
             };
 
-            // Authorization denials are flattened to `Denied` inside the
-            // timed stage, so elapsing is the only thing the stage reports
-            // besides a verdict. Only the extensions are borrowed into the
-            // stage, not the request, so the future stays `Send` for any
-            // body type.
+            // The timed stage reports a verdict (granted, denied or
+            // throttled), so elapsing is the only other thing it reports.
+            // Only the extensions are borrowed into the stage, not the
+            // request, so the future stays `Send` for any body type.
             let access = {
                 let extensions = request.extensions();
                 tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
                     match authorizer.granted_access(token.as_ref(), repository).await {
                         Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
+                        Err(status) if status.code() == Code::ResourceExhausted => {
+                            Access::Throttled(status)
+                        }
                         Err(_denied) => Access::Denied,
                     }
                 })
@@ -187,9 +193,10 @@ where
                     // work it owns once it has the body.
                     inner.call(request).await
                 }
-                // Flattened to one uniform status, so an unauthorized caller
+                // Every denial is one uniform status, so an unauthorized caller
                 // learns nothing from the reason.
                 Ok(Access::Denied) => Ok(no_repository_access_status().into_http()),
+                Ok(Access::Throttled(status)) => Ok(status.into_http()),
                 Err(_elapsed) => Ok(authorization_timeout_status().into_http()),
             }
         })

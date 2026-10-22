@@ -219,9 +219,7 @@ impl QuicService for StorageServiceV4 {
                         .repository_authorizer
                         .granted_access(Some(&verified), repository)
                         .await
-                        .map_err(|status| {
-                            MessageHandleError::AuthorizationFailure(status.message().to_string())
-                        })?;
+                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
                     token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
@@ -350,9 +348,7 @@ impl QuicService for StorageServiceV4 {
                                 )
                                 .await
                                 .map_err(|status| {
-                                    MessageHandleError::AuthorizationFailure(
-                                        status.message().to_string(),
-                                    )
+                                    MessageHandleError::from_authorization(&status)
                                 })?;
                             authorized_sources.insert(copy.source_repository);
                         }

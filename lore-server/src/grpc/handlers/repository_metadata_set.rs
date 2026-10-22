@@ -21,11 +21,11 @@ use tonic::Status;
 
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::FilterSlowDownExt;
+use crate::grpc::access_failure_status;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
-use crate::grpc::no_repository_access_status;
 use crate::grpc::warn_error_to_status;
 use crate::util::setup_execution;
 
@@ -123,7 +123,7 @@ pub async fn handler(
                     None,
                 )
                 .await
-                .map_err(|_err| no_repository_access_status())?;
+                .map_err(access_failure_status)?;
 
             // Deserialize current and proposed blobs for validation
             let current_metadata = if !expected_hash.is_zero() {

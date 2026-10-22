@@ -868,6 +868,43 @@ mod name_scoped_grants {
         assert!(!check(&bare, &token, f.app, Some("read")).await);
     }
 
+    struct FailingNames(Status);
+
+    #[async_trait]
+    impl RepositoryNameResolver for FailingNames {
+        async fn resolve(&self, _repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
+            Err(self.0.clone())
+        }
+    }
+
+    async fn granted_access_with_resolver_error(status: Status) -> Status {
+        let authorizer = AuthClientAuthorizer::new("https://auth.invalid".to_string())
+            .with_name_resolver(Arc::new(FailingNames(status)));
+        let authorizer: &dyn RepositoryAuthorizer = &authorizer;
+        let token = claims(&[("urc-name:goalables/*", &["read"])]);
+        let verified = VerifiedToken {
+            raw: "raw.jwt",
+            claims: &token,
+        };
+        authorizer
+            .granted_access(Some(&verified), rand::random())
+            .await
+            .expect_err("resolver failed")
+    }
+
+    #[tokio::test]
+    async fn backpressure_from_the_resolver_reaches_the_caller() {
+        let err = granted_access_with_resolver_error(Status::resource_exhausted("slow down")).await;
+        assert_eq!(err.code(), Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn other_resolver_errors_are_the_uniform_denial() {
+        let err = granted_access_with_resolver_error(Status::unavailable("store down")).await;
+        assert_eq!(err.code(), Code::PermissionDenied);
+        assert_eq!(err.message(), "Unauthorized");
+    }
+
     #[tokio::test]
     async fn enumeration_merges_name_and_id_grants() {
         let f = fixture();

@@ -453,6 +453,17 @@ pub fn no_repository_access_status() -> Status {
     Status::permission_denied("Unauthorized")
 }
 
+/// The status an authorization failure is reported as: backpressure
+/// (`ResourceExhausted`) is returned unchanged so the client retries later,
+/// every other failure becomes [`no_repository_access_status`].
+pub fn access_failure_status(status: Status) -> Status {
+    if status.code() == Code::ResourceExhausted {
+        status
+    } else {
+        no_repository_access_status()
+    }
+}
+
 /// What an authorization check answers with when its own bound elapses,
 /// wherever that check is made. A server condition rather than a denial, and
 /// worded apart from a handler timeout so that which of the two elapsed stays

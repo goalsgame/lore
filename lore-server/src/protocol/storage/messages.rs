@@ -94,6 +94,19 @@ pub enum MessageHandleError {
     InvalidArgument(String),
 }
 
+impl MessageHandleError {
+    /// The error an authorization failure is reported as: backpressure
+    /// (`ResourceExhausted`) becomes [`MessageHandleError::SlowDown`], every
+    /// other failure an [`MessageHandleError::AuthorizationFailure`].
+    pub fn from_authorization(status: &tonic::Status) -> Self {
+        if status.code() == tonic::Code::ResourceExhausted {
+            Self::SlowDown
+        } else {
+            Self::AuthorizationFailure(status.message().to_string())
+        }
+    }
+}
+
 impl From<StoreError> for MessageHandleError {
     fn from(value: StoreError) -> Self {
         warn!("Received store error: {value:?}");

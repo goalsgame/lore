@@ -169,7 +169,8 @@ impl dyn RepositoryAuthorizer {
     /// answers later action checks in memory, `Ok(None)` means reachable but
     /// per-action checks must ask the authorizer. Denials are flattened to
     /// [`no_repository_access_status`] so an unauthorized caller learns
-    /// nothing from the reason.
+    /// nothing from the reason; backpressure (`ResourceExhausted`) is the one
+    /// error that is not flattened.
     ///
     /// The one call every partition-scoped entry point makes — the gRPC
     /// partition-access layer, the QUIC session start / connect, and the
@@ -187,8 +188,9 @@ impl dyn RepositoryAuthorizer {
                 .check_repository_access(token, repository_id, None)
                 .await
                 .map(|()| None)
-                .map_err(|_denied| crate::grpc::no_repository_access_status()),
-            _ => Err(crate::grpc::no_repository_access_status()),
+                .map_err(crate::grpc::access_failure_status),
+            Err(status) => Err(crate::grpc::access_failure_status(status)),
+            Ok(Some(_)) => Err(crate::grpc::no_repository_access_status()),
         }
     }
 

@@ -43,11 +43,19 @@ pub async fn jwt_axum_verify_authorization(
                     raw: &accesstoken,
                     claims: &user_info,
                 };
-                if let Ok(grants) = state
+                let access = state
                     .repository_authorizer
                     .granted_access(Some(&token), repository)
-                    .await
+                    .await;
+                if let Err(status) = &access
+                    && status.code() == tonic::Code::ResourceExhausted
                 {
+                    return Response::builder()
+                        .status(StatusCode::TOO_MANY_REQUESTS)
+                        .body(Body::empty())
+                        .unwrap();
+                }
+                if let Ok(grants) = access {
                     Span::current().record(USER_ID, user_info.identity());
                     if let Some(grants) = grants {
                         request.extensions_mut().insert(PartitionGrants {

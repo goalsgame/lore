@@ -150,9 +150,7 @@ impl Message for Copy {
             repository_authorizer
                 .check_repository_access(token.as_ref(), self.source_repository, None)
                 .await
-                .map_err(|status| {
-                    MessageHandleError::AuthorizationFailure(status.message().to_string())
-                })?;
+                .map_err(|status| MessageHandleError::from_authorization(&status))?;
         }
 
         let user_id = get_user_id_from_context(&context);
