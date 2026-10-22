@@ -1312,6 +1312,17 @@ mod name_scoped_create {
     }
 
     #[test]
+    fn oversized_names_and_patterns_never_match() {
+        let limit = lore_revision::repository::MAX_NAME_LEN;
+        let huge = "/".repeat(1 << 20);
+        assert!(!glob_matches_name("**", &huge));
+        assert!(!glob_matches_name(&huge, "goalables/app"));
+        let longest = "a".repeat(limit);
+        assert!(glob_matches_name("**", &longest));
+        assert!(!glob_matches_name("**", &format!("{longest}a")));
+    }
+
+    #[test]
     fn literal_pattern_matches_only_itself() {
         assert!(glob_matches_name("goalables/app", "goalables/app"));
         assert!(!glob_matches_name("goalables/app", "goalables/other"));
