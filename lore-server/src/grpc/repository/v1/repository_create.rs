@@ -25,6 +25,7 @@ use super::record::build_repository;
 use super::repository_get::repository_load_id;
 use super::repository_get::repository_load_name;
 use crate::authnz::repository_registry::RepositoryRegistry;
+use crate::authnz::repository_authorizer::authorize_repository_create;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
@@ -33,6 +34,7 @@ use crate::grpc::forwarded_requests::CallerContext;
 use crate::grpc::forwarded_requests::ForwardedRequests;
 use crate::grpc::get_is_service_account;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
@@ -65,6 +67,10 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
+    authorize_repository_create(
+        get_verified_token(request.extensions()).as_ref(),
+        &request.get_ref().name,
+    )?;
     let user_id = get_user_id(request.extensions());
     let is_service_account = get_is_service_account(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
