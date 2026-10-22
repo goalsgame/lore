@@ -18,6 +18,7 @@ use super::common::create_request_with_authorization;
 use super::global_grants_authorizer::GlobalGrantsAuthorizer;
 use super::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use crate::auth::jwt::AuthorizationToken;
+use crate::auth::jwt::NameVerdict;
 use crate::auth::jwt::ResourceMatcher;
 use crate::grpc::ServerResultExt;
 use crate::settings::AuthSettings;
@@ -305,6 +306,23 @@ fn check_user_permission_request(
         },
         authorization,
     )
+}
+
+/// Whether the token may create a repository called `name`. Tokens without a
+/// `resources` claim, or without name-scoped entries, are not restricted here.
+pub fn authorize_repository_create(
+    token: Option<&VerifiedToken<'_>>,
+    name: &str,
+) -> Result<(), Status> {
+    let Some(resources) = token.and_then(|token| token.claims.resources.as_deref()) else {
+        return Ok(());
+    };
+    match ResourceMatcher::default().create_by_name(resources, name) {
+        NameVerdict::Unscoped | NameVerdict::Allowed => Ok(()),
+        NameVerdict::Denied => Err(Status::permission_denied(
+            "Not permitted to create a repository with this name",
+        )),
+    }
 }
 
 #[lore_macro::test_pub]

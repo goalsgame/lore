@@ -1289,3 +1289,148 @@ mod jwt_verifier {
         }
     }
 }
+
+mod name_scoped_create {
+    use super::*;
+
+    fn entry(resource_id: &str, permissions: &[&str]) -> ResourcePermission {
+        ResourcePermission {
+            resource_id: resource_id.to_string(),
+            permission: permissions.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    #[test]
+    fn single_star_matches_exactly_one_segment() {
+        assert!(glob_matches_name("goalables/*", "goalables/app"));
+        assert!(!glob_matches_name("goalables/*", "goalables"));
+        assert!(!glob_matches_name("goalables/*", "goalables/a/b"));
+        assert!(!glob_matches_name("goalables/*", "goalables2/app"));
+        assert!(!glob_matches_name("goalables/*", "game"));
+        assert!(glob_matches_name("a/*/c", "a/b/c"));
+        assert!(!glob_matches_name("a/*/c", "a/b/d"));
+    }
+
+    #[test]
+    fn oversized_names_and_patterns_never_match() {
+        let limit = lore_revision::repository::MAX_NAME_LEN;
+        let huge = "/".repeat(1 << 20);
+        assert!(!glob_matches_name("**", &huge));
+        assert!(!glob_matches_name(&huge, "goalables/app"));
+        let longest = "a".repeat(limit);
+        assert!(glob_matches_name("**", &longest));
+        assert!(!glob_matches_name("**", &format!("{longest}a")));
+    }
+
+    #[test]
+    fn literal_pattern_matches_only_itself() {
+        assert!(glob_matches_name("goalables/app", "goalables/app"));
+        assert!(!glob_matches_name("goalables/app", "goalables/other"));
+    }
+
+    #[test]
+    fn trailing_double_star_matches_one_or_more_segments() {
+        assert!(glob_matches_name("goalables/**", "goalables/app"));
+        assert!(glob_matches_name("goalables/**", "goalables/a/b/c"));
+        assert!(!glob_matches_name("goalables/**", "goalables"));
+        assert!(!glob_matches_name("goalables/**", "other/app"));
+        assert!(glob_matches_name("**", "game"));
+        assert!(glob_matches_name("*/**", "a/b"));
+        assert!(!glob_matches_name("*/**", "a"));
+    }
+
+    #[test]
+    fn double_star_only_matches_in_trailing_position() {
+        assert!(!glob_matches_name("**/app", "goalables/app"));
+        assert!(!glob_matches_name("a/**/c", "a/b/c"));
+    }
+
+    #[test]
+    fn rejects_malformed_patterns_and_names() {
+        for pattern in [
+            "goalables//*",
+            "/goalables/*",
+            "goalables/*/",
+            "goalables/../*",
+            ".hidden/*",
+            "",
+        ] {
+            assert!(!glob_matches_name(pattern, "goalables/app"), "{pattern}");
+        }
+        assert!(!glob_matches_name("goalables/*", "goalables/../x"));
+        assert!(!glob_matches_name("goalables/*", "goalables/.x"));
+        assert!(!glob_matches_name("goalables/*", "goalables/"));
+        assert!(!glob_matches_name("**", "a/../b"));
+    }
+
+    #[test]
+    fn unscoped_without_name_entries() {
+        let matcher = ResourceMatcher::default();
+        assert_eq!(matcher.create_by_name(&[], "game"), NameVerdict::Unscoped);
+        let resources = vec![entry("urc-*", &["read"]), entry("urc-abc", &[])];
+        assert_eq!(
+            matcher.create_by_name(&resources, "game"),
+            NameVerdict::Unscoped
+        );
+    }
+
+    #[test]
+    fn allowed_needs_matching_glob_and_create_permission() {
+        let matcher = ResourceMatcher::default();
+        let resources = vec![
+            entry("urc-*", &["read", "create"]),
+            entry("urc-name:goalables/*", &["create"]),
+        ];
+        assert_eq!(
+            matcher.create_by_name(&resources, "goalables/app"),
+            NameVerdict::Allowed
+        );
+        assert_eq!(
+            matcher.create_by_name(&resources, "game"),
+            NameVerdict::Denied
+        );
+        assert_eq!(
+            matcher.create_by_name(&resources, "goalables/a/b"),
+            NameVerdict::Denied
+        );
+
+        let no_create = vec![entry("urc-name:goalables/*", &["read", "push"])];
+        assert_eq!(
+            matcher.create_by_name(&no_create, "goalables/app"),
+            NameVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn any_matching_entry_with_create_allows() {
+        let matcher = ResourceMatcher::default();
+        let resources = vec![
+            entry("urc-name:goalables/*", &["read"]),
+            entry("urc-name:tools/**", &["create"]),
+        ];
+        assert_eq!(
+            matcher.create_by_name(&resources, "tools/a/b"),
+            NameVerdict::Allowed
+        );
+        assert_eq!(
+            matcher.create_by_name(&resources, "goalables/app"),
+            NameVerdict::Denied
+        );
+    }
+
+    #[test]
+    fn name_entries_do_not_affect_partition_matching() {
+        let matcher = ResourceMatcher::default();
+        let repository: RepositoryId = Context::from_str("0194b726b34e72b0b45550b88a967076")
+            .unwrap()
+            .into();
+        let resources = vec![entry("urc-name:goalables/*", &["create", "read"])];
+        assert!(!matcher.any_match(&resources, repository));
+        assert!(!matcher.permits(&resources, repository, "read"));
+        assert!(
+            matcher
+                .merged_permissions(&resources, repository)
+                .is_empty()
+        );
+    }
+}

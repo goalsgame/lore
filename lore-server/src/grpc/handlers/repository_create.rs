@@ -29,11 +29,13 @@ use super::repository_query::repository_query_name;
 use crate::authnz::common::create_request_with_authorization;
 use crate::authnz::rebac::RebacApiClient;
 use crate::authnz::rebac::grpc_get_rebac_client;
+use crate::authnz::repository_authorizer::authorize_repository_create;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
+use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
@@ -52,6 +54,10 @@ pub async fn handler(
     hook_dispatcher: &HookDispatcher,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<RepositoryCreateResponse>, Status> {
+    authorize_repository_create(
+        get_verified_token(request.extensions()).as_ref(),
+        &request.get_ref().name,
+    )?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
     let authorization = extract_authorization_header(&request);
