@@ -628,3 +628,104 @@ mod behind_the_interceptor {
         );
     }
 }
+
+/// The layer in front of the real authorizer: a `urc-name:` token reaches
+/// the repositories its glob names, with its permissions, and no others.
+mod name_scoped_token {
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_name_resolver::repository_name_resolver;
+
+    use super::*;
+    use crate::store::test_support::seed_repository;
+    use crate::store::test_support::test_store_create;
+
+    /// Records the grants the layer attached for the handler.
+    #[derive(Clone, Default)]
+    struct GrantsProbe(Arc<Mutex<Vec<Option<PartitionGrants>>>>);
+
+    impl Service<Request<()>> for GrantsProbe {
+        type Response = Response<()>;
+        type Error = Infallible;
+        type Future = std::future::Ready<Result<Response<()>, Infallible>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: Request<()>) -> Self::Future {
+            self.0
+                .lock()
+                .unwrap()
+                .push(request.extensions().get::<PartitionGrants>().cloned());
+            std::future::ready(Ok(Response::new(())))
+        }
+    }
+
+    fn scoped_request(repository: RepositoryId) -> Request<()> {
+        let mut request = request(Some(repository), false);
+        request.extensions_mut().insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-name:goalables/*".to_string(),
+                permission: vec!["read".to_string(), "push".to_string()],
+            }]),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(RawToken("raw.jwt".into()));
+        request
+    }
+
+    #[tokio::test]
+    async fn reaches_a_matching_repository_and_not_another() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(
+            lore_base::runtime::LORE_CONTEXT.scope(execution, async move {
+                let app: RepositoryId = rand::random();
+                let game: RepositoryId = rand::random();
+                seed_repository(
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    app,
+                    "goalables/app",
+                )
+                .await;
+                seed_repository(immutable_store.clone(), mutable_store.clone(), game, "game").await;
+                let authorizer = Arc::new(
+                    AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                        .with_name_resolver(repository_name_resolver(
+                            immutable_store,
+                            mutable_store,
+                        )),
+                );
+                let probe = GrantsProbe::default();
+                let mut service =
+                    PartitionAccessLayer::new(authorizer, TEST_TIMEOUT).layer(probe.clone());
+
+                let allowed = service.call(scoped_request(app)).await.unwrap();
+                assert!(allowed.headers().get("grpc-status").is_none());
+                {
+                    let seen = probe.0.lock().unwrap();
+                    assert_eq!(seen.len(), 1, "the matching repository reaches the service");
+                    let grants = seen[0]
+                        .as_ref()
+                        .expect("grants are attached")
+                        .grants
+                        .clone();
+                    assert!(grants.permits("read") && grants.permits("push"));
+                    assert!(!grants.permits("obliterate"));
+                }
+
+                let denied = service.call(scoped_request(game)).await.unwrap();
+                assert_eq!(status_of(&denied).code(), Code::PermissionDenied);
+                assert_eq!(
+                    probe.0.lock().unwrap().len(),
+                    1,
+                    "game never reaches the service"
+                );
+            }),
+        )
+        .await;
+    }
+}

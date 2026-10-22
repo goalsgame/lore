@@ -323,3 +323,91 @@ mod forwarded_request {
         .await;
     }
 }
+
+mod name_scoped_token {
+    use lore_server::auth::jwt::AuthorizationToken;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::repository_name_resolver::repository_name_resolver;
+    use lore_server::grpc::repository::v1::repository_get::*;
+    use tonic::Code;
+
+    use super::*;
+    use crate::store::test_support::seed_repository;
+    use crate::store::test_support::test_store_create;
+
+    fn request(query: Query) -> Request<RepositoryGetRequest> {
+        let mut request = Request::new(RepositoryGetRequest { query: Some(query) });
+        request.extensions_mut().insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: "urc-name:goalables/*".to_string(),
+                permission: vec!["read".to_string()],
+            }]),
+            ..Default::default()
+        });
+        request
+            .extensions_mut()
+            .insert(RawToken("raw.jwt".to_string()));
+        request
+    }
+
+    /// A token holding only `urc-name:goalables/*` reads the repository named
+    /// `goalables/app` and is told `game` does not exist.
+    #[tokio::test]
+    async fn reads_a_matching_repository_and_is_denied_another() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+
+        Box::pin(LORE_CONTEXT.scope(execution, async move {
+            let app: RepositoryId = rand::random();
+            let game: RepositoryId = rand::random();
+            seed_repository(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                app,
+                "goalables/app",
+            )
+            .await;
+            seed_repository(immutable_store.clone(), mutable_store.clone(), game, "game").await;
+            let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+                AuthClientAuthorizer::new("https://auth.invalid".to_string()).with_name_resolver(
+                    repository_name_resolver(immutable_store.clone(), mutable_store.clone()),
+                ),
+            );
+
+            for query in [
+                Query::Name("goalables/app".to_string()),
+                Query::Id(app.into()),
+            ] {
+                let response = handler(
+                    request(query),
+                    authorizer.clone(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                )
+                .await
+                .expect("a matching repository is readable");
+                assert_eq!(
+                    response.into_inner().repository.unwrap().name,
+                    "goalables/app"
+                );
+            }
+
+            for query in [Query::Name("game".to_string()), Query::Id(game.into())] {
+                let err = handler(
+                    request(query),
+                    authorizer.clone(),
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    &None,
+                )
+                .await
+                .expect_err("a non-matching repository is not readable");
+                assert_eq!(err.code(), Code::NotFound);
+            }
+        }))
+        .await;
+    }
+}

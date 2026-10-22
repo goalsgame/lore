@@ -96,6 +96,26 @@ pub fn glob_matches_name(pattern: &str, name: &str) -> bool {
     }
 }
 
+/// Whether any entry is a `urc-name:` grant.
+pub fn has_name_scoped(resources: &[ResourcePermission]) -> bool {
+    resources
+        .iter()
+        .any(|entry| entry.resource_id.starts_with(NAME_RESOURCE_PREFIX))
+}
+
+/// The `urc-name:` entries whose glob matches the repository `name`.
+pub fn name_scoped_matches<'a>(
+    resources: &'a [ResourcePermission],
+    name: &'a str,
+) -> impl Iterator<Item = &'a ResourcePermission> {
+    resources.iter().filter(move |entry| {
+        entry
+            .resource_id
+            .strip_prefix(NAME_RESOURCE_PREFIX)
+            .is_some_and(|pattern| glob_matches_name(pattern, name))
+    })
+}
+
 /// The outcome of checking a repository name against name-scoped grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NameVerdict {
