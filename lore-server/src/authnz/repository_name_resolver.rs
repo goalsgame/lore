@@ -28,6 +28,15 @@ pub trait RepositoryNameResolver: Send + Sync {
     /// The name of `repository_id`, or `Ok(None)` when no such repository exists.
     async fn resolve(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status>;
 
+    /// The name held by the metadata blob `hash` of `repository_id`.
+    /// `Ok(None)` for the default hash, which stands for no metadata, and for
+    /// a blob that cannot be read.
+    async fn resolve_at(
+        &self,
+        repository_id: RepositoryId,
+        hash: Hash,
+    ) -> Result<Option<Arc<str>>, Status>;
+
     /// The hash of the repository's current metadata, read fresh. It changes
     /// when the repository is deleted and recreated, so a holder of grants
     /// derived from a name can tell they may no longer apply.
@@ -159,6 +168,17 @@ impl RepositoryNameResolver for CachedNameResolver {
         let Some(hash) = self.source.metadata_hash(repository_id).await? else {
             return Ok(None);
         };
+        self.resolve_at(repository_id, hash).await
+    }
+
+    async fn resolve_at(
+        &self,
+        repository_id: RepositoryId,
+        hash: Hash,
+    ) -> Result<Option<Arc<str>>, Status> {
+        if hash == Hash::default() {
+            return Ok(None);
+        }
         if let Some(name) = self.names.lock().expect("name cache lock").get(&hash) {
             return Ok(Some(name.clone()));
         }

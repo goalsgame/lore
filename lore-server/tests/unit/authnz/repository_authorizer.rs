@@ -756,6 +756,14 @@ mod name_scoped_grants {
             Ok(self.0.get(&repository_id).cloned())
         }
 
+        async fn resolve_at(
+            &self,
+            _repository_id: RepositoryId,
+            _hash: lore_base::types::Hash,
+        ) -> Result<Option<Arc<str>>, Status> {
+            Ok(None)
+        }
+
         async fn incarnation(
             &self,
             _repository_id: RepositoryId,
@@ -882,6 +890,14 @@ mod name_scoped_grants {
     #[async_trait]
     impl RepositoryNameResolver for FailingNames {
         async fn resolve(&self, _repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
+            Err(self.0.clone())
+        }
+
+        async fn resolve_at(
+            &self,
+            _repository_id: RepositoryId,
+            _hash: lore_base::types::Hash,
+        ) -> Result<Option<Arc<str>>, Status> {
             Err(self.0.clone())
         }
 

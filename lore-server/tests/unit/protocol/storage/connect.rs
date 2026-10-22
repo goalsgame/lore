@@ -296,38 +296,21 @@ mod authorized_connect {
 
 mod revalidation {
     use std::collections::HashSet;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
 
     use lore_base::types::Hash;
     use lore_server::auth::jwt::ResourcePermission;
     use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
     use lore_server::authnz::repository_authorizer::Grants;
     use lore_server::authnz::repository_authorizer::PartitionGrants;
-    use lore_server::authnz::repository_name_resolver::RepositoryNameResolver;
-    use tonic::Status;
 
     use super::*;
+    use crate::authnz::switchable_resolver::SwitchableResolver;
 
-    struct SwitchableResolver {
-        state: Mutex<(Hash, Arc<str>)>,
-        resolves: AtomicUsize,
-    }
-
-    #[async_trait]
-    impl RepositoryNameResolver for SwitchableResolver {
-        async fn resolve(&self, _repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
-            self.resolves.fetch_add(1, Ordering::SeqCst);
-            Ok(Some(self.state.lock().unwrap().1.clone()))
-        }
-
-        async fn incarnation(&self, _repository_id: RepositoryId) -> Result<Option<Hash>, Status> {
-            Ok(Some(self.state.lock().unwrap().0))
-        }
-    }
-
-    fn connection(repository: RepositoryId, incarnation: Option<Hash>) -> Arc<AttributeMap> {
+    fn connection(
+        repository: RepositoryId,
+        incarnation: Option<Hash>,
+        with_id_entry: bool,
+    ) -> Arc<AttributeMap> {
         let context = Arc::new(AttributeMap::default());
         context.insert(PartitionGrants {
             repository_id: repository,
@@ -336,38 +319,75 @@ mod revalidation {
         });
         context.insert(RawToken("raw.jwt".to_string()));
         context.insert(AuthorizationToken {
-            resources: Some(vec![ResourcePermission {
-                resource_id: "urc-name:goalables/*".to_string(),
-                permission: vec!["read".to_string()],
-            }]),
+            resources: Some(
+                [
+                    ResourcePermission {
+                        resource_id: "urc-name:goalables/*".to_string(),
+                        permission: vec!["read".to_string(), "write".to_string()],
+                    },
+                    ResourcePermission {
+                        resource_id: format!("urc-{repository}"),
+                        permission: vec!["read".to_string()],
+                    },
+                ]
+                .into_iter()
+                .take(if with_id_entry { 2 } else { 1 })
+                .collect(),
+            ),
             ..Default::default()
         });
         context
     }
 
-    fn fixture() -> (Arc<SwitchableResolver>, Arc<dyn RepositoryAuthorizer>) {
-        let resolver = Arc::new(SwitchableResolver {
-            state: Mutex::new((Hash::from([1u8; 32]), Arc::from("goalables/app"))),
-            resolves: AtomicUsize::new(0),
-        });
-        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(
+    fn first() -> Hash {
+        Hash::from([1u8; 32])
+    }
+
+    fn second() -> Hash {
+        Hash::from([2u8; 32])
+    }
+
+    fn authorizer(resolver: &Arc<SwitchableResolver>) -> Arc<dyn RepositoryAuthorizer> {
+        Arc::new(
             AuthClientAuthorizer::new("https://auth.invalid".to_string())
                 .with_name_resolver(resolver.clone()),
-        );
-        (resolver, authorizer)
+        )
+    }
+
+    fn recorded(context: &AttributeMap) -> Arc<PartitionGrants> {
+        context.get::<PartitionGrants>().unwrap()
     }
 
     #[tokio::test]
-    async fn a_connection_whose_repository_was_recreated_is_refused() {
-        let (resolver, authorizer) = fixture();
+    async fn a_connection_whose_repository_was_recreated_loses_name_grants() {
         let repository = random::<RepositoryId>();
-        let context = connection(repository, Some(Hash::from([1u8; 32])));
+        let resolver = SwitchableResolver::new();
+        resolver.set(repository, first(), "goalables/app");
+        let authorizer = authorizer(&resolver);
+        let context = connection(repository, Some(first()), true);
 
         revalidate_connection_grants(&context, &authorizer)
             .await
             .unwrap();
 
-        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("game"));
+        resolver.set(repository, second(), "game");
+        revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap();
+        let grants = recorded(&context);
+        assert!(grants.grants.permits("read") && !grants.grants.permits("write"));
+        assert_eq!(grants.incarnation, Some(second()));
+    }
+
+    #[tokio::test]
+    async fn a_connection_with_nothing_left_is_refused() {
+        let repository = random::<RepositoryId>();
+        let resolver = SwitchableResolver::new();
+        resolver.set(repository, first(), "goalables/app");
+        let authorizer = authorizer(&resolver);
+        let context = connection(repository, Some(first()), false);
+
+        resolver.set(repository, second(), "game");
         let err = revalidate_connection_grants(&context, &authorizer)
             .await
             .unwrap_err();
@@ -375,35 +395,63 @@ mod revalidation {
     }
 
     #[tokio::test]
+    async fn a_connection_admitted_with_no_metadata_is_enumerated_at_the_next_hash() {
+        let repository = random::<RepositoryId>();
+        let resolver = SwitchableResolver::new();
+        resolver.answer_unpinned("goalables/app");
+        let authorizer = authorizer(&resolver);
+        let context = connection(repository, Some(Hash::default()), true);
+
+        revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap();
+        assert!(!recorded(&context).grants.permits("write"));
+        assert_eq!(recorded(&context).incarnation, Some(Hash::default()));
+
+        resolver.set(repository, first(), "goalables/app");
+        revalidate_connection_grants(&context, &authorizer)
+            .await
+            .unwrap();
+        assert!(recorded(&context).grants.permits("write"));
+        assert_eq!(recorded(&context).incarnation, Some(first()));
+    }
+
+    #[tokio::test]
     async fn an_unchanged_incarnation_enumerates_nothing_again() {
-        let (resolver, authorizer) = fixture();
-        let context = connection(random(), Some(Hash::from([1u8; 32])));
+        let repository = random::<RepositoryId>();
+        let resolver = SwitchableResolver::new();
+        resolver.set(repository, first(), "goalables/app");
+        let authorizer = authorizer(&resolver);
+        let context = connection(repository, Some(first()), true);
 
         for _ in 0..3 {
             revalidate_connection_grants(&context, &authorizer)
                 .await
                 .unwrap();
         }
-        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.resolves(), 0);
 
-        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("goalables/other"));
+        resolver.set(repository, second(), "goalables/other");
         for _ in 0..3 {
             revalidate_connection_grants(&context, &authorizer)
                 .await
                 .unwrap();
         }
-        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 1);
+        assert_eq!(resolver.resolves(), 1);
     }
 
     #[tokio::test]
     async fn a_connection_without_an_incarnation_is_never_checked() {
-        let (resolver, authorizer) = fixture();
-        let context = connection(random(), None);
+        let repository = random::<RepositoryId>();
+        let resolver = SwitchableResolver::new();
+        resolver.set(repository, first(), "goalables/app");
+        let authorizer = authorizer(&resolver);
+        let context = connection(repository, None, true);
 
-        *resolver.state.lock().unwrap() = (Hash::from([2u8; 32]), Arc::from("game"));
+        resolver.set(repository, second(), "game");
         revalidate_connection_grants(&context, &authorizer)
             .await
             .unwrap();
-        assert_eq!(resolver.resolves.load(Ordering::SeqCst), 0);
+        assert_eq!(resolver.resolves() + resolver.incarnations(), 0);
     }
 }

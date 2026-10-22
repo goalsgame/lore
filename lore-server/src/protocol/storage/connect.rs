@@ -13,6 +13,7 @@ use crate::auth::jwt::AuthorizationToken;
 use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::PartitionGrants;
 use crate::authnz::repository_authorizer::RawToken;
+use crate::authnz::repository_authorizer::Regranted;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::correlation::CorrelationId;
@@ -103,12 +104,11 @@ impl Message for Connect {
                         raw: auth_token,
                         claims: &authorization,
                     };
-                    let incarnation = repository_authorizer
-                        .session_incarnation(&token, self.repository)
-                        .await
-                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
-                    let grants = repository_authorizer
-                        .granted_access(Some(&token), self.repository)
+                    let Regranted {
+                        grants,
+                        incarnation,
+                    } = repository_authorizer
+                        .granted_access_tracked(Some(&token), self.repository)
                         .await
                         .map_err(|status| MessageHandleError::from_authorization(&status))?;
                     if let Some(grants) = grants {

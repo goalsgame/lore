@@ -142,3 +142,93 @@ async fn subscribe_stays_open_under_the_allow_all_authorizer() {
         .await
         .expect("a no-auth server's subscribe is open");
 }
+
+mod incarnation {
+    use lore_revision::notification::NotificationSender as _;
+    use lore_server::auth::jwt::ResourcePermission;
+    use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
+    use lore_server::notification::local::NotificationSender;
+    use tokio_stream::StreamExt;
+
+    use super::*;
+    use crate::authnz::switchable_resolver::SwitchableResolver;
+
+    fn subscribe_request(repository: RepositoryId, entry: &str) -> Request<SubscribeRequest> {
+        let mut request = Request::new(SubscribeRequest {
+            repository: Context::from(repository).into(),
+        });
+        request.extensions_mut().insert(AuthorizationToken {
+            resources: Some(vec![ResourcePermission {
+                resource_id: entry.to_string(),
+                permission: vec!["read".to_string()],
+            }]),
+            ..Default::default()
+        });
+        request.extensions_mut().insert(RawToken("raw.jwt".into()));
+        request
+    }
+
+    fn service(
+        resolver: &Arc<SwitchableResolver>,
+    ) -> (NotificationService, Arc<NotificationSender>) {
+        let sender = Arc::new(NotificationSender::default());
+        let authorizer = AuthClientAuthorizer::new("https://auth.invalid".to_string())
+            .with_name_resolver(resolver.clone());
+        (
+            NotificationService::new(sender.clone(), Arc::new(authorizer), Duration::from_secs(5)),
+            sender,
+        )
+    }
+
+    async fn publish(sender: &NotificationSender, repository: RepositoryId) {
+        sender.branch_created(repository, rand::random()).await;
+    }
+
+    #[tokio::test]
+    async fn a_name_scoped_subscription_ends_when_the_repository_is_recreated() {
+        let repository = repository(1);
+        let resolver = SwitchableResolver::new();
+        resolver.set(
+            repository,
+            lore_base::types::Hash::from([1u8; 32]),
+            "goalables/app",
+        );
+        let (service, sender) = service(&resolver);
+        let mut stream = service
+            .subscribe(subscribe_request(repository, "urc-name:goalables/*"))
+            .await
+            .unwrap()
+            .into_inner();
+
+        publish(&sender, repository).await;
+        assert!(stream.next().await.unwrap().is_ok());
+
+        resolver.set(repository, lore_base::types::Hash::from([2u8; 32]), "game");
+        publish(&sender, repository).await;
+        let denied = stream.next().await.unwrap().unwrap_err();
+        assert_eq!(denied.code(), Code::PermissionDenied);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_id_scoped_subscription_keeps_receiving() {
+        let repository = repository(1);
+        let resolver = SwitchableResolver::new();
+        resolver.set(
+            repository,
+            lore_base::types::Hash::from([1u8; 32]),
+            "goalables/app",
+        );
+        let (service, sender) = service(&resolver);
+        let mut stream = service
+            .subscribe(subscribe_request(repository, &format!("urc-{repository}")))
+            .await
+            .unwrap()
+            .into_inner();
+
+        resolver.set(repository, lore_base::types::Hash::from([2u8; 32]), "game");
+        publish(&sender, repository).await;
+        assert!(stream.next().await.unwrap().is_ok());
+        assert_eq!(resolver.incarnations(), 0);
+    }
+}

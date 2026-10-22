@@ -19,8 +19,8 @@ use tonic::server::NamedService;
 use tower::Layer;
 use tower::Service;
 
-use crate::authnz::repository_authorizer::Grants;
 use crate::authnz::repository_authorizer::PartitionGrants;
+use crate::authnz::repository_authorizer::Regranted;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_repository;
@@ -113,8 +113,9 @@ pub struct PartitionAccessService<S> {
 
 /// The authorization stage's verdict on one request.
 enum Access {
-    /// Reachable; the enumerated grants when the authorizer had them.
-    Granted(Option<Grants>),
+    /// Reachable; the enumerated grants when the authorizer had them, with
+    /// the metadata hash they are tied to when tracked.
+    Granted(Regranted),
     Denied,
     /// The authorizer is shedding load; the status is returned as is.
     Throttled(Status),
@@ -166,8 +167,16 @@ where
                 let extensions = request.extensions();
                 tokio::time::timeout(authorization_timeout, async move {
                     let token = get_verified_token(extensions);
-                    match authorizer.granted_access(token.as_ref(), repository).await {
-                        Ok(grants) => Access::Granted(grants.filter(|_| token.is_some())),
+                    match authorizer
+                        .granted_access_tracked(token.as_ref(), repository)
+                        .await
+                    {
+                        Ok(mut regranted) => {
+                            if token.is_none() {
+                                regranted.grants = None;
+                            }
+                            Access::Granted(regranted)
+                        }
                         Err(status) if status.code() == Code::ResourceExhausted => {
                             Access::Throttled(status)
                         }
@@ -178,14 +187,14 @@ where
             };
 
             match access {
-                Ok(Access::Granted(grants)) => {
-                    if let Some(grants) = grants {
+                Ok(Access::Granted(regranted)) => {
+                    if let Some(grants) = regranted.grants {
                         // The enumeration also answers the handler's action
                         // checks, without another authorizer call.
                         request.extensions_mut().insert(PartitionGrants {
                             repository_id: repository,
                             grants,
-                            incarnation: None,
+                            incarnation: regranted.incarnation,
                         });
                     }
                     // Entered unbounded: the decode of the request body

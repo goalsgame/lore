@@ -199,6 +199,35 @@ async fn repositories_sharing_a_metadata_hash_share_one_name_read() {
 }
 
 #[tokio::test]
+async fn resolve_at_reads_the_pinned_blob_through_the_cache() {
+    let repository = id();
+    let pinned = hash();
+    let source = CountingSource::new();
+    source.set(repository, pinned, "goalables/app");
+    let cached = CachedNameResolver::new(source.clone(), 8);
+
+    assert!(
+        cached
+            .resolve_at(repository, Hash::default())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(source.name_reads(), 0);
+
+    for _ in 0..2 {
+        let name = cached
+            .resolve_at(repository, pinned)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&*name, "goalables/app");
+    }
+    assert_eq!(source.name_reads(), 1);
+    assert_eq!(source.hash_reads(), 0);
+}
+
+#[tokio::test]
 async fn the_store_source_reads_the_name_from_repository_metadata() {
     let (immutable_store, mutable_store, execution) =
         test_store_create().await.expect("Failed to create stores");

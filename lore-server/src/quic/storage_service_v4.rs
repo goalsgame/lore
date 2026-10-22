@@ -22,6 +22,7 @@ use crate::auth::jwt::JwtVerifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_authorizer::VerifiedToken;
 use crate::authnz::repository_authorizer::VerifiedTokenOwned;
+use crate::authnz::repository_authorizer::token_is_name_scoped;
 use crate::protocol::attribute_map::AttributeMap;
 use crate::protocol::attribute_map::ConnectionId;
 use crate::protocol::client_identify::ClientIdentify;
@@ -216,16 +217,13 @@ impl QuicService for StorageServiceV4 {
                         raw: &token_str,
                         claims: &authorization,
                     };
-                    incarnation = self
+                    let tracked = self
                         .repository_authorizer
-                        .session_incarnation(&verified, repository)
+                        .granted_access_tracked(Some(&verified), repository)
                         .await
                         .map_err(|status| MessageHandleError::from_authorization(&status))?;
-                    grants = self
-                        .repository_authorizer
-                        .granted_access(Some(&verified), repository)
-                        .await
-                        .map_err(|status| MessageHandleError::from_authorization(&status))?;
+                    grants = tracked.grants;
+                    incarnation = tracked.incarnation;
                     token = Some(Arc::new(verified.owned()));
 
                     user_id = crate::util::get_user_id_from_token(Some(authorization));
@@ -364,11 +362,13 @@ impl QuicService for StorageServiceV4 {
                         // session's authorization on the connection must not
                         // vouch for it. A source this session's token already
                         // cleared is remembered, so a repeated copy from it
-                        // skips the check.
+                        // skips the check; a name-scoped token is always asked.
+                        let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
+                        let name_scoped = verified.as_ref().is_some_and(token_is_name_scoped);
                         if copy.source_repository != repository
-                            && !authorized_sources.contains(&copy.source_repository)
+                            && (name_scoped
+                                || !authorized_sources.contains(&copy.source_repository))
                         {
-                            let verified = token.as_deref().map(VerifiedTokenOwned::as_token);
                             self.repository_authorizer
                                 .check_repository_access(
                                     verified.as_ref(),
@@ -379,7 +379,9 @@ impl QuicService for StorageServiceV4 {
                                 .map_err(|status| {
                                     MessageHandleError::from_authorization(&status)
                                 })?;
-                            authorized_sources.insert(copy.source_repository);
+                            if !name_scoped {
+                                authorized_sources.insert(copy.source_repository);
+                            }
                         }
                         handle_copy(
                             copy.source_repository,

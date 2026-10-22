@@ -9,3 +9,4 @@ mod repository_authorizer;
 mod repository_catalog;
 mod repository_name_resolver;
 mod resource_grants_authorizer;
+pub mod switchable_resolver;

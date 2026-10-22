@@ -3,6 +3,7 @@
 
 mod copy;
 mod get_resolved;
+mod incarnation;
 mod mutable_load;
 mod mutable_store;
 mod put_resolved;

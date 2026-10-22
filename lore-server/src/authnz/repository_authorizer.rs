@@ -104,13 +104,15 @@ impl Grants {
 pub struct PartitionGrants {
     pub repository_id: RepositoryId,
     pub grants: Grants,
-    /// The repository's metadata hash when the grants were enumerated, for a
-    /// name-scoped token on a long-lived connection. `None` on the
-    /// per-request paths, which enumerate again on every request.
+    /// The metadata hash the name-derived grants were enumerated against;
+    /// `Hash::default()` when the repository had no metadata. `None` when the
+    /// grants are not tracked: an id-scoped token, or the per-request paths,
+    /// which enumerate again on every request.
     pub incarnation: Option<Hash>,
 }
 
-/// Grants enumerated again for a long-lived session or connection.
+/// Grants enumerated for a long-lived session, connection or stream, with the
+/// metadata hash they are tied to. `incarnation` is `None` when untracked.
 pub struct Regranted {
     pub grants: Option<Grants>,
     pub incarnation: Option<Hash>,
@@ -123,6 +125,66 @@ pub fn token_is_name_scoped(token: &VerifiedToken<'_>) -> bool {
         .resources
         .as_deref()
         .is_some_and(has_name_scoped)
+}
+
+/// Keeps a long-lived stream's name-derived grants tied to the metadata hash
+/// they were enumerated against: [`check`](Self::check) reads the pointer and
+/// enumerates again, pinned at the new hash, when it has changed.
+pub struct IncarnationGuard {
+    authorizer: Arc<dyn RepositoryAuthorizer>,
+    token: VerifiedTokenOwned,
+    repository_id: RepositoryId,
+    seen: Hash,
+}
+
+impl IncarnationGuard {
+    /// `None` when the grants are untracked (`incarnation` is `None`) or no
+    /// verified token is present, so those streams never pay for a check.
+    pub fn new(
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        incarnation: Option<Hash>,
+    ) -> Option<Self> {
+        Some(Self {
+            authorizer,
+            token: token?.owned(),
+            repository_id,
+            seen: incarnation?,
+        })
+    }
+
+    /// The guard for a request that went through the partition-access layer,
+    /// built from the [`PartitionGrants`] and the verified token in its
+    /// extensions.
+    pub fn from_extensions(
+        authorizer: Arc<dyn RepositoryAuthorizer>,
+        extensions: &tonic::Extensions,
+        repository_id: RepositoryId,
+    ) -> Option<Self> {
+        let incarnation = extensions
+            .get::<PartitionGrants>()
+            .filter(|grants| grants.repository_id == repository_id)?
+            .incarnation;
+        Self::new(
+            authorizer,
+            crate::grpc::get_verified_token(extensions).as_ref(),
+            repository_id,
+            incarnation,
+        )
+    }
+
+    /// Whether the caller still has access to the repository.
+    pub async fn check(&mut self) -> Result<(), Status> {
+        let regranted = self
+            .authorizer
+            .regrant_if_incarnation_changed(&self.token.as_token(), self.repository_id, self.seen)
+            .await?;
+        if let Some(incarnation) = regranted.and_then(|regranted| regranted.incarnation) {
+            self.seen = incarnation;
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -163,13 +225,26 @@ pub trait RepositoryAuthorizer: Send + Sync {
     }
 
     /// The hash of the repository's current metadata, read fresh, for
-    /// authorizers whose grants depend on the repository's name. `Ok(None)`
-    /// when the authorizer's grants do not depend on it.
+    /// authorizers whose grants depend on the repository's name:
+    /// `Hash::default()` when it has no metadata. `Ok(None)` when the
+    /// authorizer's grants do not depend on it.
     async fn repository_incarnation(
         &self,
         _repository_id: RepositoryId,
     ) -> Result<Option<Hash>, Status> {
         Ok(None)
+    }
+
+    /// [`granted_actions`](Self::granted_actions) with name-derived grants
+    /// taken from the metadata blob `incarnation` instead of the current
+    /// pointer; `Hash::default()` yields no name-derived grants.
+    async fn granted_actions_at(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        _incarnation: Hash,
+    ) -> Result<Option<Grants>, Status> {
+        self.granted_actions(token, repository_id).await
     }
 
     /// [`check_repository_access`](Self::check_repository_access) for call
@@ -212,7 +287,31 @@ impl dyn RepositoryAuthorizer {
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
-        match self.granted_actions(token, repository_id).await {
+        let enumerated = self.granted_actions(token, repository_id).await;
+        self.admit(token, repository_id, enumerated).await
+    }
+
+    /// [`granted_access`](Self::granted_access) with name-derived grants
+    /// taken from the metadata blob `incarnation`.
+    pub async fn granted_access_at(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        incarnation: Hash,
+    ) -> Result<Option<Grants>, Status> {
+        let enumerated = self
+            .granted_actions_at(token, repository_id, incarnation)
+            .await;
+        self.admit(token, repository_id, enumerated).await
+    }
+
+    async fn admit(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        enumerated: Result<Option<Grants>, Status>,
+    ) -> Result<Option<Grants>, Status> {
+        match enumerated {
             Ok(Some(grants)) if grants.reachable() => Ok(Some(grants)),
             Ok(None) => self
                 .check_repository_access(token, repository_id, None)
@@ -224,37 +323,56 @@ impl dyn RepositoryAuthorizer {
         }
     }
 
-    /// The incarnation a long-lived session on `repository_id` records at
-    /// start: `Some` only for a name-scoped token, so other sessions never
-    /// pay for the read.
-    pub async fn session_incarnation(
+    /// [`granted_access`](Self::granted_access) for a long-lived session,
+    /// connection or stream. A name-scoped token reads the metadata hash
+    /// once and enumerates pinned at it, so the grants are tied to the hash
+    /// recorded with them; any other caller is untracked (`incarnation:
+    /// None`) and pays for no extra read.
+    pub async fn granted_access_tracked(
         &self,
-        token: &VerifiedToken<'_>,
+        token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
-    ) -> Result<Option<Hash>, Status> {
-        if !token_is_name_scoped(token) {
-            return Ok(None);
+    ) -> Result<Regranted, Status> {
+        if let Some(token) = token.filter(|token| token_is_name_scoped(token))
+            && let Some(incarnation) = self.repository_incarnation(repository_id).await?
+        {
+            let grants = self
+                .granted_access_at(Some(token), repository_id, incarnation)
+                .await?;
+            return Ok(Regranted {
+                grants,
+                incarnation: Some(incarnation),
+            });
         }
-        self.repository_incarnation(repository_id).await
+        Ok(Regranted {
+            grants: self.granted_access(token, repository_id).await?,
+            incarnation: None,
+        })
     }
 
-    /// Enumerates the caller's access again when `repository_id`'s
-    /// incarnation is no longer `seen`; `Ok(None)` when it is unchanged.
-    /// The error is [`granted_access`](Self::granted_access)'s.
+    /// Enumerates the caller's access again, pinned at the current metadata
+    /// hash, when `repository_id`'s incarnation is no longer `seen`;
+    /// `Ok(None)` when it is unchanged. The error is
+    /// [`granted_access`](Self::granted_access)'s.
     pub async fn regrant_if_incarnation_changed(
         &self,
         token: &VerifiedToken<'_>,
         repository_id: RepositoryId,
         seen: Hash,
     ) -> Result<Option<Regranted>, Status> {
-        let current = self.repository_incarnation(repository_id).await?;
-        if current == Some(seen) {
+        let current = self
+            .repository_incarnation(repository_id)
+            .await?
+            .unwrap_or_default();
+        if current == seen {
             return Ok(None);
         }
-        let grants = self.granted_access(Some(token), repository_id).await?;
+        let grants = self
+            .granted_access_at(Some(token), repository_id, current)
+            .await?;
         Ok(Some(Regranted {
             grants,
-            incarnation: current.or(Some(seen)),
+            incarnation: Some(current),
         }))
     }
 
@@ -347,6 +465,19 @@ impl AuthClientAuthorizer {
     async fn resolve_name(&self, repository_id: RepositoryId) -> Result<Option<Arc<str>>, Status> {
         match &self.name_resolver {
             Some(resolver) => resolver.resolve(repository_id).await,
+            None => Ok(None),
+        }
+    }
+
+    /// The name held by the metadata blob `hash`, `None` when it has none or
+    /// no resolver is set.
+    async fn resolve_name_at(
+        &self,
+        repository_id: RepositoryId,
+        hash: Hash,
+    ) -> Result<Option<Arc<str>>, Status> {
+        match &self.name_resolver {
+            Some(resolver) => resolver.resolve_at(repository_id, hash).await,
             None => Ok(None),
         }
     }
@@ -582,9 +713,24 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         repository_id: RepositoryId,
     ) -> Result<Option<Hash>, Status> {
         match &self.name_resolver {
-            Some(resolver) => resolver.incarnation(repository_id).await,
+            Some(resolver) => Ok(Some(
+                resolver
+                    .incarnation(repository_id)
+                    .await?
+                    .unwrap_or_default(),
+            )),
             None => Ok(None),
         }
+    }
+
+    async fn granted_actions_at(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        incarnation: Hash,
+    ) -> Result<Option<Grants>, Status> {
+        self.enumerate(token, repository_id, Some(incarnation))
+            .await
     }
 
     async fn check_repository_access(
@@ -632,6 +778,19 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         token: Option<&VerifiedToken<'_>>,
         repository_id: RepositoryId,
     ) -> Result<Option<Grants>, Status> {
+        self.enumerate(token, repository_id, None).await
+    }
+}
+
+impl AuthClientAuthorizer {
+    /// Enumerates the caller's grants; name-derived grants come from the
+    /// blob `pinned` when given, from the current pointer otherwise.
+    async fn enumerate(
+        &self,
+        token: Option<&VerifiedToken<'_>>,
+        repository_id: RepositoryId,
+        pinned: Option<Hash>,
+    ) -> Result<Option<Grants>, Status> {
         let Some(token) = token else {
             // Nothing to enumerate for. The per-question path answers this
             // the same way it always has.
@@ -640,7 +799,10 @@ impl RepositoryAuthorizer for AuthClientAuthorizer {
         if let Some(resources) = token.claims.resources.as_deref() {
             let mut grants = grants_from_resources_claim(resources, repository_id);
             if has_name_scoped(resources)
-                && let Some(name) = self.resolve_name(repository_id).await?
+                && let Some(name) = match pinned {
+                    Some(hash) => self.resolve_name_at(repository_id, hash).await?,
+                    None => self.resolve_name(repository_id).await?,
+                }
             {
                 grants = merge_grants(grants, grants_from_name_entries(resources, &name));
             }

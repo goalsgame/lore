@@ -199,6 +199,7 @@ mod authorized_session {
     use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
 
     use super::*;
+    use crate::authnz::switchable_resolver::SwitchableResolver;
 
     const ALGORITHM: Algorithm = Algorithm::HS256;
     const SIGNING_SECRET: &str = "storage-v4-test-secret";
@@ -345,57 +346,6 @@ mod authorized_session {
         }
     }
 
-    /// Serves a switchable name and incarnation for one repository and counts
-    /// the reads.
-    struct SwitchableResolver {
-        state: std::sync::Mutex<(Option<lore_base::types::Hash>, Arc<str>)>,
-        resolves: std::sync::atomic::AtomicUsize,
-        incarnations: std::sync::atomic::AtomicUsize,
-    }
-
-    impl SwitchableResolver {
-        fn new(hash: lore_base::types::Hash, name: &str) -> Arc<Self> {
-            Arc::new(Self {
-                state: std::sync::Mutex::new((Some(hash), Arc::from(name))),
-                resolves: Default::default(),
-                incarnations: Default::default(),
-            })
-        }
-
-        fn flip(&self, hash: lore_base::types::Hash, name: &str) {
-            *self.state.lock().unwrap() = (Some(hash), Arc::from(name));
-        }
-
-        fn resolves(&self) -> usize {
-            self.resolves.load(std::sync::atomic::Ordering::SeqCst)
-        }
-
-        fn incarnations(&self) -> usize {
-            self.incarnations.load(std::sync::atomic::Ordering::SeqCst)
-        }
-    }
-
-    #[async_trait]
-    impl lore_server::authnz::repository_name_resolver::RepositoryNameResolver for SwitchableResolver {
-        async fn resolve(
-            &self,
-            _repository_id: lore_revision::lore::RepositoryId,
-        ) -> Result<Option<Arc<str>>, tonic::Status> {
-            self.resolves
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(Some(self.state.lock().unwrap().1.clone()))
-        }
-
-        async fn incarnation(
-            &self,
-            _repository_id: lore_revision::lore::RepositoryId,
-        ) -> Result<Option<lore_base::types::Hash>, tonic::Status> {
-            self.incarnations
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            Ok(self.state.lock().unwrap().0)
-        }
-    }
-
     async fn service_with_resolver(resolver: Arc<SwitchableResolver>) -> StorageServiceV4 {
         let (immutable_store, mutable_store, _execution) =
             test_store_create().await.expect("Failed to create stores");
@@ -435,9 +385,10 @@ mod authorized_session {
     /// same repository is unaffected and never reads the pointer.
     #[tokio::test]
     async fn a_recreated_repository_ends_name_scoped_access() {
-        let resolver = SwitchableResolver::new(hash_of(1), "goalables/app");
+        let resolver = SwitchableResolver::new();
         let service = service_with_resolver(resolver.clone()).await;
         let repository = random::<lore_revision::lore::RepositoryId>();
+        resolver.set(repository, hash_of(1), "goalables/app");
         let by_name = signed_token(&["urc-name:goalables/*"], &["read", "write"]);
         let by_id = signed_token(&[&format!("urc-{repository}")], &["read", "write"]);
 
@@ -450,7 +401,7 @@ mod authorized_session {
             MessageHandleError::FragmentNotFound
         ));
 
-        resolver.flip(hash_of(2), "game");
+        resolver.set(repository, hash_of(2), "game");
 
         assert!(matches!(
             serve(&service, name_session, repository).await,
@@ -467,9 +418,10 @@ mod authorized_session {
     /// and is not enumerated again until it changes once more.
     #[tokio::test]
     async fn an_unchanged_incarnation_enumerates_nothing_again() {
-        let resolver = SwitchableResolver::new(hash_of(1), "goalables/app");
+        let resolver = SwitchableResolver::new();
         let service = service_with_resolver(resolver.clone()).await;
         let repository = random::<lore_revision::lore::RepositoryId>();
+        resolver.set(repository, hash_of(1), "goalables/app");
         let token = signed_token(&["urc-name:goalables/*"], &["read", "write"]);
 
         let session = start_session(&service, repository, &token).await.unwrap();
@@ -482,7 +434,7 @@ mod authorized_session {
         }
         assert_eq!(resolver.resolves(), resolves_after_start);
 
-        resolver.flip(hash_of(2), "goalables/other");
+        resolver.set(repository, hash_of(2), "goalables/other");
         for _ in 0..3 {
             assert!(matches!(
                 serve(&service, session, repository).await,
@@ -490,6 +442,77 @@ mod authorized_session {
             ));
         }
         assert_eq!(resolver.resolves(), resolves_after_start + 1);
+    }
+
+    /// A repository that has no metadata when the session starts leaves the
+    /// session tracked at the default hash with no name grants, whatever an
+    /// unpinned lookup would answer later; the next command enumerates
+    /// against the hash it finds.
+    #[tokio::test]
+    async fn a_session_admitted_with_no_metadata_gains_name_grants_only_at_a_hash() {
+        let resolver = SwitchableResolver::new();
+        resolver.answer_unpinned("goalables/app");
+        let service = service_with_resolver(resolver.clone()).await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let token = signed_token(
+            &["urc-name:goalables/*", &format!("urc-{repository}")],
+            &["read", "write"],
+        );
+        let id_only = signed_token(&[&format!("urc-{repository}")], &["read"]);
+
+        let session = start_session(&service, repository, &token).await.unwrap();
+        {
+            let entry = service.session_map.get(session).unwrap();
+            assert_eq!(entry.incarnation, Some(lore_base::types::Hash::default()));
+            assert!(
+                entry
+                    .grants
+                    .as_ref()
+                    .is_some_and(|grants| grants.reachable())
+            );
+        }
+        let untracked = start_session(&service, repository, &id_only).await.unwrap();
+        assert_eq!(
+            service.session_map.get(untracked).unwrap().incarnation,
+            None
+        );
+
+        resolver.set(repository, hash_of(1), "goalables/app");
+        assert!(matches!(
+            serve(&service, session, repository).await,
+            MessageHandleError::FragmentNotFound
+        ));
+        assert_eq!(
+            service.session_map.get(session).unwrap().incarnation,
+            Some(hash_of(1))
+        );
+    }
+
+    /// A copy source recreated under another name is checked again for a
+    /// name-scoped token, not answered from the session's cache.
+    #[tokio::test]
+    async fn a_recreated_copy_source_is_checked_again_for_a_name_scoped_token() {
+        let resolver = SwitchableResolver::new();
+        let service = service_with_resolver(resolver.clone()).await;
+        let destination = random::<lore_revision::lore::RepositoryId>();
+        let source = random::<lore_revision::lore::RepositoryId>();
+        resolver.set(destination, hash_of(1), "goalables/destination");
+        resolver.set(source, hash_of(2), "goalables/source");
+        let token = signed_token(&["urc-name:goalables/*"], &["read", "write"]);
+
+        let session = start_session(&service, destination, &token).await.unwrap();
+        for _ in 0..2 {
+            assert!(matches!(
+                serve(&service, session, source).await,
+                MessageHandleError::FragmentNotFound
+            ));
+        }
+
+        resolver.set(source, hash_of(3), "game");
+        assert!(matches!(
+            serve(&service, session, source).await,
+            MessageHandleError::AuthorizationFailure(_)
+        ));
     }
 
     /// One connection, two sessions with different credentials: the

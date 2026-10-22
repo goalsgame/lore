@@ -32,6 +32,8 @@ use tracing::info_span;
 
 use super::log_and_code;
 use super::record_latency;
+use crate::authnz::repository_authorizer::IncarnationGuard;
+use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_repository;
 use crate::grpc::get_user_id;
@@ -108,27 +110,61 @@ async fn put_item(
 pub async fn handler(
     request: Request<Streaming<storage_v1::PutRequest>>,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    authorizer: Arc<dyn RepositoryAuthorizer>,
     instrument_provider: &impl InstrumentProvider,
 ) -> Result<Response<PutResponseStream>, Status> {
     let repository = get_repository(request.metadata())?;
     let user_id = get_user_id(request.extensions());
     let correlation_id = extract_correlation_id(&request).unwrap_or_default();
+    let guard = IncarnationGuard::from_extensions(authorizer, request.extensions(), repository);
 
-    let mut stream = request.into_inner();
-
-    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
-
-    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
-
+    let stream = request.into_inner();
     let histogram = Arc::new(
         instrument_provider.latency_histogram_ms(METRICS_STREAMING_MESSAGE_HANDLER_LATENCY),
     );
 
+    Ok(Response::new(
+        serve(
+            stream,
+            repository,
+            correlation_id,
+            user_id,
+            immutable_store,
+            guard,
+            histogram,
+        )
+        .await,
+    ))
+}
+
+/// Processes the request stream item by item, checking `guard` before each.
+#[lore_macro::test_pub]
+async fn serve<S>(
+    mut stream: S,
+    repository: RepositoryId,
+    correlation_id: String,
+    user_id: String,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mut guard: Option<IncarnationGuard>,
+    histogram: Arc<opentelemetry::metrics::Histogram<f64>>,
+) -> PutResponseStream
+where
+    S: Stream<Item = Result<storage_v1::PutRequest, Status>> + Unpin + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel(super::STREAM_PROCESS_LIMIT);
+
+    let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
     LORE_CONTEXT
         .scope(execution, async move {
             lore_spawn!(async move {
                 let task_limiter = Arc::new(Semaphore::new(super::STREAM_PROCESS_LIMIT));
                 while let Some(req) = stream.next().await {
+                    if let Some(guard) = guard.as_mut()
+                        && let Err(status) = guard.check().await
+                    {
+                        let _ = tx.send(Err(status)).await;
+                        break;
+                    }
                     let permit = match Arc::clone(&task_limiter).acquire_owned().await {
                         Ok(p) => p,
                         Err(error) => {
@@ -179,5 +215,5 @@ pub async fn handler(
         .await;
 
     let recv_stream = ReceiverStream::from(rx);
-    Ok(Response::new(Box::pin(recv_stream) as PutResponseStream))
+    Box::pin(recv_stream)
 }

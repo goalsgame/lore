@@ -20,7 +20,9 @@ use tonic::Status;
 use tracing::debug;
 use tracing::instrument;
 
+use crate::authnz::repository_authorizer::IncarnationGuard;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
+use crate::authnz::repository_authorizer::token_is_name_scoped;
 use crate::grpc::access_failure_status;
 use crate::grpc::authorization_timeout_status;
 use crate::grpc::get_user_id;
@@ -80,14 +82,33 @@ impl lore_notification::NotificationService for NotificationService {
         // in the body need custom verification logic. A denial is folded
         // into the boolean inside the bound, so elapsing is the only other
         // thing the check reports.
-        tokio::time::timeout(self.authorization_timeout, async {
-            self.authorizer
-                .check_repository_access(get_verified_token(&extensions).as_ref(), repository, None)
-                .await
+        let verified = get_verified_token(&extensions);
+        let incarnation = tokio::time::timeout(self.authorization_timeout, async {
+            match verified
+                .as_ref()
+                .filter(|token| token_is_name_scoped(token))
+            {
+                Some(token) => self
+                    .authorizer
+                    .granted_access_tracked(Some(token), repository)
+                    .await
+                    .map(|regranted| regranted.incarnation),
+                None => self
+                    .authorizer
+                    .check_repository_access(verified.as_ref(), repository, None)
+                    .await
+                    .map_err(access_failure_status)
+                    .map(|()| None),
+            }
         })
         .await
-        .map_err(|_elapsed| authorization_timeout_status())?
-        .map_err(access_failure_status)?;
+        .map_err(|_elapsed| authorization_timeout_status())??;
+        let guard = IncarnationGuard::new(
+            self.authorizer.clone(),
+            verified.as_ref(),
+            repository,
+            incarnation,
+        );
 
         let rx = self.sender.register(repository);
 
@@ -97,13 +118,28 @@ impl lore_notification::NotificationService for NotificationService {
             "User subscribed to notifications"
         );
 
-        let stream = BroadcastStream::new(rx).filter_map(|res| {
-            match res {
-                Ok(item) => Some(Ok(item)),
-                // Ignore if client is lagging behind, just drop the event
-                Err(BroadcastStreamRecvError::Lagged(_)) => None,
-            }
-        });
+        let stream = futures::stream::unfold(
+            (BroadcastStream::new(rx), guard, false),
+            |(mut events, mut guard, ended)| async move {
+                if ended {
+                    return None;
+                }
+                loop {
+                    match events.next().await? {
+                        Ok(event) => {
+                            if let Some(guard) = guard.as_mut()
+                                && let Err(status) = guard.check().await
+                            {
+                                return Some((Err(status), (events, None, true)));
+                            }
+                            return Some((Ok(event), (events, guard, false)));
+                        }
+                        // Ignore if client is lagging behind, just drop the event
+                        Err(BroadcastStreamRecvError::Lagged(_)) => {}
+                    }
+                }
+            },
+        );
 
         Ok(Response::new(Box::pin(stream) as Self::SubscribeStream))
     }
