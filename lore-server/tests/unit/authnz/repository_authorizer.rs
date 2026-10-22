@@ -658,3 +658,72 @@ fn selection_display_names_the_implementation() {
         "ResourceGrantsAuthorizer"
     );
 }
+
+mod authorize_create {
+    use lore_server::auth::jwt::ResourcePermission as ClaimEntry;
+
+    use super::*;
+
+    fn claims(resources: Option<Vec<(&str, &[&str])>>) -> AuthorizationToken {
+        AuthorizationToken {
+            resources: resources.map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|(resource_id, permissions)| ClaimEntry {
+                        resource_id: resource_id.to_string(),
+                        permission: permissions.iter().map(ToString::to_string).collect(),
+                    })
+                    .collect()
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn check(claims: &AuthorizationToken, name: &str) -> Result<(), Status> {
+        let token = VerifiedToken { raw: "raw", claims };
+        authorize_repository_create(Some(&token), name)
+    }
+
+    #[test]
+    fn no_token_or_no_resources_claim_is_not_restricted() {
+        authorize_repository_create(None, "game").unwrap();
+        check(&claims(None), "game").unwrap();
+    }
+
+    #[test]
+    fn token_without_name_entries_is_not_restricted() {
+        let claims = claims(Some(vec![("urc-*", &["read"])]));
+        check(&claims, "game").unwrap();
+    }
+
+    #[test]
+    fn scoped_token_creates_matching_names_only() {
+        let claims = claims(Some(vec![
+            ("urc-*", &["read"]),
+            ("urc-name:goalables/*", &["create"]),
+        ]));
+        check(&claims, "goalables/app").unwrap();
+        for name in ["game", "goalables/a/b", "goalables", "goalables2/app"] {
+            let err = check(&claims, name).expect_err(name);
+            assert_eq!(err.code(), Code::PermissionDenied, "{name}");
+        }
+    }
+
+    #[test]
+    fn missing_create_permission_denies() {
+        let claims = claims(Some(vec![("urc-name:goalables/*", &["read", "push"])]));
+        let err = check(&claims, "goalables/app").expect_err("no create");
+        assert_eq!(err.code(), Code::PermissionDenied);
+    }
+
+    #[test]
+    fn multiple_patterns() {
+        let claims = claims(Some(vec![
+            ("urc-name:goalables/*", &["create"]),
+            ("urc-name:tools/**", &["create"]),
+        ]));
+        check(&claims, "goalables/app").unwrap();
+        check(&claims, "tools/a/b").unwrap();
+        assert!(check(&claims, "game").is_err());
+    }
+}

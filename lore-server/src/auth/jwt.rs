@@ -41,11 +41,56 @@ impl ResourcePermission {
 pub const DEFAULT_RESOURCE_ID_TEMPLATE: &str = "urc-{id}";
 /// The legacy wildcard, the `resource_wildcard` setting's default.
 pub const DEFAULT_RESOURCE_WILDCARD: &str = "urc-*";
+/// Prefix of a `resources` entry that scopes repository creation by name:
+/// `urc-name:<glob>`.
+pub const NAME_RESOURCE_PREFIX: &str = "urc-name:";
 /// The claim an issuer puts the user identity in when `sub` is not it.
 pub const IDENTITY_CLAIM: &str = "identity";
 /// The namespaced alias of [`IDENTITY_CLAIM`], for providers that require
 /// namespaced custom claims.
 pub const IDENTITY_CLAIM_NAMESPACED: &str = "https://lore.org/claims/identity";
+
+/// Whether `name` matches the `/`-segmented `pattern`.
+///
+/// A literal segment matches itself, `*` matches exactly one segment, and a
+/// trailing `**` matches one or more remaining segments. A pattern with an
+/// empty, `..` or dot-leading segment, or with `**` anywhere but last, never
+/// matches; neither does a name with an empty or dot-leading segment.
+pub fn glob_matches_name(pattern: &str, name: &str) -> bool {
+    let valid = |segment: &str| !segment.is_empty() && !segment.starts_with('.');
+    let pattern_segments: Vec<&str> = pattern.split('/').collect();
+    let name_segments: Vec<&str> = name.split('/').collect();
+    if !pattern_segments.iter().all(|s| valid(s)) || !name_segments.iter().all(|s| valid(s)) {
+        return false;
+    }
+    let last = pattern_segments.len() - 1;
+    if pattern_segments[..last].contains(&"**") {
+        return false;
+    }
+    if pattern_segments[last] == "**" {
+        return name_segments.len() > last
+            && pattern_segments[..last]
+                .iter()
+                .zip(&name_segments)
+                .all(|(p, n)| *p == "*" || p == n);
+    }
+    pattern_segments.len() == name_segments.len()
+        && pattern_segments
+            .iter()
+            .zip(&name_segments)
+            .all(|(p, n)| *p == "*" || p == n)
+}
+
+/// The outcome of checking a repository name against name-scoped grants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameVerdict {
+    /// No `urc-name:` entry exists; name scoping does not apply.
+    Unscoped,
+    /// An entry matching the name grants the action.
+    Allowed,
+    /// Name-scoped entries exist and none matching the name grants the action.
+    Denied,
+}
 
 /// Renders repository ids into resource names and matches grant entries
 /// against them. The defaults reproduce the legacy `UrcAuthApi` shape for
@@ -105,6 +150,25 @@ impl ResourceMatcher {
             .iter()
             .filter(|entry| entry.matches_resource(&resource_id, &self.resource_wildcard))
             .any(|entry| entry.permission.iter().any(|granted| granted == action))
+    }
+
+    /// Whether the token may create a repository called `name`.
+    pub fn create_by_name(&self, resources: &[ResourcePermission], name: &str) -> NameVerdict {
+        let mut scoped = false;
+        for entry in resources {
+            let Some(pattern) = entry.resource_id.strip_prefix(NAME_RESOURCE_PREFIX) else {
+                continue;
+            };
+            scoped = true;
+            if glob_matches_name(pattern, name) && entry.permission.iter().any(|p| p == "create") {
+                return NameVerdict::Allowed;
+            }
+        }
+        if scoped {
+            NameVerdict::Denied
+        } else {
+            NameVerdict::Unscoped
+        }
     }
 
     /// The actions granted on `repository`, merged across every matching
