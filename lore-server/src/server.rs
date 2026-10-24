@@ -2130,12 +2130,25 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         settings.server.auth.as_ref(),
         auth_url.clone(),
     )?;
+    let user_url = settings
+        .environment
+        .as_ref()
+        .and_then(|environment| environment.endpoint.as_ref())
+        .and_then(|endpoint| endpoint.user_url.as_deref());
     let repository_catalog = crate::authnz::repository_catalog::repository_catalog(
         settings.server.auth.as_ref(),
         auth_url.as_deref(),
+        user_url,
         immutable_store.clone(),
         mutable_store.clone(),
     )?;
+    info!(
+        "Repository registry: {}",
+        crate::authnz::repository_registry::RepositoryRegistry::select(
+            auth_url.as_deref(),
+            user_url
+        )
+    );
 
     let forwarded_requests: Option<Arc<dyn ForwardedRequests>> =
         if let Some(forwarded_requests_settings) =

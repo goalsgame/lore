@@ -7369,7 +7369,7 @@ pub fn file_modified_against_node<'a>(
 #[must_use]
 #[lore_macro::test_pub]
 pub struct RecordedModifiedTimes {
-    entries: Box<crossbeam::queue::SegQueue<(Hash, u64)>>,
+    entries: Box<crossbeam_queue::SegQueue<(Hash, u64)>>,
     /// Times at or after this are not collected.
     floor: u64,
 }
@@ -7577,9 +7577,9 @@ pub async fn wait_until_settled(repository: &RepositoryContext, mtime_max: u64) 
         return;
     };
     let _ = tokio::time::timeout(MODIFIED_TIME_SETTLE_LIMIT, async {
-        while !stamp_probe(&path)
+        while stamp_probe(&path)
             .await
-            .is_some_and(|stamp| mtime_max < stamp)
+            .is_none_or(|stamp| mtime_max >= stamp)
         {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }

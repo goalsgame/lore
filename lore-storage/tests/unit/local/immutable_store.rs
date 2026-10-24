@@ -4147,6 +4147,51 @@ async fn a_compaction_claims_to_write_on_its_own_past_another_span() {
     );
 }
 
+/// **A compaction measures the store on its own claims.** A pass measures the packstores as it
+/// starts, under its claim to read, and as a step ends, under its claim to write, never on the
+/// cover of a span of whatever use of the store is under way, which can end while it measures. A
+/// measurement the span covered is counted as one, and fails test builds where the span ends
+/// between the check and the count.
+#[tokio::test]
+async fn a_compaction_measures_the_store_on_its_own_claims_past_another_span() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_compact_measure_");
+    let partition = Partition::from([0x33u8; 16]);
+    let (_, payloads) = payloads_in_one_group(4);
+    let store = store_for_rewrite(&dir, partition, &payloads, 2).await;
+    let lock = store.lock.clone().expect("a disk-backed store has a lock");
+
+    let span = ImmutableStore::hold_for_command(store.clone())
+        .await
+        .unwrap();
+    let measures = [
+        pause_at(PausePoint::Measuring),
+        pause_at(PausePoint::Measuring),
+    ];
+    let compacting = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.compact(1, None, false, None).await })
+    };
+    for (measure, when) in measures
+        .iter()
+        .zip(["as the pass starts", "as the step ends"])
+    {
+        tokio::time::timeout(Duration::from_secs(5), measure.reached.notified())
+            .await
+            .unwrap_or_else(|_| panic!("the pass measures the store {when}"));
+        assert_eq!(
+            lock.shared.covered.load(atomic::Ordering::Relaxed),
+            0,
+            "the pass measures the store {when} on its own claim, counted on no span"
+        );
+        measure.resume.notify_one();
+    }
+    let next = compacting.await.expect("the pass ends").expect("compacts");
+    assert!(next.is_some(), "the step left groups for the next one");
+    drop(span);
+}
+
 /// **A healing verify releases the store.** Its flush runs inside the pass's own
 /// write claim, so the pass itself has to release what that claim marked.
 #[tokio::test]
@@ -4166,6 +4211,127 @@ async fn a_healing_verify_releases_the_store() {
     assert!(
         !lock.is_held(),
         "a verify that healed nothing leaves nothing claimed"
+    );
+}
+
+/// **A verify heals a payload a fan-out would move out of its walk.** It walks a group under the
+/// group's flush lock, so a flush fanning the group out waits for the walk, which reads one
+/// layout and finds every entry of the group at it.
+#[tokio::test]
+async fn a_verify_heals_a_corrupt_payload_a_fan_out_would_move_out_of_its_walk() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_fan_out_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            fan_out_threshold: 4,
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .expect("store opens");
+    let partition = Partition::from([3u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(6);
+    let mut addresses = vec![];
+    for payload in &payloads[..4] {
+        addresses.push(put_payload(&store, partition, Context::default(), payload, false).await);
+    }
+    ImmutableStore::flush(store.clone(), false)
+        .await
+        .expect("flush at level 1");
+    let corrupt = *addresses
+        .iter()
+        .find(|address| lore_storage::local::fan_out::bucket_index_for(&address.hash, 32) != 0)
+        .expect("a payload a fan-out to 32 buckets moves out of bucket 0");
+    let found = store
+        .clone()
+        .find(partition, corrupt, Lookup::Read)
+        .await
+        .expect("the entry is there to corrupt");
+    store.group[group_index]
+        .packstore
+        .obliterate(
+            found.data.pack_file,
+            found.data.pack_offset,
+            found.data.size_payload,
+        )
+        .await
+        .expect("overwrite the payload");
+    for payload in &payloads[4..] {
+        put_payload(&store, partition, Context::default(), payload, false).await;
+    }
+
+    let checking: Vec<_> = (0..=group_index)
+        .map(|_| pause_at(PausePoint::Checking))
+        .collect();
+    let verifying = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { store.verify(true).await })
+    };
+    for pause in &checking[..group_index] {
+        pause.reached.notified().await;
+        pause.resume.notify_one();
+    }
+    checking[group_index].reached.notified().await;
+    let mut flushing = {
+        let store = store.clone();
+        lore_base::lore_spawn!(async move { ImmutableStore::flush(store, false).await })
+    };
+    let flushed_meanwhile = tokio::time::timeout(Duration::from_millis(100), &mut flushing)
+        .await
+        .is_ok();
+    checking[group_index].resume.notify_one();
+    verifying.await.expect("the verify ends").expect("verifies");
+    let resolved = lore_storage::immutable_store::query_one(
+        &(store.clone() as Arc<dyn ImmutableStore>),
+        partition,
+        corrupt,
+    )
+    .await
+    .expect("query answers");
+    assert_eq!(
+        resolved.match_made,
+        StoreMatch::MatchNone,
+        "the verify healed the payload that no longer verifies"
+    );
+    assert!(!flushed_meanwhile, "the flush waits for the walk");
+    flushing.await.expect("the flush ends").expect("flush");
+    assert!(
+        store.group[group_index]
+            .bucket_count
+            .load(atomic::Ordering::Relaxed)
+            > 1,
+        "the group fanned out once the walk ended"
+    );
+}
+
+/// **A verify fails when a bucket cannot be loaded**, rather than passing over the entries the
+/// bucket holds.
+#[tokio::test]
+async fn a_verify_fails_when_a_bucket_cannot_be_loaded() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_unloaded_");
+    let partition = Partition::from([3u8; 16]);
+    let (group_index, payloads) = payloads_in_one_group(1);
+    {
+        let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), quiet_settings())
+            .await
+            .expect("store opens");
+        put_payload(&store, partition, Context::default(), &payloads[0], false).await;
+        ImmutableStore::flush(store.clone(), false)
+            .await
+            .expect("flush");
+    }
+    let store = LocalImmutableStore::new(Some(dir.path().to_path_buf()), quiet_settings())
+        .await
+        .expect("store reopens");
+    block_bucket_file(&store, group_index, 0);
+    assert!(
+        store.verify(false).await.is_err(),
+        "a verify that could not load a bucket passed"
     );
 }
 
@@ -8842,6 +9008,50 @@ async fn a_verified_store_holds_the_payload_gate_while_it_loads_the_payload() {
     })
     .await;
     assert_payloads_read_back(&store, partition, [(address, payloads[0].clone())]).await;
+}
+
+/// **A verified store succeeds once an eviction took what it stored.** A store verifying its
+/// writes finds its entry again once it is in and reads the payload back, and an eviction may take
+/// the entry in between, as it takes any it ranks: the store stored what it was given, and nothing
+/// of it is left to verify.
+#[tokio::test]
+async fn a_verified_store_succeeds_once_an_eviction_took_what_it_stored() {
+    use lore_storage::immutable_store::ImmutableStore;
+
+    let dir = lore_base::test_util::TempDir::new("is_verify_write_evicted_");
+    let store = LocalImmutableStore::new(
+        Some(dir.to_path_buf()),
+        ImmutableStoreSettings {
+            verify_write: true,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let partition = Partition::from([0x3du8; 16]);
+    let (_, payloads) = payloads_in_one_group(1);
+
+    let verifying = pause_at(PausePoint::Verifying);
+    let storing = {
+        let store = store.clone();
+        let payload = payloads[0].clone();
+        lore_base::lore_spawn!(async move {
+            try_put_payload(&store, partition, Context::default(), &payload, true, false).await
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), verifying.reached.notified())
+        .await
+        .expect("the store verifies what it wrote");
+    let evicted = store.clone().evict(1, false, None).await.unwrap();
+    assert_eq!(
+        evicted, 1,
+        "the eviction takes the durable entry the store put in"
+    );
+    verifying.resume.notify_one();
+    storing
+        .await
+        .expect("the store ends")
+        .expect("a store whose entry an eviction took succeeds");
 }
 
 /// Stores of one new hash in flight together each write the payload. Every entry takes the
