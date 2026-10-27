@@ -491,6 +491,16 @@ async fn side_at(
     Ok(Some(absent.from_child(link.node, &node, path.clone())))
 }
 
+/// Refuse unsupported revision and merge commands before they change metadata.
+pub(crate) fn require_revision_replacement(
+    repository: &RepositoryContext,
+) -> Result<(), InvalidArguments> {
+    if !repository.file_system().supports_revision_replacement() {
+        return Err(InvalidArguments { reason: "Revision replacement and merge-state operations are not supported by this filesystem provider".into() });
+    }
+    Ok(())
+}
+
 /// The refusal of what a provider holding whole revisions cannot do, `what` phrased as a verb.
 #[lore_macro::test_pub]
 pub(crate) fn refused(what: &str) -> InvalidArguments {

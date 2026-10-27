@@ -329,3 +329,136 @@ async fn guarded_task_completes() {
     runtime_flush_guarded().await;
     assert!(completed.load(Ordering::Acquire));
 }
+
+#[test]
+fn io_ownership_propagates_without_replacing_command_context() {
+    use lore_io::lease::IoLease;
+    let lease = IoLease::new(Arc::new(()));
+    let expected = lease.clone();
+    let context: Arc<dyn Any + Send + Sync> = Arc::new("io-owner");
+    net_runtime().block_on(LORE_CONTEXT.scope(
+        context,
+        lease.scope(async move {
+            let task = lore_base::lore_spawn!({
+                let expected = expected.clone();
+                async move {
+                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
+                    assert_eq!(context_label(), Some("io-owner"));
+                }
+            });
+            let core = lore_base::lore_spawn_core!({
+                let expected = expected.clone();
+                async move {
+                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
+                    assert_eq!(context_label(), Some("io-owner"));
+                }
+            });
+            let net = lore_base::lore_spawn_net!({
+                let expected = expected.clone();
+                async move {
+                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
+                    assert_eq!(context_label(), Some("io-owner"));
+                }
+            });
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            runtime_spawn_guarded({
+                let expected = expected.clone();
+                async move {
+                    sender
+                        .send(
+                            IoLease::current().unwrap().ptr_eq(&expected)
+                                && try_lore_context().is_none(),
+                        )
+                        .unwrap();
+                }
+            });
+            let blocking = lore_base::lore_spawn_blocking!({
+                let expected = expected.clone();
+                move || {
+                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
+                    assert_eq!(context_label(), Some("io-owner"));
+                }
+            });
+            let plain = lore_base::lore_spawn_blocking_nocontext!({
+                let expected = expected.clone();
+                move || {
+                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
+                    assert!(try_lore_context().is_none());
+                }
+            });
+            task.await.unwrap();
+            core.await.unwrap();
+            blocking.await.unwrap();
+            plain.await.unwrap();
+            net.await.unwrap();
+            assert!(receiver.await.unwrap());
+        }),
+    ));
+    assert!(IoLease::current().is_none());
+}
+
+#[test]
+fn detached_connection_task_clears_ambient_ownership_and_does_not_pin_caller() {
+    use std::future::Future;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Waker;
+
+    use lore_io::lease::IoLease;
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let lease = IoLease::new(owner);
+    let mut detached = Box::pin(lease.sync_scope(|| {
+        detached_task(std::future::poll_fn(|_context| {
+            assert!(IoLease::current().is_none());
+            Poll::<()>::Pending
+        }))
+    }));
+    drop(lease);
+    assert!(
+        weak.upgrade().is_none(),
+        "connection task must not retain scoped caller"
+    );
+    let unrelated = IoLease::new(Arc::new(()));
+    unrelated.sync_scope(|| {
+        assert!(
+            detached
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        );
+        assert!(IoLease::current().unwrap().ptr_eq(&unrelated));
+    });
+    let mut ordinary = Box::pin(spawned_task(std::future::poll_fn(|_context| {
+        assert!(IoLease::current().is_none());
+        Poll::Ready(())
+    })));
+    unrelated.sync_scope(|| {
+        assert!(
+            ordinary
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_ready()
+        );
+    });
+}
+
+#[test]
+fn bounded_shutdown_wait_keeps_io_scope_across_runtime_thread_handoff() {
+    use lore_io::lease::IoLease;
+    let lease = IoLease::new(Arc::new(()));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let expected = lease.clone();
+        assert!(lease.sync_scope(|| shutdown_block_on(
+            async move {
+                assert!(IoLease::current().unwrap().ptr_eq(&expected));
+            },
+            Duration::from_secs(10)
+        )));
+        assert!(IoLease::current().is_none());
+    });
+}

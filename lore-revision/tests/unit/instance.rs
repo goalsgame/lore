@@ -3,6 +3,8 @@
 // Fixtures write external `.lore` configs directly; what these test is how staleness reads them.
 #![allow(clippy::disallowed_methods)]
 
+mod strict_anchors;
+
 use lore_revision::instance::*;
 use lore_revision::repository::SALT_LORE;
 use lore_storage::store_types::KeyType;

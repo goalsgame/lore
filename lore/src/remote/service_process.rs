@@ -603,6 +603,10 @@ struct StopState {
     /// until it ends. A stop asked for in that window is kept for the service
     /// to find once it is serving, rather than lost.
     starting: bool,
+    #[cfg(unix)]
+    token: Option<Arc<()>>,
+    #[cfg(unix)]
+    owner: Option<std::sync::Weak<crate::service::owner::ServiceOwner>>,
 }
 
 /// The stop request for a service running in this process.
@@ -625,6 +629,19 @@ impl StopRequest {
         self.state.lock()
     }
 
+    #[cfg(any(unix, feature = "test-util"))]
+    #[lore_macro::test_pub]
+    fn bound_stop_request(self: &Arc<Self>) -> Option<ServiceStopRequest> {
+        let state = self.state();
+        if !state.starting {
+            return None;
+        }
+        Some(ServiceStopRequest {
+            request: self.clone(),
+            #[cfg(unix)]
+            token: state.token.clone()?,
+        })
+    }
     /// Claims the start for the caller, answering `false` when a service already
     /// starts or runs. Clearing the stop asked of an earlier service happens in
     /// the same step as publishing the start, so a stop that sees the start
@@ -637,17 +654,31 @@ impl StopRequest {
         }
         state.requested = false;
         state.starting = true;
+        #[cfg(unix)]
+        {
+            state.token = Some(Arc::new(()));
+            state.owner = None;
+        }
         true
     }
 
     /// Ends the service that holds the start.
+    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn end_service(&self) {
         let mut state = self.state();
         state.running = false;
         state.starting = false;
+        #[cfg(unix)]
+        {
+            state.token = None;
+            state.owner = None;
+            drop(state);
+            self.notify.notify_waiters();
+        }
     }
 
+    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn set_running(&self) {
         self.state().running = true;
@@ -658,6 +689,7 @@ impl StopRequest {
         self.state().running
     }
 
+    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn is_requested(&self) -> bool {
         self.state().requested
@@ -666,6 +698,7 @@ impl StopRequest {
     /// Asks the service to stop, and reports whether there was one, starting or
     /// running, to ask. The request is stored before the wait is woken, so a wait
     /// that reads it afterwards sees the request either way.
+    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn request_stop(&self) -> bool {
         {
@@ -686,17 +719,79 @@ static STOP_REQUEST: OnceLock<Arc<StopRequest>> = OnceLock::new();
 
 /// The stop request the process running the service waits on.
 #[lore_macro::test_pub]
+#[derive(Clone)]
 pub struct ServiceStopRequest {
     request: Arc<StopRequest>,
+    #[cfg(unix)]
+    token: Arc<()>,
 }
 
 impl ServiceStopRequest {
     /// Resolves once a stop has been requested, including one requested before
     /// the wait began.
     pub async fn requested(&self) {
+        #[cfg(not(unix))]
         while !self.request.is_requested() {
             self.request.notify.notified().await;
         }
+        #[cfg(unix)]
+        loop {
+            let changed = self.request.notify.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.requested_or_ended() {
+                return;
+            }
+            changed.await;
+        }
+    }
+    #[cfg(unix)]
+    fn requested_or_ended(&self) -> bool {
+        let state = self.request.state();
+        state
+            .token
+            .as_ref()
+            .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
+            || state.requested
+            || !state.starting
+    }
+    #[cfg(unix)]
+    #[lore_macro::test_pub]
+    pub(crate) fn is_current(&self) -> bool {
+        let state = self.request.state();
+        state.starting
+            && state
+                .token
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+    }
+    #[cfg(unix)]
+    pub(crate) fn is_running(&self) -> bool {
+        let state = self.request.state();
+        state.running
+            && state
+                .token
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+    }
+    /// Request only the captured Unix run; an old command cannot stop its successor.
+    #[cfg(unix)]
+    #[lore_macro::test_pub]
+    pub(crate) fn request_stop(&self) -> bool {
+        {
+            let mut state = self.request.state();
+            if !state.starting
+                || state
+                    .token
+                    .as_ref()
+                    .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
+            {
+                return false;
+            }
+            state.requested = true;
+        }
+        self.request.notify.notify_waiters();
+        true
     }
 }
 
@@ -708,6 +803,8 @@ fn stop_request() -> &'static Arc<StopRequest> {
 /// it ends. Dropping it makes the process one that runs no service.
 pub struct ServiceStartGuard {
     request: Arc<StopRequest>,
+    #[cfg(unix)]
+    token: Arc<()>,
 }
 
 impl ServiceStartGuard {
@@ -715,13 +812,54 @@ impl ServiceStartGuard {
     pub fn stop_request(&self) -> ServiceStopRequest {
         ServiceStopRequest {
             request: Arc::clone(&self.request),
+            #[cfg(unix)]
+            token: self.token.clone(),
         }
+    }
+    #[cfg(unix)]
+    #[lore_macro::test_pub]
+    pub(crate) fn bind_owner(&self, owner: &Arc<crate::service::owner::ServiceOwner>) -> bool {
+        let mut state = self.request.state();
+        if state
+            .token
+            .as_ref()
+            .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
+            || state
+                .owner
+                .as_ref()
+                .and_then(std::sync::Weak::upgrade)
+                .is_some()
+        {
+            return false;
+        }
+        if !owner.bind_stop(self.stop_request()) {
+            return false;
+        }
+        state.owner = Some(Arc::downgrade(owner));
+        true
     }
 }
 
 impl Drop for ServiceStartGuard {
     fn drop(&mut self) {
+        #[cfg(not(unix))]
         self.request.end_service();
+        #[cfg(unix)]
+        {
+            let mut state = self.request.state();
+            if state
+                .token
+                .as_ref()
+                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
+            {
+                state.running = false;
+                state.starting = false;
+                state.token = None;
+                state.owner = None;
+            }
+            drop(state);
+            self.request.notify.notify_waiters();
+        }
     }
 }
 
@@ -733,10 +871,57 @@ impl Drop for ServiceStartGuard {
 /// socket and mounting is not lost. Clears any stop asked for an earlier service,
 /// so that a service started after one has stopped is not stopped on arrival.
 pub fn begin_service_start() -> Option<ServiceStartGuard> {
+    #[cfg(unix)]
+    {
+        crate::service::shutdown::with_start_admission(begin_service_start_unchecked)
+            .ok()
+            .flatten()
+    }
+    #[cfg(not(unix))]
+    begin_service_start_unchecked()
+}
+
+pub(crate) fn begin_service_start_unchecked() -> Option<ServiceStartGuard> {
     let request = Arc::clone(stop_request());
     // Built only on success: a guard made for a refused start would clear the state
     // of the service that holds it when dropped.
-    request.begin_start().then(|| ServiceStartGuard { request })
+    begin_service_start_for(request)
+}
+
+#[lore_macro::test_pub]
+fn begin_service_start_for(request: Arc<StopRequest>) -> Option<ServiceStartGuard> {
+    request.begin_start().then(|| {
+        #[cfg(unix)]
+        let token = request
+            .state()
+            .token
+            .clone()
+            .expect("a successful start owns a run token");
+        ServiceStartGuard {
+            request,
+            #[cfg(unix)]
+            token,
+        }
+    })
+}
+#[cfg(unix)]
+#[lore_macro::test_pub]
+fn owner_for(request: &StopRequest) -> Option<Arc<crate::service::owner::ServiceOwner>> {
+    let state = request.state();
+    if !state.starting {
+        return None;
+    }
+    state.owner.as_ref().and_then(std::sync::Weak::upgrade)
+}
+#[cfg(unix)]
+#[lore_macro::test_pub]
+pub(crate) fn current_service_owner() -> Option<Arc<crate::service::owner::ServiceOwner>> {
+    owner_for(STOP_REQUEST.get()?.as_ref())
+}
+#[cfg(unix)]
+#[lore_macro::test_pub]
+pub(crate) fn current_stop_request() -> Option<ServiceStopRequest> {
+    STOP_REQUEST.get()?.bound_stop_request()
 }
 
 /// Records that this process runs the service, which is what makes a stop act on
@@ -744,7 +929,19 @@ pub fn begin_service_start() -> Option<ServiceStartGuard> {
 /// bound, so that a process which lost it never claims to be the service for the
 /// moments before it exits.
 pub fn register_service_process(guard: &ServiceStartGuard) {
+    #[cfg(not(unix))]
     guard.request.set_running();
+    #[cfg(unix)]
+    {
+        let mut state = guard.request.state();
+        if state
+            .token
+            .as_ref()
+            .is_some_and(|token| Arc::ptr_eq(token, &guard.token))
+        {
+            state.running = true;
+        }
+    }
 }
 
 /// Whether the service runs in this process, which is what makes a stop act on
@@ -758,6 +955,7 @@ pub(crate) fn service_runs_in_this_process() -> bool {
 
 /// Asks the service running in this process to stop, and reports whether there
 /// was one to ask. This is the one path to a stop for both `stop` and `quit`.
+#[cfg(any(not(unix), feature = "test-util"))]
 #[lore_macro::test_pub]
 pub(crate) fn request_service_stop() -> bool {
     STOP_REQUEST

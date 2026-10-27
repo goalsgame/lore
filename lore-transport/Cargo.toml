@@ -11,6 +11,7 @@ test = false
 [dependencies]
 lore-base = { workspace = true }
 lore-error-set = { workspace = true }
+lore-io = { workspace = true }
 lore-proto = { workspace = true }
 lore-credential = { workspace = true }
 

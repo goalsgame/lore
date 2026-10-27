@@ -6,6 +6,7 @@ use futures::StreamExt;
 use lore_base::fs::lock::FSLock;
 use lore_base::types::BranchPoint;
 pub mod clone;
+mod command_stores;
 pub mod create;
 pub mod delete;
 pub mod dump;
@@ -15,6 +16,11 @@ pub mod prefetch;
 pub mod status;
 pub mod store;
 pub mod verify;
+pub mod working_bootstrap;
+mod working_filter;
+mod working_handoff;
+mod working_load;
+pub use working_handoff::WorkingCommandHandoff;
 mod write_token;
 
 use std::collections::HashMap;
@@ -212,6 +218,11 @@ impl RepositoryConfig {
             .as_ref()
             .is_some_and(|vfs_config| vfs_config.vfs_type.is_swfs())
     }
+    pub fn is_experimental_working(&self) -> bool {
+        self.vfs
+            .as_ref()
+            .is_some_and(|config| config.vfs_type.is_experimental_working())
+    }
 }
 
 #[derive(Serialize, Deserialize, Default, Debug, Clone)]
@@ -268,11 +279,16 @@ pub enum VfsType {
     #[default]
     None,
     Swfs,
+    /// Explicit service-owned experimental working namespace. No OS fallback.
+    ExperimentalWorking,
 }
 
 impl VfsType {
     pub fn is_swfs(&self) -> bool {
         matches!(self, VfsType::Swfs)
+    }
+    pub fn is_experimental_working(&self) -> bool {
+        matches!(self, VfsType::ExperimentalWorking)
     }
 }
 
@@ -616,6 +632,7 @@ pub struct RepositoryContext {
     root_id: RepositoryId,
     pub instance_id: crate::instance::InstanceId,
     remote: Arc<tokio::sync::RwLock<RemoteState>>,
+    owner_remote: Option<Arc<crate::protocol::RemoteConnections>>,
     pub filter: Arc<Filter>,
     /// Defaults to allowing every repository; server handlers replace it with
     /// the requester's authorization.
@@ -624,6 +641,8 @@ pub struct RepositoryContext {
     /// How this context was mounted, or `None` where it stands on its own.
     mount: Option<MountKind>,
     write_token: Option<RepositoryWriteToken>,
+    working_admission: Option<Arc<crate::fs::provider_registry::BoundLoad>>,
+    working_resources: Option<Arc<working_handoff::WorkingResources>>,
     repo_lock: Option<Arc<RepositoryLock>>,
     /// Store claims this context holds that [`Self::repo_lock`]'s holder does not.
     ///
@@ -730,10 +749,13 @@ impl RepositoryContext {
             root_id: id,
             instance_id,
             remote: remote_arc(remote),
+            owner_remote: None,
             filter,
             settings: RepositoryRuntimeSettings::default(),
             mount: None,
             write_token: None,
+            working_admission: None,
+            working_resources: None,
             repo_lock: None,
             own_stores: None,
             session_pool: Default::default(),
@@ -762,10 +784,13 @@ impl RepositoryContext {
             root_id: self.root_id,
             instance_id: self.instance_id,
             remote: self.remote.clone(),
+            owner_remote: self.owner_remote.clone(),
             filter: self.filter.clone(),
             settings: self.settings.clone(),
             mount: self.mount,
             write_token: self.write_token.as_ref().map(|token| token.share()),
+            working_admission: self.working_admission.clone(),
+            working_resources: self.working_resources.clone(),
             repo_lock: self.repo_lock.clone(),
             own_stores: self.own_stores.clone(),
             session_pool: Default::default(),
@@ -1045,10 +1070,13 @@ impl RepositoryContext {
             root_id: id,
             instance_id: crate::instance::InstanceId::default(),
             remote: remote_arc(RemoteState::Offline),
+            owner_remote: None,
             filter: Arc::default(),
             settings: RepositoryRuntimeSettings::default(),
             mount: None,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
+            working_admission: None,
+            working_resources: None,
             repo_lock: None,
             own_stores: None,
             session_pool: Default::default(),
@@ -1062,8 +1090,11 @@ impl RepositoryContext {
             id,
             root_id: id,
             remote: remote_arc(RemoteState::Offline),
+            owner_remote: None,
             mount: None,
             write_token: Some(RepositoryWriteToken::server(&INTERNAL_SERVER_CONTEXT)),
+            working_admission: None,
+            working_resources: None,
             repo_lock: None,
             own_stores: None,
             ..self.inherited()
@@ -1087,7 +1118,7 @@ impl RepositoryContext {
             write_token: None,
             repo_lock: None,
             own_stores: None,
-            file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new(),
+            file_system: crate::fs::invalid_filesystem_provider::InvalidFilesystemProvider::with_revision_replacement(self.file_system.supports_revision_replacement()),
             ..self.inherited()
         }
     }
@@ -1104,16 +1135,37 @@ impl RepositoryContext {
         RepositoryContext {
             filter,
             remote: remote_arc(RemoteState::from_result(remote)),
+            owner_remote: None,
             ..self.inherited()
         }
     }
 
+    #[cfg(unix)]
+    pub(crate) async fn with_owner_remote(
+        mut self,
+        source: lore_transport::OwnerConnectionSource,
+        execution: &crate::interface::ExecutionContext,
+    ) -> Result<Self, ProtocolError> {
+        let connections = Arc::new(
+            crate::protocol::RemoteConnections::for_background_owner(source, execution).await?,
+        );
+        self.remote = remote_arc(RemoteState::Pending(
+            connections.owner_remote_future(self.id)?,
+        ));
+        self.owner_remote = Some(connections);
+        self.holds_its_sessions = true;
+        Ok(self)
+    }
+
     /// This context aimed at the repository a link mounts. See [`Self::mounted`].
     pub async fn to_link_context(&self, id: RepositoryId) -> Arc<Self> {
-        let remote = self.remote().await;
-        let remote = match remote {
-            Ok(remote) => remote.connect_module(id).await,
-            Err(err) => Err(err),
+        let remote = if let Some(owner) = &self.owner_remote {
+            owner.owner_setup(owner.connection(id)).await
+        } else {
+            match self.remote().await {
+                Ok(remote) => remote.connect_module(id).await,
+                Err(err) => Err(err),
+            }
         };
         Arc::new(self.mounted(id, MountKind::Link, remote))
     }
@@ -1121,10 +1173,13 @@ impl RepositoryContext {
     /// This context aimed at the repository a layer draws from, as
     /// [`Self::to_link_context`] does for a link.
     pub async fn to_layer_context(&self, id: RepositoryId) -> Arc<Self> {
-        let remote = self.remote().await;
-        let remote = match remote {
-            Ok(remote) => remote.connect_module(id).await,
-            Err(err) => Err(err),
+        let remote = if let Some(owner) = &self.owner_remote {
+            owner.owner_setup(owner.connection(id)).await
+        } else {
+            match self.remote().await {
+                Ok(remote) => remote.connect_module(id).await,
+                Err(err) => Err(err),
+            }
         };
         Arc::new(self.mounted(id, MountKind::Layer, remote))
     }
@@ -1191,6 +1246,9 @@ impl RepositoryContext {
     /// `Shared` future. After resolution, the state is promoted so subsequent calls
     /// hit the read-lock fast path.
     pub async fn remote(&self) -> Result<Arc<Connection>, ProtocolError> {
+        if let Some(owner) = &self.owner_remote {
+            owner.check_owner_environment()?;
+        }
         // Fast path: resolved states take only the read lock and return immediately.
         let fut = match &*self.remote.read().await {
             RemoteState::Offline => return Err(ProtocolError::from(NoRemote)),
@@ -1224,16 +1282,23 @@ impl RepositoryContext {
         &self,
         correlation_id: &str,
     ) -> Result<Arc<SessionPool>, ProtocolError> {
+        if let Some(owner) = &self.owner_remote {
+            owner.check_owner_environment()?;
+        }
         if let Some(pool) = self.cached_session_pool(correlation_id) {
             return Ok(pool);
         }
-        let remote = self.remote().await?;
-        let pool = if self.holds_its_sessions {
-            remote
-                .unpinned_session_pool(self.id, correlation_id)
-                .await?
-        } else {
-            remote.session_pool(self.id, correlation_id).await?
+        let setup = async {
+            let remote = self.remote().await?;
+            if self.holds_its_sessions {
+                remote.unpinned_session_pool(self.id, correlation_id).await
+            } else {
+                remote.session_pool(self.id, correlation_id).await
+            }
+        };
+        let pool = match &self.owner_remote {
+            Some(owner) => owner.owner_setup(setup).await?,
+            None => setup.await?,
         };
         *self.session_pool.write() = Some(pool.clone());
         Ok(pool)
@@ -1459,7 +1524,65 @@ pub const MINE_SUFFIX: &str = "~mine";
 /// automerge removes the ones it wrote.
 pub const MERGE_ARTIFACT_SUFFIXES: [&str; 3] = [MINE_SUFFIX, THEIRS_SUFFIX, BASE_SUFFIX];
 
-pub fn get_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
+/// Paths selected by a service registration or ordinary repository discovery.
+#[derive(Clone, Debug)]
+pub struct ResolvedRepositoryPaths {
+    pub root: PathBuf,
+    pub metadata: PathBuf,
+    pub working: Option<crate::fs::provider_registry::WorkingLocation>,
+}
+
+/// Resolve external working metadata through an explicit service resolver.
+/// Registered pending, invalid and stale locations never use ordinary fallback.
+pub fn resolve_repository_paths(
+    path: &Path,
+    resolver: Option<&Arc<dyn crate::fs::provider_registry::ProviderResolver>>,
+) -> Result<ResolvedRepositoryPaths, RepositoryError> {
+    if let Some(resolver) = resolver {
+        let target = match crate::fs::provider_registry::CanonicalTarget::resolve(path) {
+            Ok(target) => Some(target),
+            Err(crate::fs::provider_registry::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                None
+            }
+            Err(crate::fs::provider_registry::Error::InvalidTarget) => None,
+            Err(error) => return Err(RepositoryError::internal(error.to_string())),
+        };
+        if let Some(target) = target
+            && let Some(location) = resolver
+                .locate(&target)
+                .map_err(|error| RepositoryError::internal(error.to_string()))?
+        {
+            require_text_root(location.target().path())?;
+            return Ok(ResolvedRepositoryPaths {
+                root: location.target().path().to_path_buf(),
+                metadata: location.metadata().path().to_path_buf(),
+                working: Some(location),
+            });
+        }
+    }
+    Ok(ResolvedRepositoryPaths {
+        root: path.to_path_buf(),
+        metadata: ordinary_dot_lore_path(path)?,
+        working: None,
+    })
+}
+
+pub fn get_dot_lore_path(path: &Path) -> Result<PathBuf, InvalidPath> {
+    let resolver =
+        crate::runtime::try_execution_context().and_then(|context| context.provider_resolver());
+    resolve_repository_paths(path, resolver.as_ref())
+        .map(|paths| paths.metadata)
+        .map_err(|error| InvalidPath {
+            path: format!("{}: {error}", path.display()),
+        })
+}
+
+fn ordinary_dot_lore_path(path: &std::path::Path) -> Result<PathBuf, InvalidPath> {
     if let Some(mount_manager) = MountManagerState::mount_manager() {
         match mount_manager.check_for_external_lore_dir(path) {
             Ok(Some(path)) => {
@@ -2261,6 +2384,95 @@ pub fn read_id_from_file(path: PathBuf) -> io::Result<RepositoryId> {
     Ok(id)
 }
 
+/// Resolve only the explicit experiment before opening stores or recovering IDs.
+/// Ordinary and SWFS instances keep their existing provider selection paths.
+#[cfg(any(test, feature = "test-util"))]
+#[lore_macro::test_pub]
+pub(crate) fn resolve_experimental_provider(
+    config: &RepositoryConfig,
+    path: &Path,
+    instance_path: &Path,
+    instance: InstanceId,
+    resolver: Option<&Arc<dyn crate::fs::provider_registry::ProviderResolver>>,
+    original: Option<&crate::fs::provider_registry::WorkingLocation>,
+) -> Result<Option<Arc<dyn FilesystemProvider>>, RepositoryError> {
+    resolve_experimental_provider_with_capture(
+        config,
+        path,
+        instance_path,
+        instance,
+        resolver,
+        original,
+        None,
+    )
+}
+
+fn resolve_experimental_provider_with_capture(
+    config: &RepositoryConfig,
+    path: &Path,
+    instance_path: &Path,
+    instance: InstanceId,
+    resolver: Option<&Arc<dyn crate::fs::provider_registry::ProviderResolver>>,
+    original: Option<&crate::fs::provider_registry::WorkingLocation>,
+    captured: Option<Arc<dyn FilesystemProvider>>,
+) -> Result<Option<Arc<dyn FilesystemProvider>>, RepositoryError> {
+    if !config.is_experimental_working() {
+        return if original.is_some() {
+            Err(RepositoryError::internal(
+                "Registered working configuration changed",
+            ))
+        } else {
+            Ok(None)
+        };
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, instance_path, instance, resolver, original, captured);
+        Err(RepositoryError::internal(
+            "Experimental working instances are unsupported on this platform",
+        ))
+    }
+    #[cfg(unix)]
+    {
+        if instance.is_zero()
+            || std::fs::metadata(instance_path)
+                .map_or(true, |metadata| !metadata.is_file() || metadata.len() != 16)
+        {
+            return Err(RepositoryError::internal(
+                "Experimental working instance has missing or invalid instance metadata; automatic identity recovery is disabled",
+            ));
+        }
+        let target = crate::fs::provider_registry::CanonicalTarget::resolve(path)
+            .map_err(|error| RepositoryError::internal(error.to_string()))?;
+        let resolver = resolver.ok_or_else(|| {
+            RepositoryError::internal(
+                "Experimental working instance requires a running service provider owner",
+            )
+        })?;
+        let location = original.ok_or_else(|| RepositoryError::internal("Experimental working instance had no registered location when metadata discovery began"))?;
+        if location.target() != &target
+            || location.instance() != instance
+            || location.metadata().path().join(INSTANCE) != instance_path
+        {
+            return Err(RepositoryError::internal(
+                "Experimental working metadata does not match its registered owner",
+            ));
+        }
+        let provider = match captured {
+            Some(provider) => provider,
+            None => resolver
+                .resolve_location(location)
+                .map_err(|error| RepositoryError::internal(error.to_string()))?,
+        };
+        if !provider.holds_state() {
+            return Err(RepositoryError::internal(
+                "Experimental working provider does not own filesystem state",
+            ));
+        }
+        Ok(Some(provider))
+    }
+}
+
 /// Open an existing on-disk repository and return a ready-to-use context.
 ///
 /// For `RepositoryAccess::ReadWrite`, acquires the per-path write mutex (via
@@ -2274,6 +2486,10 @@ pub async fn load_and_connect(
     access: RepositoryAccess,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     let path = path.as_ref();
+    let resolver =
+        crate::runtime::try_execution_context().and_then(|context| context.provider_resolver());
+    let resolved = resolve_repository_paths(path, resolver.as_ref())?;
+    let path = resolved.root.as_path();
     let write_token = if access == RepositoryAccess::ReadWrite {
         Some(RepositoryWriteToken::acquire(path).await)
     } else {
@@ -2331,12 +2547,55 @@ pub async fn load_and_connect_with_token(
         },
     );
 
-    let dot_path = get_dot_lore_path(path)?;
+    let resolver =
+        crate::runtime::try_execution_context().and_then(|context| context.provider_resolver());
+    let resolved = resolve_repository_paths(path, resolver.as_ref())?;
+    if resolved.working.is_some()
+        && let Some(token) = &write_token
+    {
+        let protects_root = match token {
+            RepositoryWriteToken::Client(guard) => Arc::ptr_eq(
+                tokio::sync::OwnedMutexGuard::mutex(guard.as_ref()),
+                &write_token::write_mutex_for_path(&resolved.root),
+            ),
+            _ => false,
+        };
+        if !protects_root {
+            return Err(RepositoryError::internal(
+                "Working-instance token does not protect the canonical mount root",
+            ));
+        }
+    }
+    let working = working_load::admit(&resolved, resolver.as_ref(), write_token.as_ref())?;
+    let io = working.as_ref().map(|working| working.io.clone());
+    lore_io::lease::scope(io.or_else(lore_io::lease::IoLease::current), async move {
+        load_resolved_repository(resolved, access, write_token, working).await
+    })
+    .await
+}
+
+async fn load_resolved_repository(
+    resolved: ResolvedRepositoryPaths,
+    access: RepositoryAccess,
+    write_token: Option<RepositoryWriteToken>,
+    working: Option<working_load::WorkingLoad>,
+) -> Result<Arc<RepositoryContext>, RepositoryError> {
+    let path = resolved.root.as_path();
+    let dot_path = resolved.metadata;
+    let working_location = resolved.working;
 
     let id_path = dot_path.join(ID);
     let config_path = dot_path.join(CONFIG);
 
     let repository = read_id_from_file(id_path).internal("Repository not found")?;
+    if working_location
+        .as_ref()
+        .is_some_and(|location| location.repository() != repository)
+    {
+        return Err(RepositoryError::internal(
+            "Registered working metadata repository identity changed",
+        ));
+    }
 
     let instance_path = dot_path.join(INSTANCE);
     let instance_id = match crate::instance::InstanceId::read_from_file(instance_path.clone()) {
@@ -2358,6 +2617,22 @@ pub async fn load_and_connect_with_token(
     let context = execution_context();
     let global = context.globals();
     let mut config = load_config(config_path.as_path())?;
+    if let Some(location) = &working_location
+        && (location.instance() != instance_id || !config.is_experimental_working())
+    {
+        return Err(RepositoryError::internal(
+            "Registered working metadata instance/configuration changed",
+        ));
+    }
+    let working_filesystem = resolve_experimental_provider_with_capture(
+        &config,
+        path,
+        &instance_path,
+        instance_id,
+        context.provider_resolver().as_ref(),
+        working_location.as_ref(),
+        working.as_ref().map(|working| working.provider.clone()),
+    )?;
 
     let mut identity = config.identity.clone();
     let mut identity_resolved_from_auth = false;
@@ -2415,8 +2690,13 @@ pub async fn load_and_connect_with_token(
         .unwrap_or_default();
     let read_only = access != RepositoryAccess::ReadWrite;
 
-    let options =
-        incremental_gc_options(read_only, global.no_gc() || global.dry_run(), config_store);
+    // Sleeping periodic workers cannot inherit a command's root token/admission.
+    // Working instances admit finite store maintenance through their facades.
+    let options = incremental_gc_options(
+        read_only,
+        global.no_gc() || global.dry_run() || working.is_some(),
+        config_store,
+    );
 
     // Create stores — disk-backed mutable store may need deferred upgrade — and claim them
     // for the command, which holds the claims in its repository lock below. NoStore commands
@@ -2476,7 +2756,11 @@ pub async fn load_and_connect_with_token(
         let _ = save_config(config_path.as_path(), &persisted).await;
     }
 
-    let filter = load_filter(path)?;
+    let filter = if let Some(provider) = working_filesystem.as_ref() {
+        load_working_filter(provider.as_ref(), path, &dot_path).await?
+    } else {
+        load_filter(path)?
+    };
 
     // Resolve the remote eagerly only when we need it for the mutable store upgrade.
     // Otherwise keep it pending so local-only commands never block on the connect.
@@ -2562,6 +2846,21 @@ pub async fn load_and_connect_with_token(
         mutable_store
     };
 
+    let working_admission = working.as_ref().map(|working| working.load.clone());
+    let working_resources = working.as_ref().and_then(|working| {
+        (access != RepositoryAccess::NoStore && !global.in_memory()).then(|| {
+            working_handoff::WorkingResources::new(
+                immutable_store.clone(),
+                mutable_store.clone(),
+                working.load.clone(),
+            )
+        })
+    });
+    let (immutable_store, mutable_store) = match working {
+        Some(working) => command_stores::wrap(immutable_store, mutable_store, working.load),
+        None => (immutable_store, mutable_store),
+    };
+
     // If the mutable store upgrade already forced resolution, we can use the resolved
     // connection to refresh the config with the authoritative remote/identity values.
     if let Some(Ok(ref remote_conn)) = resolved_remote_for_upgrade {
@@ -2619,8 +2918,14 @@ pub async fn load_and_connect_with_token(
         instance_id
     };
 
-    // Load the mounted filesystem if this is a SWFS-backed instance
-    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config.is_swfs() {
+    // Experimental owners were resolved before store setup; SWFS retains its mount manager.
+    let filesystem: Option<Arc<dyn FilesystemProvider + 'static>> = if config
+        .is_experimental_working()
+    {
+        Some(working_filesystem.ok_or_else(|| {
+            RepositoryError::internal("Experimental working provider resolution returned no owner")
+        })?)
+    } else if config.is_swfs() {
         let mount_manager = MountManagerState::mount_manager().ok_or(RepositoryError::internal(
             "Loading a SWFS repository without using the service",
         ))?;
@@ -2650,6 +2955,9 @@ pub async fn load_and_connect_with_token(
         filter,
         filesystem,
     );
+    let mut repository = repository;
+    repository.working_admission = working_admission;
+    repository.working_resources = working_resources;
     let repository = match repo_lock {
         Some((lock, stores)) => repository.with_repository_lock(lock, stores),
         None => repository,
@@ -2824,6 +3132,11 @@ pub async fn create_local(
     no_tracking: bool,
 ) -> Result<Arc<RepositoryContext>, RepositoryError> {
     require_text_root(path)?;
+    if config.is_experimental_working() {
+        return Err(RepositoryError::internal(
+            "Experimental working instances require service-owned setup",
+        ));
+    }
     let instance_id = InstanceId::generate();
 
     let dotpath;
@@ -3005,6 +3318,18 @@ pub fn load_filter(root_path: &Path) -> Result<Arc<filter::Filter>, RepositoryEr
     Ok(Arc::new(filter))
 }
 
+/// Maximum encoded bytes in each provider-backed ignore or private view file.
+pub const MAX_FILTER_FILE_BYTES: usize = 1024 * 1024;
+
+#[lore_macro::test_pub]
+pub(crate) async fn load_working_filter(
+    provider: &dyn FilesystemProvider,
+    root: &Path,
+    metadata: &Path,
+) -> Result<Arc<filter::Filter>, RepositoryError> {
+    working_filter::load(provider, root, metadata).await
+}
+
 fn branch_switch_create_recurse(
     repository: Arc<RepositoryContext>,
     token: RepositoryWriteToken,
@@ -3114,6 +3439,7 @@ pub async fn branch_switch(
     branch: String,
     options: BranchSwitchOptions,
 ) -> Result<Hash, RepositoryError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     if options.reset && !options.bare && repository.file_system().holds_state() {
         return Err(crate::fs::hold::refused("reset local changes in a branch switch").into());
     }

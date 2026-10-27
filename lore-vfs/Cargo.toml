@@ -1,0 +1,30 @@
+[package]
+name = "lore-vfs"
+edition = "2024"
+version.workspace = true
+publish = false
+
+[features]
+default = []
+# Test helpers exercise the private complete-backend preparation path.
+test-util = []
+
+[dependencies]
+async-trait = { workspace = true }
+bytes = { workspace = true }
+lore-base = { workspace = true }
+lore-revision = { workspace = true }
+lore-storage = { workspace = true }
+ring = { workspace = true }
+tokio = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+fuser = { version = "=0.16.0", default-features = false, features = ["abi-7-31"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+lore-io = { workspace = true }
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

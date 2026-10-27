@@ -9,5 +9,6 @@
 mod driver;
 #[cfg(target_family = "windows")]
 mod iocp;
+mod lease;
 mod pool;
 mod psync;

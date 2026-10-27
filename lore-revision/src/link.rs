@@ -1445,6 +1445,7 @@ pub async fn realize_link_pin_change(
     new_sig: Hash,
     linked_node: NodeID,
 ) -> Result<(), LinkError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let diff = link_pin_diff(&link_context, link_path, old_sig, new_sig, linked_node).await?;
 
     with_operation(repository.file_system(), async |operation| {
@@ -2001,6 +2002,9 @@ pub async fn stage_link_pin(
     new_branch: BranchId,
     realize: LinkPinRealize,
 ) -> Result<NodeID, LinkError> {
+    if matches!(realize, LinkPinRealize::WorkingTree) {
+        crate::fs::hold::require_revision_replacement(&repository)?;
+    }
     // Resolve the source_node in the new link state. The parent's link node
     // stores a NodeID (`link_node.child`) that points into the linked state's
     // tree at the mount's source_path. Node IDs aren't stable across link

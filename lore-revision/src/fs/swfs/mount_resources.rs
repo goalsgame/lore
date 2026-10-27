@@ -225,7 +225,7 @@ impl MountResources {
                 instance_id,
                 RemoteState::Offline,
                 Arc::new(Filter::default()),
-                Some(Arc::new(InvalidFilesystemProvider {})),
+                Some(InvalidFilesystemProvider::new()),
             )
             .with_store_hold(stores),
         );

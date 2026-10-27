@@ -1,15 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-//! The OS provider's diff of the working tree against a state.
+//! Provider-backed working tree comparison against pinned and staged states.
 //!
-//! Reads the live filesystem through [`crate::util::fs`] and the global I/O driver, which is what
-//! backing an operation with the OS means. Only [`crate::fs::os::OsOperation`] reaches
-//! [`diff_os_filesystem`]: another provider implements
-//! [`changes_from_filesystem_to_state`](crate::fs::filesystem_provider::InstanceOperation::changes_from_filesystem_to_state)
-//! over whatever it is backed by, and routing that here would read the OS behind its own snapshot.
-//!
-//! A child of [`crate::state`], so the state internals a diff walks stay that module's own rather
-//! than becoming the crate's to reach.
+//! Directory, metadata and content reads use the operation's boundary. Host
+//! nested-working-copy probes run only when the operation explicitly permits them.
 
 use core::str;
 use std::future::Future;
@@ -33,12 +27,14 @@ use crate::errors::NodeNotFound;
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
 use crate::filter::WalkPath;
+use crate::fs::filesystem_provider::DirectoryEntry as FileListItem;
+use crate::fs::filesystem_provider::DirectoryListing;
 use crate::fs::filesystem_provider::FileInfo;
 use crate::fs::filesystem_provider::FilesystemDiffContext;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
 use crate::fs::filesystem_provider::StageIntent;
-use crate::fs::os::FileListItem;
+use crate::hash::hash_string;
 use crate::lore::*;
 use crate::lore_drain_tasks;
 use crate::lore_trace;
@@ -95,19 +91,35 @@ pub(crate) async fn ensure_scan_dir_chain(
     Ok(current_node)
 }
 
+async fn is_provider_nested_root(
+    path: &RelativePath,
+    probe: &mut Option<std::path::PathBuf>,
+    root: Option<&std::path::Path>,
+    name: &str,
+) -> bool {
+    let Some(root) = root else {
+        return false;
+    };
+    let probe = probe.get_or_insert_with(|| path.to_absolute_path(root));
+    is_nested_repository_root(probe, name).await
+}
+
 async fn diff_filesystem_subtree_impl(
     mut ctx: FilesystemDiffContext,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
-    let absolute_path = ctx
-        .filesystem_path
-        .to_absolute_path(ctx.from.repository.require_path()?);
-
-    match crate::fs::os::list_path(absolute_path)
+    let info = ctx
+        .operation
+        .file_info(&ctx.filesystem_path)
         .await
-        .forward::<StateError>("Failed to list the path")?
-    {
-        crate::fs::os::PathListingResult::Directory { listing } => {
+        .forward_any::<StateError>("Failed to query provider path")?;
+    match info {
+        FileInfo::Directory => {
+            let listing = ctx
+                .operation
+                .read_directory(&ctx.filesystem_path)
+                .await
+                .forward_any::<StateError>("Failed to list provider directory")?;
             // A path-filtered scan can enter a directory present on disk but
             // absent from state_from (an untracked add). Create its dirty-add
             // node chain so adds discovered inside resolve their parent node.
@@ -126,7 +138,13 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_directory(ctx, listing, changes).await
         }
-        crate::fs::os::PathListingResult::File { item } => {
+        FileInfo::File { .. } => {
+            let name = ctx.filesystem_path.name().to_string();
+            let item = FileListItem {
+                name_hash: hash_string(&name),
+                name,
+                info,
+            };
             // A path-filtered scan of a new file: ensure its parent directory
             // chain exists so the add resolves its parent node.
             if ctx.intent.marks_dirty()
@@ -144,7 +162,7 @@ async fn diff_filesystem_subtree_impl(
             }
             diff_filesystem_single_file(ctx, item, changes).await
         }
-        crate::fs::os::PathListingResult::NotFound => {
+        FileInfo::NotExist => {
             // Path doesn't exist on filesystem - everything in state is deleted
             diff_filesystem_missing(
                 ctx.from,
@@ -795,7 +813,7 @@ async fn handle_single_file_compare_result(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory(
     ctx: FilesystemDiffContext,
-    file_listing: lore_io::DirStream,
+    file_listing: DirectoryListing,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     /// A staging walk includes the children staged for delete, so a path the file system
@@ -1205,7 +1223,7 @@ async fn staged_entry(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_directory_walk(
     ctx: &FilesystemDiffContext,
-    mut file_listing: lore_io::DirStream,
+    mut file_listing: DirectoryListing,
     node_list: &StateChildrenNodes,
     current_node_list: &StateChildrenNodes,
     node_list_found: &mut [bool],
@@ -1214,7 +1232,11 @@ async fn diff_filesystem_directory_walk(
     stats: &mut FilesystemDiffStats,
     pending_discards: &mut Vec<NodeID>,
 ) -> Result<(), StateError> {
-    let repository_root = ctx.from.repository.require_path()?;
+    let repository_root = if ctx.operation.uses_host_filesystem() {
+        Some(ctx.from.repository.require_path()?)
+    } else {
+        None
+    };
     let staging = ctx.intent.stage().is_some();
     let forced = staging && execution_context().globals().force();
     let mut nested_probe: Option<std::path::PathBuf> = None;
@@ -1223,11 +1245,10 @@ async fn diff_filesystem_directory_walk(
         .filesystem_path
         .to_buf_with_capacity(RelativePath::COMPONENT_ROOM);
     while let Some(entry) = file_listing.next().await {
-        let Some(item) = crate::fs::os::file_list_item(entry)
-            .forward::<StateError>("Unusable directory entry")?
-        else {
+        let item = entry.forward_any::<StateError>("Unusable provider directory entry")?;
+        if !item.info.exists() {
             continue;
-        };
+        }
         if is_reserved_node_name(item.name.as_str()) {
             continue;
         }
@@ -1240,7 +1261,7 @@ async fn diff_filesystem_directory_walk(
         let (item_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
             ctx.states,
             entry.path(),
-            item.metadata.is_dir(),
+            item.info.is_dir(),
             ctx.filter_mode,
         );
         if excluded {
@@ -1298,8 +1319,8 @@ async fn diff_filesystem_directory_walk(
         let was_directory = from_node.is_directory();
         let was_link = from_node.is_link();
 
-        let is_directory = item.metadata.is_dir();
-        let is_file = item.metadata.is_file();
+        let is_directory = item.info.is_dir();
+        let is_file = item.info.is_file();
 
         let is_rename = from_match.renamed();
 
@@ -1347,7 +1368,7 @@ async fn diff_filesystem_directory_walk(
                     from_named_node.node,
                     from_node,
                     &entry.to_path(),
-                    &FileInfo::from_metadata(&item.metadata),
+                    &item.info,
                     changes,
                     stats,
                     ctx.filter_mode,
@@ -1364,7 +1385,7 @@ async fn diff_filesystem_directory_walk(
                 None
             };
 
-            let observed = FileInfo::from_metadata(&item.metadata);
+            let observed = item.info;
             let compare_result = compare_single_file_against_state(
                 &ctx.operation,
                 node_list.repository.clone(),
@@ -1617,7 +1638,7 @@ async fn diff_filesystem_matched_directory(
     staged: StagedEntry,
     is_rename: bool,
     nested_probe: &mut Option<std::path::PathBuf>,
-    repository_root: &std::path::Path,
+    repository_root: Option<&std::path::Path>,
     tasks: &mut SubtreeTasks,
     changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
@@ -1630,13 +1651,17 @@ async fn diff_filesystem_matched_directory(
             matched.path(&ctx.current.path, item.name.as_str())
         });
     let uncommitted = ctx.intent.marks_dirty() && !current_node_id.is_valid_node_id();
-    if uncommitted {
-        let probe = nested_probe
-            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
-        if is_nested_repository_root(probe, item.name.as_str()).await {
-            lore_trace!("Discarding zombie entry for nested repository root {item_path}");
-            return Ok(false);
-        }
+    if uncommitted
+        && is_provider_nested_root(
+            &ctx.filesystem_path,
+            nested_probe,
+            repository_root,
+            item.name.as_str(),
+        )
+        .await
+    {
+        lore_trace!("Discarding zombie entry for nested repository root {item_path}");
+        return Ok(false);
     }
     if staged == StagedEntry::Undeleted {
         emit_add_node_single(
@@ -1706,7 +1731,7 @@ async fn diff_filesystem_matched_directory(
             from_named_node.node,
             &from_node,
             &item_path,
-            FileInfo::from_metadata(&item.metadata),
+            item.info,
             changes,
             ctx.intent,
             ctx.filter_mode,
@@ -1789,7 +1814,7 @@ async fn diff_filesystem_type_change(
     is_file: bool,
     is_directory: bool,
     nested_probe: &mut Option<std::path::PathBuf>,
-    repository_root: &std::path::Path,
+    repository_root: Option<&std::path::Path>,
     tasks: &mut SubtreeTasks,
     changes: &ChangeSender,
     stats: &mut FilesystemDiffStats,
@@ -1803,7 +1828,7 @@ async fn diff_filesystem_type_change(
         parent_node_id: Some(ctx.from.node),
         intent: ctx.intent,
         states: item_states,
-        observed: FileInfo::from_metadata(&item.metadata),
+        observed: item.info,
         insists: false,
     };
 
@@ -1843,9 +1868,13 @@ async fn diff_filesystem_type_change(
     // directory holds none.
     let reports_without_node = !replacement.is_valid_node_id() && !ctx.intent.marks_dirty();
     let nested_root = is_directory && reports_without_node && {
-        let probe = nested_probe
-            .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
-        is_nested_repository_root(probe, item.name.as_str()).await
+        is_provider_nested_root(
+            &ctx.filesystem_path,
+            nested_probe,
+            repository_root,
+            item.name.as_str(),
+        )
+        .await
     };
     if nested_root {
         lore_trace!(
@@ -2050,7 +2079,7 @@ async fn diff_filesystem_new_entries(
     ctx: &FilesystemDiffContext,
     new_file_list: &[FileListItem],
     nested_probe: &mut Option<std::path::PathBuf>,
-    repository_root: &std::path::Path,
+    repository_root: Option<&std::path::Path>,
     staging: bool,
     tasks: &mut SubtreeTasks,
     changes: &ChangeSender,
@@ -2067,14 +2096,14 @@ async fn diff_filesystem_new_entries(
         let (child_states, excluded) = ctx.from.repository.filter.child_emit_excludes(
             ctx.states,
             &child_file_path,
-            file.metadata.is_dir(),
+            file.info.is_dir(),
             ctx.filter_mode,
         );
         if excluded {
             continue 'new_file_iter;
         }
 
-        let is_directory = file.metadata.is_dir();
+        let is_directory = file.info.is_dir();
 
         if is_directory {
             // A directory on disk with no `state_from` node that matches a
@@ -2159,9 +2188,14 @@ async fn diff_filesystem_new_entries(
                 .await?;
                 continue 'new_file_iter;
             }
-            let probe = nested_probe
-                .get_or_insert_with(|| ctx.filesystem_path.to_absolute_path(repository_root));
-            if is_nested_repository_root(probe, file.name.as_str()).await {
+            if is_provider_nested_root(
+                &ctx.filesystem_path,
+                nested_probe,
+                repository_root,
+                file.name.as_str(),
+            )
+            .await
+            {
                 lore_trace!("Skipping nested repository root {child_file_path}");
                 continue 'new_file_iter;
             }
@@ -2270,7 +2304,7 @@ async fn diff_filesystem_new_entries(
             parent_node_id: Some(ctx.from.node),
             intent: ctx.intent,
             states: child_states,
-            observed: FileInfo::from_metadata(&file.metadata),
+            observed: file.info,
             insists: false,
         };
 
@@ -2351,7 +2385,7 @@ fn diff_filesystem_subtree_merge_task(
 #[allow(clippy::too_many_arguments)]
 async fn diff_filesystem_single_file(
     ctx: FilesystemDiffContext,
-    file_item: crate::fs::os::FileListItem,
+    file_item: FileListItem,
     changes: &ChangeSender,
 ) -> Result<FilesystemDiffStats, StateError> {
     let stats = FilesystemDiffStats::default();
@@ -2380,13 +2414,13 @@ async fn diff_filesystem_single_file(
         None
     };
 
-    let observed = FileInfo::from_metadata(&file_item.metadata);
+    let observed = file_item.info;
 
     // Staging decides on a node the tree holds before anything is compared, as the directory
     // walk does.
     let mut insisted = false;
     if let Some(stage) = ctx.intent.stage()
-        && file_item.metadata.is_file()
+        && file_item.info.is_file()
         && let Some(node) = from_node
         && node.is_file()
     {
@@ -2421,7 +2455,7 @@ async fn diff_filesystem_single_file(
     // the file's presence on disk is the add. Skip the compare and emit
     // Add+Dirty directly.
     if ctx.intent.marks_dirty()
-        && file_item.metadata.is_file()
+        && file_item.info.is_file()
         && ctx.from.node.is_valid_node_id()
         && !ctx.current.node.is_valid_node_id()
         && let Some(node) = from_node
@@ -2473,7 +2507,7 @@ async fn diff_filesystem_single_file(
         compare_result,
         &ctx.filesystem_path,
         None, // No rename detection for single file path
-        file_item.metadata.is_dir(),
+        file_item.info.is_dir(),
         changes,
         &stats,
         ctx.filter_mode,
@@ -2589,7 +2623,7 @@ fn diff_filesystem_subtree_recurse<'a>(
 /// change per difference through `changes`.
 ///
 /// The module's entry, and what
-/// [`OsOperation`](crate::fs::os::OsOperation)'s
+/// The operation's
 /// `changes_from_filesystem_to_state` answers with.
 ///
 /// A marking walk handed no queue for what it finds stale holds it on one of its own and
@@ -2598,7 +2632,7 @@ fn diff_filesystem_subtree_recurse<'a>(
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
-pub(crate) fn diff_os_filesystem(
+pub(crate) fn diff_provider_filesystem(
     mut diff: FilesystemDiffContext,
     changes: &ChangeSender,
 ) -> impl Future<Output = Result<FilesystemDiffStats, StateError>> + Send + '_ {

@@ -679,6 +679,7 @@ pub async fn merge_start(
     branch: BranchId,
     options: MergeStartOptions,
 ) -> Result<Hash, MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged_opt, current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -2245,6 +2246,7 @@ pub async fn apply_diff(
     target_branch: BranchId,
     inherit: &MetadataInherit,
 ) -> Result<ApplyDiffResults, MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     lore_debug!(
         "Branch diff found {} changes and {} conflicts",
         diff.changes.len(),
@@ -2708,6 +2710,7 @@ pub async fn branch_merge_abort(
     link: Option<String>,
     ignore_links: bool,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     // `--link` and `--ignore-links` are mutually exclusive at the CLI layer.
     // If both arrive together (e.g. via a non-CLI caller), `ignore_links`
     // wins because it's the more conservative scope (parent only) and matches
@@ -2983,6 +2986,7 @@ pub async fn merge_abort(
     repository: Arc<RepositoryContext>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (current_revision, _current_branch) = crate::instance::load_current_anchor(&repository)
         .await
         .forward::<MergeError>("loading current anchor")?;
@@ -3115,6 +3119,7 @@ pub async fn merge_restart(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (_state_current, state_staged, branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -3168,6 +3173,7 @@ pub async fn apply_restart_diff(
     state_staged: Arc<State>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     // Filter diff found to passed in paths
     let mut relative_paths = vec![];
     for path in paths.as_slice().iter() {
@@ -3278,6 +3284,7 @@ pub async fn merge_unresolve(
     paths: LoreArray<LoreString>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -3834,6 +3841,7 @@ pub async fn merge_resolve(
     paths: LoreArray<LoreString>,
     merge_type: MergeType,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (_state_current, state_staged, _branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -3935,6 +3943,7 @@ pub async fn merge_resolve_mine(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), StageError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     validate_merge_type(repository.clone(), None, MergeType::BranchMerge)
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;
@@ -3953,6 +3962,7 @@ pub async fn merge_resolve_theirs(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), StageError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     validate_merge_type(repository.clone(), None, MergeType::BranchMerge)
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;

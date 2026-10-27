@@ -11,6 +11,8 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Serialize;
 
+mod transactional;
+
 use crate::branch;
 use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
@@ -428,6 +430,10 @@ pub(crate) async fn sync(
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
+    let transactional_root = repository.file_system().supports_transactional_root_hold();
+    if !transactional_root {
+        crate::fs::hold::require_revision_replacement(&repository)?;
+    }
     if repository.file_system().holds_state() {
         if !options.root_files.is_empty() {
             return Err(hold::refused("restrict a sync to a dependency set").into());
@@ -438,6 +444,9 @@ pub(crate) async fn sync(
     }
     let view = sync_load_view(&options).await?;
     let view_change = view.is_some();
+    if transactional_root && view_change {
+        return Err(FsError::internal("Transactional root holds do not change views").into());
+    }
     let repository_current = repository.clone();
     let repository = match view {
         Some(view) => Arc::new(repository.with_filter_and_remote(
@@ -835,6 +844,12 @@ pub(crate) async fn sync(
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
             };
+            if transactional_root {
+                return Err(FsError::internal(
+                    "Transactional root holds require an explicit target for diverged history",
+                )
+                .into());
+            }
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),
                 token,
@@ -863,6 +878,35 @@ pub(crate) async fn sync(
 
             return Ok(());
         }
+    }
+
+    if transactional_root {
+        let outcome = transactional::hold(
+            &repository,
+            &state_target,
+            &options,
+            requested_branch,
+            anchor_branch,
+            view_change,
+        )
+        .await?;
+        if !matches!(
+            outcome,
+            crate::fs::filesystem_provider::RootHoldOutcome::Preview
+        ) && location == LoreBranchLocation::Remote
+            && !execution_context().globals().dry_run()
+        {
+            sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
+        }
+        LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
+            branch: target_branch,
+            revision,
+            revision_number,
+            flag_merge: 0,
+            flag_conflict: 0,
+        })
+        .send();
+        return Ok(());
     }
 
     let cache_repository = repository.clone();

@@ -306,6 +306,8 @@ impl SyscallPool {
         T: Send + 'static,
         F: FnOnce() -> T + Send + 'static,
     {
+        let lease = crate::lease::IoLease::current();
+        let work = move || crate::lease::sync_scope(lease, work);
         let task = Arc::new(Task {
             state: Mutex::new(TaskState::Pending {
                 work: Some(work),

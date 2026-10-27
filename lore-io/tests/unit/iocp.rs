@@ -141,6 +141,44 @@ fn an_abandoned_pending_operation_is_completed_and_released() {
     );
 }
 
+#[test]
+fn abandoned_pending_io_retains_its_lease_until_kernel_completion() {
+    let driver = IocpDriver::new().expect("a completion port");
+    let (server, mut client) = overlapped_pipe_pair();
+    driver.register(&server).expect("binding the pipe");
+
+    let owner = Arc::new(());
+    let weak = Arc::downgrade(&owner);
+    let lease = lore_io::lease::IoLease::new(owner);
+    let mut read = Box::pin(lease.scope(driver.read_at(Arc::new(server), 8, 0)));
+    assert!(
+        read.as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending(),
+        "the empty pipe must leave an actual kernel operation pending"
+    );
+    drop(read);
+    drop(lease);
+    assert!(
+        weak.upgrade().is_some(),
+        "cancellation released the IO owner"
+    );
+
+    client
+        .write_all(b"deferred")
+        .expect("completing the pipe read");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while weak.upgrade().is_some() || driver.stats().reaped != 1 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "kernel completion did not release the IO owner: {:?}",
+            driver.stats()
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(driver.stats().inline, 0);
+}
+
 /// Every operation is completed once, by exactly one of the two paths.
 ///
 /// Which path is a property of the host, so the test does not pin it. What it pins is that the

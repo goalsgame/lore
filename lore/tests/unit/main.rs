@@ -17,7 +17,30 @@ mod repository;
 mod revision;
 mod revision_tree;
 mod sandbox_tests;
+#[cfg(target_os = "linux")]
+mod service_owned_mount;
+#[cfg(unix)]
+mod service_owner;
+#[cfg(unix)]
+mod service_shutdown;
+mod service_state_scope;
 mod storage;
+#[cfg(unix)]
+mod working_mount;
+#[cfg(unix)]
+mod working_mount_admission;
+#[cfg(unix)]
+mod working_mount_bootstrap;
+#[cfg(unix)]
+mod working_mount_candidate_policy;
+#[cfg(unix)]
+mod working_mount_factory;
+#[cfg(unix)]
+mod working_mount_local_policy;
+#[cfg(unix)]
+mod working_mount_reservation;
+#[cfg(unix)]
+mod working_mount_worker;
 
 /// Points the unit tests at a global config, credential store and service socket of
 /// their own, rather than the machine's, and keeps them from relaying.

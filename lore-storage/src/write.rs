@@ -84,13 +84,14 @@ pub async fn write_raw(
     }
 }
 
-// This map holds the set of unique (partition, address) pairs that are currently
-// in flight to be stored locally, and a token to wait for completion
+// In-flight writes are scoped to one store allocation. A different store may
+// hold none of these bytes even when partition and content address are equal.
 static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, CancellationToken>> = OnceLock::new();
 
 #[lore_macro::test_pub]
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct StoreInFlightKey {
+    pub store: usize,
     pub partition: Partition,
     pub address: Address,
 }
@@ -114,6 +115,8 @@ pub(crate) fn stores_landed(address: Address) -> u64 {
 
 /// RAII guard that removes the in-flight entry and notifies waiters on drop.
 pub struct StoreInFlightGuard {
+    // Retention prevents allocation-address reuse while the key is registered.
+    _store: Arc<dyn ImmutableStore>,
     key: StoreInFlightKey,
 }
 
@@ -139,10 +142,11 @@ impl Drop for StoreInFlightGuard {
 // Either returns a new in-flight token if request was not in flight, or waits for the request
 // to finish and then return none if already in-flight
 pub async fn stored_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Option<StoreInFlightGuard> {
-    match try_acquire_in_flight(partition, address) {
+    match try_acquire_in_flight(store, partition, address) {
         Ok(guard) => Some(guard),
         Err(token) => {
             token.cancelled().await;
@@ -151,9 +155,11 @@ pub async fn stored_in_flight(
     }
 }
 
-/// Non-blocking attempt to acquire the in-flight guard for `(partition, address)`.
+/// Non-blocking attempt to acquire the in-flight guard for this store and `(partition, address)`.
+/// Writers and readers coordinate only when they share the same `Arc` allocation.
+/// Separate wrappers or independently opened handles do not inherit each other's writes.
 ///
-/// Returns `Ok(guard)` if no one else is currently writing this address — the
+/// Returns `Ok(guard)` if no one else is currently writing this address to this store — the
 /// caller becomes the leader and must drop the guard when the terminal store
 /// entry is written.
 ///
@@ -161,10 +167,15 @@ pub async fn stored_in_flight(
 /// cancelled when that task drops its guard; callers that want to observe the
 /// leader's outcome should await the token and then query the store.
 pub fn try_acquire_in_flight(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
 ) -> Result<StoreInFlightGuard, CancellationToken> {
-    let key = StoreInFlightKey { partition, address };
+    let key = StoreInFlightKey {
+        store: Arc::as_ptr(store).cast::<()>() as usize,
+        partition,
+        address,
+    };
     let in_flight = STORE_IN_FLIGHT.get_or_init(DashMap::new);
     // `DashMap::entry` is safe here as it is not held across any awaits and no other locks are acquired while held
     #[allow(clippy::disallowed_methods)]
@@ -172,20 +183,31 @@ pub fn try_acquire_in_flight(
         Entry::Occupied(entry) => Err(entry.get().clone()),
         Entry::Vacant(entry) => {
             entry.insert(CancellationToken::new());
-            Ok(StoreInFlightGuard { key })
+            Ok(StoreInFlightGuard {
+                key,
+                _store: store.clone(),
+            })
         }
     }
 }
 
-/// If another task is currently writing `(partition, address)` via the tracker
+/// If another task is currently writing this store's `(partition, address)` via the tracker
 /// path, wait for its cancellation token so subsequent reads observe the
 /// terminal store entry the leader produces, and answer true. Returns false
-/// immediately when no write is in flight.
-pub async fn wait_if_in_flight(partition: Partition, address: Address) -> bool {
+/// immediately when no write is in flight for this same `Arc` allocation.
+pub async fn wait_if_in_flight(
+    store: &Arc<dyn ImmutableStore>,
+    partition: Partition,
+    address: Address,
+) -> bool {
     let Some(in_flight) = STORE_IN_FLIGHT.get() else {
         return false;
     };
-    let key = StoreInFlightKey { partition, address };
+    let key = StoreInFlightKey {
+        store: Arc::as_ptr(store).cast::<()>() as usize,
+        partition,
+        address,
+    };
     let token = in_flight.get(&key).map(|entry| entry.value().clone());
     let Some(token) = token else {
         return false;
@@ -837,7 +859,7 @@ fn store_fragment_inline(
 
         // Remote-coupled path: acquire the in-flight guard so a concurrent writer to the same
         // address dedupes onto one upload.
-        let guard = stored_in_flight(partition, address).await;
+        let guard = stored_in_flight(&store, partition, address).await;
         if guard.is_none()
             && let Some((stored_local, stored_durable)) =
                 inherited_placement(&store, partition, address, publish).await
@@ -914,7 +936,7 @@ async fn store_fragment_dispatched(
     permit: Option<OwnedSemaphorePermit>,
 ) -> Result<StoreResult, StorageError> {
     tracker.claim(&store).await;
-    let guard = match try_acquire_in_flight(partition, address) {
+    let guard = match try_acquire_in_flight(&store, partition, address) {
         Ok(guard) => guard,
         Err(token) => {
             // Follower path: drop buffer and permit, register on the tracker.
@@ -1597,6 +1619,89 @@ pub fn write_from_file(
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
 ) -> impl Future<Output = Result<StoreResult, StorageError>> {
+    write_from_file_impl(
+        store,
+        partition,
+        source,
+        context,
+        flags,
+        remote_session,
+        writes,
+        None,
+    )
+}
+
+/// Whole-file SHA-256 bound to the exact immutable identity established by ingestion.
+/// Its fields cannot be constructed from fragment hashes or path metadata.
+#[derive(Clone, Debug)]
+pub struct IngestedContent {
+    address: Address,
+    size: u64,
+    sha256: [u8; 32],
+}
+
+impl IngestedContent {
+    pub fn address(&self) -> Address {
+        self.address
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+}
+
+/// Store a file and hash its whole content in the same ingestion stream.
+/// Hash-only requests are refused. With a write tracker, the caller must await its
+/// completion before treating the content as stored; pending storage failures do not
+/// invalidate the digest's binding to the ingested bytes and identity.
+#[allow(clippy::too_many_arguments)]
+pub async fn write_from_file_with_sha256(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    source: &ContentSource<'_>,
+    context: Context,
+    flags: WriteOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
+) -> Result<(StoreResult, IngestedContent), StorageError> {
+    if flags.hash_only {
+        return Err(StorageError::internal(
+            "ingestion digests require stored content",
+        ));
+    }
+    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
+    let written = write_from_file_impl(
+        store,
+        partition,
+        source,
+        context,
+        flags,
+        remote_session,
+        writes,
+        Some(&mut digest),
+    )
+    .await?;
+    let content = IngestedContent {
+        address: written.address,
+        size: written.size_content,
+        sha256: digest.finish().as_ref().try_into().expect("SHA-256 length"),
+    };
+    Ok((written, content))
+}
+
+#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
+fn write_from_file_impl(
+    store: Arc<dyn ImmutableStore>,
+    partition: Partition,
+    source: &ContentSource<'_>,
+    context: Context,
+    flags: WriteOptions,
+    remote_session: Option<Arc<StorageSession>>,
+    writes: WriteContext,
+    mut sha256: Option<&mut ring::digest::Context>,
+) -> impl Future<Output = Result<StoreResult, StorageError>> {
     async move {
         let _in_flight = (!flags.hash_only).then(ContentWriteGuard::new);
         let _count_permit = file_count_limit_acquire()
@@ -1623,12 +1728,17 @@ pub fn write_from_file(
         }
 
         // Anything larger than one fragment streams, so the scan never holds a file resident.
-        let size = size as usize;
+        let size = usize::try_from(size).map_err(|_unaddressable_size| {
+            StorageError::internal("content size exceeds addressable memory")
+        })?;
         if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
             let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
             let buffer = handle.read_all(size).await.map_err(|err| {
                 StorageError::internal_with_context(err, &format!("read content: {source}"))
             })?;
+            if let Some(digest) = sha256.as_mut() {
+                digest.update(&buffer);
+            }
             let address = write_single_fragment(
                 store,
                 partition,
@@ -1647,7 +1757,7 @@ pub fn write_from_file(
         }
 
         let (address, _stored_local, _stored_durable) =
-            crate::fragment_engine::write_fragmented_from_file(
+            crate::fragment_engine::write_fragmented_from_file_digest(
                 store,
                 partition,
                 context,
@@ -1657,6 +1767,7 @@ pub fn write_from_file(
                 remote_session,
                 writes,
                 None,
+                sha256,
             )
             .await?;
         Ok(StoreResult {

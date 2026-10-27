@@ -218,6 +218,7 @@ pub(crate) async fn restore(
     token: &RepositoryWriteToken,
     options: RestoreOptions,
 ) -> Result<(), RestoreError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let context = execution_context();
     let call = context.globals();
 

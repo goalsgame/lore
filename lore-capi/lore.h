@@ -12566,12 +12566,17 @@ void lore_notification_unsubscribe_async(const struct lore_global_args_t *global
 int32_t lore_log_configure(const struct lore_log_config_t *config);
 
 // Shut the library down, stopping its worker threads and releasing the
-// resources it holds. Call this once, when no further calls will be made and
+// resources it holds. Call this when no further calls will be made and
 // every call made has completed. The library makes a best effort to cancel
 // calls still executing safely, but a call it does not stop in time may still
 // use the memory passed to it after this returns.
 //
-// Returns 0 on success and a non-zero value on failure.
+// Returns 0 when this call completes teardown and a non-zero value otherwise.
+// On Unix, an owned service that cannot finish retiring within the shutdown
+// bound prevents teardown. Its runtimes, connections and allocator remain
+// available, and shutdown may be retried once the service can retire.
+// A panic during service start publication also prevents teardown on the next
+// attempt; a subsequent retry inspects the retained service run.
 int32_t lore_shutdown(void);
 
 // Limits the total number of threads Lore sizes its pools for.

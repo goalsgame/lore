@@ -19,10 +19,10 @@ fn swfs_file_sizing() {
         let file_b = (*file_a).next;
         assert!(std::ptr::addr_eq(file_a.offset(1), file_b));
         assert_eq!(size_of::<SwfsFile>(), size_of::<SWFSFile>());
-        assert_eq!(*(*file_a).path, 'a' as c_char);
-        assert_eq!(*(*file_a).path.offset(1), '\0' as c_char);
-        assert_eq!(*(*file_b).path, 'b' as c_char);
-        assert_eq!(*(*file_b).path.offset(1), '\0' as c_char);
+        assert_eq!(*(*file_a).path, b'a' as c_char);
+        assert_eq!(*(*file_a).path.offset(1), b'\0' as c_char);
+        assert_eq!(*(*file_b).path, b'b' as c_char);
+        assert_eq!(*(*file_b).path.offset(1), b'\0' as c_char);
     }
 }
 

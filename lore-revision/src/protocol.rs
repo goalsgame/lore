@@ -19,6 +19,8 @@ use tokio::time::Instant;
 use crate::lore::RepositoryId;
 use crate::lore_debug;
 
+mod owner_context;
+
 // Bridge the connect() function to maintain the 3-argument signature.
 pub async fn connect(
     remote_url: &str,
@@ -51,6 +53,7 @@ pub struct RemoteConnections {
     remote_url: Arc<str>,
     identity: Arc<str>,
     connect: Connect,
+    owner: Option<owner_context::OwnerConnection>,
     connections: parking_lot::Mutex<HashMap<RepositoryId, Remote>>,
 }
 
@@ -67,6 +70,7 @@ pub(crate) type RemoteFuture = Shared<BoxFuture<'static, Result<Arc<Connection>,
 
 /// `connect` run as a task of its own on the network runtime and shared by every caller awaiting
 /// it, so it runs to its end whichever of them drop.
+#[lore_macro::test_pub]
 pub(crate) fn shared_connect(
     connect: impl Future<Output = Result<Arc<Connection>, ProtocolError>> + Send + 'static,
 ) -> RemoteFuture {
@@ -110,6 +114,7 @@ impl RemoteConnections {
             connect: |remote_url, identity, repository| {
                 async move { connect(&remote_url, &identity, repository).await }.boxed()
             },
+            owner: None,
             connections: parking_lot::Mutex::default(),
         }
     }
@@ -157,6 +162,7 @@ impl RemoteConnections {
         repository: RepositoryId,
     ) -> impl Future<Output = Result<Arc<Connection>, ProtocolError>> + '_ {
         async move {
+            self.check_owner_environment()?;
             let attempt = {
                 let (attempt, replaced) = 'attempt: {
                     let mut connections = self.connections.lock();
@@ -198,11 +204,7 @@ impl RemoteConnections {
                         }
                         _ => (connect_retry(), None),
                     };
-                    let attempt = shared_connect((self.connect)(
-                        self.remote_url.clone(),
-                        self.identity.clone(),
-                        repository,
-                    ));
+                    let attempt = self.start_connection(repository);
                     connections.insert(
                         repository,
                         Remote::Connecting {

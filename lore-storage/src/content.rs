@@ -59,6 +59,12 @@ impl lore_io::StableBufListMut for WindowRead {
 pub enum ContentSource<'a> {
     /// A file on the host filesystem, read through the IO driver.
     File(std::borrow::Cow<'a, Path>),
+    /// An owned host file whose storage remains retained through submitted IO.
+    /// The lease grants no authorization and is also retained by opened handles.
+    LeasedFile {
+        path: std::path::PathBuf,
+        lease: lore_io::lease::IoLease,
+    },
     /// Content a virtualizing library holds, named by whatever reads it.
     Virtual(VirtualContent),
 }
@@ -85,6 +91,16 @@ impl<'a> ContentSource<'a> {
         ContentSource::File(std::borrow::Cow::Owned(path))
     }
 
+    pub fn leased_file<T: Send + Sync + 'static>(
+        path: std::path::PathBuf,
+        owner: std::sync::Arc<T>,
+    ) -> ContentSource<'static> {
+        ContentSource::LeasedFile {
+            path,
+            lease: lore_io::lease::IoLease::new(owner),
+        }
+    }
+
     /// Content addressed in the immutable store, not backed by any host path.
     pub fn virtual_immutable(address: Address, size: u64) -> ContentSource<'static> {
         ContentSource::Virtual(VirtualContent::Immutable { address, size })
@@ -98,16 +114,17 @@ impl<'a> ContentSource<'a> {
             return Ok(*size);
         }
         let path = self.host_path();
-        lore_io::IoDriver::global()
-            .metadata(path)
-            .await
-            .map(|metadata| metadata.len())
-            .map_err(|err| {
-                StorageError::internal_with_context(
-                    err,
-                    &format!("failed to query file metadata: {}", path.display()),
-                )
-            })
+        let metadata = lore_io::IoDriver::global().metadata(path);
+        let result = match self {
+            Self::LeasedFile { lease, .. } => lease.scope(metadata).await,
+            _ => metadata.await,
+        };
+        result.map(|metadata| metadata.len()).map_err(|err| {
+            StorageError::internal_with_context(
+                err,
+                &format!("failed to query file metadata: {}", path.display()),
+            )
+        })
     }
 
     /// The whole content at once, naming it rather than opening it, which reads it in one
@@ -123,12 +140,14 @@ impl<'a> ContentSource<'a> {
             }));
         }
         let path = self.host_path();
-        lore_io::IoDriver::global()
-            .read_file_bytes(path)
-            .await
-            .map_err(|err| {
-                StorageError::internal_with_context(err, &format!("read file: {}", path.display()))
-            })
+        let read = lore_io::IoDriver::global().read_file_bytes(path);
+        let result = match self {
+            Self::LeasedFile { lease, .. } => lease.scope(read).await,
+            _ => read.await,
+        };
+        result.map_err(|err| {
+            StorageError::internal_with_context(err, &format!("read file: {}", path.display()))
+        })
     }
 
     /// The content as a handle windows are read from, and its size, retrying a transient failure
@@ -178,6 +197,16 @@ impl<'a> ContentSource<'a> {
         if matches!(self, ContentSource::Virtual(_)) {
             return Err(std::io::Error::from(std::io::ErrorKind::Unsupported));
         }
+        if let Self::LeasedFile { lease, .. } = self {
+            let (file, size) = lease.scope(open_read(self.host_path())).await?;
+            return Ok((
+                ContentHandle::LeasedFile {
+                    file,
+                    lease: lease.clone(),
+                },
+                size,
+            ));
+        }
         let (file, size) = open_read(self.host_path()).await?;
         Ok((ContentHandle::File(file), size))
     }
@@ -186,6 +215,7 @@ impl<'a> ContentSource<'a> {
     pub fn file_path(&self) -> Option<&Path> {
         match self {
             ContentSource::File(path) => Some(path),
+            ContentSource::LeasedFile { path, .. } => Some(path),
             ContentSource::Virtual(_) => None,
         }
     }
@@ -195,6 +225,7 @@ impl<'a> ContentSource<'a> {
     fn host_path(&self) -> &Path {
         match self {
             ContentSource::File(path) => path,
+            ContentSource::LeasedFile { path, .. } => path,
             ContentSource::Virtual(_) => Path::new(""),
         }
     }
@@ -204,6 +235,7 @@ impl std::fmt::Display for ContentSource<'_> {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ContentSource::File(path) => write!(formatter, "{}", path.display()),
+            ContentSource::LeasedFile { path, .. } => write!(formatter, "{}", path.display()),
             ContentSource::Virtual(VirtualContent::Immutable { address, .. }) => {
                 write!(formatter, "immutable:{address}")
             }
@@ -223,6 +255,11 @@ impl std::fmt::Display for ContentSource<'_> {
 pub enum ContentHandle {
     /// A file on the host, read through the IO driver.
     File(lore_io::IoFile),
+    /// A host handle retaining private storage through actual submitted reads.
+    LeasedFile {
+        file: lore_io::IoFile,
+        lease: lore_io::lease::IoLease,
+    },
     /// Content a virtualizing library holds, open. Never produced: no virtual content opens here.
     #[allow(dead_code)]
     Virtual(VirtualContent),
@@ -252,6 +289,10 @@ impl ContentHandle {
             ContentHandle::File(file) => {
                 Ok(file.read_exact_vectored_at(window, offset).await?.buffer)
             }
+            ContentHandle::LeasedFile { file, lease } => Ok(lease
+                .scope(file.read_exact_vectored_at(window, offset))
+                .await?
+                .buffer),
             ContentHandle::Virtual(_) => Err(std::io::Error::from(std::io::ErrorKind::Unsupported)),
         }
     }

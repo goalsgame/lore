@@ -514,6 +514,7 @@ pub async fn reset(
     revision: LoreString,
     options: ResetOptions,
 ) -> Result<(), ResetError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let relative_paths = resolve_user_paths(&repository, &paths).await?;
 
     let layers = layer::list(repository.clone())
@@ -704,6 +705,7 @@ pub async fn reset_to_last_merged(
     merge_side: ResetMergeSide,
     options: ResetOptions,
 ) -> Result<(), ResetError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     if branch.is_empty() {
         lore_debug!("Cannot reset to last merged without a branch");
         return Err(BranchNotFound {

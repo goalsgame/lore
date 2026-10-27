@@ -7,6 +7,7 @@ use lore_base::error::RepositoryNotFound;
 use lore_revision::event::EventError;
 use lore_revision::repository::RepositoryError;
 
+mod provider;
 pub(crate) mod test_support;
 
 use std::sync::Mutex;

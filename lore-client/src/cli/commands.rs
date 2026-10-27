@@ -8,6 +8,7 @@ pub mod layer;
 pub mod link;
 pub mod lock;
 pub mod logfile;
+pub mod mount;
 pub mod notification;
 pub mod repository;
 pub mod revision;

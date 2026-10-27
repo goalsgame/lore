@@ -138,6 +138,9 @@ pub struct UdsStream {
 }
 
 impl UdsStream {
+    pub(crate) fn shutdown(&self) -> std::io::Result<()> {
+        self.stream.shutdown(std::net::Shutdown::Both)
+    }
     pub fn writer(&mut self) -> &mut impl std::io::Write {
         &mut self.stream
     }

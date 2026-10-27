@@ -31,6 +31,8 @@ use crate::store::StoreGetData;
 use crate::store::StoreMatch;
 use crate::store::StoreMatchResult;
 
+mod owner_context;
+
 /// An immutable store served by a remote over the storage protocol. The remote is an untrusted
 /// source: a payload it serves is checked against its address on receipt.
 pub struct RemoteImmutableStore {
@@ -73,7 +75,8 @@ impl RemoteImmutableStore {
         partition: Partition,
     ) -> impl Future<Output = Result<Arc<dyn Admin>, StoreError>> + '_ {
         async move {
-            self.connections
+            let connection = self
+                .connections
                 .connection(partition)
                 .await
                 .forward_with::<StoreError, _>(|| {
@@ -81,8 +84,9 @@ impl RemoteImmutableStore {
                         "connecting to remote store at {}",
                         self.connections.remote_url()
                     )
-                })?
-                .admin(partition)
+                })?;
+            self.connections
+                .owner_setup(connection.admin(partition))
                 .await
                 .forward_with(|| {
                     format!(
@@ -104,15 +108,16 @@ fn remote_session(
     partition: Partition,
 ) -> impl Future<Output = Result<Arc<StorageSession>, StoreError>> + '_ {
     async move {
+        // Keep only the explicit caller correlation across owner-scoped setup.
+        let correlation = execution_context().globals().correlation_id.to_string();
         let connection = connections
             .connection(partition)
             .await
             .forward_with::<StoreError, _>(|| {
                 format!("connecting to remote store at {}", connections.remote_url())
             })?;
-        let execution = execution_context();
-        connection
-            .session_pool(partition, execution.globals().correlation_id.as_str())
+        connections
+            .owner_setup(connection.session_pool(partition, &correlation))
             .await
             .map(|pool| pool.pick())
             .forward_with(|| {

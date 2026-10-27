@@ -51,6 +51,9 @@ use crate::state::StateNodeChildrenWithNameIterator;
 use crate::util;
 use crate::util::path::RelativePath;
 
+#[path = "unstage/preflight.rs"]
+mod preflight;
+
 /// Data for the event emitted when an unstage operation begins.
 #[repr(C)]
 #[derive(Clone, PartialEq, Serialize, bitcode::Encode, bitcode::Decode)]
@@ -206,6 +209,15 @@ pub async fn unstage(
         .await
         .forward::<UnstageError>("Failed to list layers")?;
     let (parent_paths, layer_jobs) = route_layer_paths(&layers, relative_paths);
+
+    preflight::check(
+        repository.clone(),
+        &parent_paths,
+        &layers,
+        &layer_jobs,
+        options,
+    )
+    .await?;
 
     event::LoreEvent::FileUnstageBegin(LoreFileUnstageBeginEventData {
         path_count: parent_paths.len() + layer_jobs.iter().map(|(_, r)| r.len()).sum::<usize>(),

@@ -126,15 +126,19 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_base::lore_spawn_net!(grpc_auth_refresher(
-            auth_ref,
-            auth_endpoint.clone(),
-            remote_domain,
-            resolved_identity,
-            repository,
-            credentials.clone(),
-            rotated,
-        )));
+        // A persistent refresher keeps authorization context and credentials,
+        // but must not retain the instance IO operation that created it.
+        let refresher = Some(lore_io::lease::sync_scope(None, || {
+            lore_base::lore_spawn_net!(grpc_auth_refresher(
+                auth_ref,
+                auth_endpoint.clone(),
+                remote_domain,
+                resolved_identity,
+                repository,
+                credentials.clone(),
+                rotated,
+            ))
+        }));
 
         {
             let mut auth = auth.write();
@@ -179,8 +183,8 @@ impl GRPCAuth {
         }));
 
         let auth_ref = Arc::downgrade(&auth);
-        let refresher = Some(lore_base::lore_spawn_net!(
-            grpc_auth_refresher_custom_resource(
+        let refresher = Some(lore_io::lease::sync_scope(None, || {
+            lore_base::lore_spawn_net!(grpc_auth_refresher_custom_resource(
                 auth_ref,
                 auth_endpoint.clone(),
                 remote_domain,
@@ -188,8 +192,8 @@ impl GRPCAuth {
                 resource_id.to_string(),
                 credentials.clone(),
                 rotated,
-            )
-        ));
+            ))
+        }));
 
         {
             let mut auth = auth.write();
@@ -1206,14 +1210,27 @@ impl GRPCStorage {
 
     /// Storage needs no client rebuild: `StorageService` resolves the channel when it opens a
     /// stream, so a reconnected channel is picked up by the next rotation on its own.
-    async fn with_reconnect<T, Op, Fut>(&self, op: Op) -> Result<T, ProtocolError>
+    async fn with_reconnect<T, Op, Fut>(
+        &self,
+        ctx: &storage_client::GrpcSessionContext,
+        op: Op,
+    ) -> Result<T, ProtocolError>
     where
         Op: Fn() -> Fut,
         Fut: Future<Output = Result<T, ProtocolError>>,
     {
-        with_reconnect(&self.connection, op, |reconnect_id| async move {
-            self.connection.reconnect(reconnect_id).await.map(|_| ())
-        })
+        with_reconnect(
+            &self.connection,
+            || async {
+                ctx.check_open()?;
+                op().await
+            },
+            |reconnect_id| async move {
+                ctx.check_open()?;
+                self.connection.reconnect(reconnect_id).await?;
+                ctx.check_open()
+            },
+        )
         .await
     }
 }
@@ -1238,21 +1255,23 @@ impl Storage for GRPCStorage {
 
         let session_id = self
             .session_counter
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_exhausted| ProtocolError::internal("gRPC session identifiers exhausted"))?;
         self.sessions.insert(
             session_id,
-            Arc::new(storage_client::GrpcSessionContext {
+            Arc::new(storage_client::GrpcSessionContext::new(
                 partition,
-                correlation_id: correlation_id.to_string(),
-                auth_token: token,
-            }),
+                correlation_id.to_string(),
+                token,
+            )),
         );
         Ok(session_id)
     }
 
     async fn session_stop(&self, session_id: u32) -> Result<(), ProtocolError> {
-        self.sessions.remove(&session_id);
-        self.client.remove_session_streams(session_id);
+        if let Some((_, ctx)) = self.sessions.remove(&session_id) {
+            self.client.remove_session_streams(session_id, &ctx);
+        }
         Ok(())
     }
 
@@ -1262,8 +1281,12 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.get(session_id, &ctx, address))
-            .await
+        let operation = self.client.operation(&ctx).await?;
+        self.with_reconnect(&ctx, || {
+            self.client
+                .get_with_operation(session_id, &ctx, address, &operation)
+        })
+        .await
     }
 
     async fn get_metadata(
@@ -1272,8 +1295,12 @@ impl Storage for GRPCStorage {
         address: &Address,
     ) -> Result<Fragment, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.get_metadata(session_id, &ctx, address))
-            .await
+        let operation = self.client.operation(&ctx).await?;
+        self.with_reconnect(&ctx, || {
+            self.client
+                .get_metadata_with_operation(session_id, &ctx, address, &operation)
+        })
+        .await
     }
 
     async fn get_resolved(
@@ -1311,16 +1338,23 @@ impl Storage for GRPCStorage {
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
-            self.client
-                .put(session_id, &ctx, address, fragment, payload.clone())
+        let operation = self.client.operation(&ctx).await?;
+        self.with_reconnect(&ctx, || {
+            self.client.put_with_operation(
+                session_id,
+                &ctx,
+                address,
+                fragment,
+                payload.clone(),
+                &operation,
+            )
         })
         .await
     }
 
     async fn query(&self, session_id: u32, address: &[Address]) -> Result<Bytes, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.query(&ctx, address))
+        self.with_reconnect(&ctx, || self.client.query(&ctx, address))
             .await
     }
 
@@ -1331,7 +1365,7 @@ impl Storage for GRPCStorage {
         heal: bool,
     ) -> Result<VerifyResult, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.verify(&ctx, address, heal))
+        self.with_reconnect(&ctx, || self.client.verify(&ctx, address, heal))
             .await
     }
 
@@ -1343,13 +1377,15 @@ impl Storage for GRPCStorage {
         target_context: Context,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
-            self.client.copy(
+        let operation = self.client.operation(&ctx).await?;
+        self.with_reconnect(&ctx, || {
+            self.client.copy_with_operation(
                 session_id,
                 &ctx,
                 source_partition,
                 source_address,
                 target_context,
+                &operation,
             )
         })
         .await
@@ -1362,7 +1398,7 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.mutable_load(&ctx, key, key_type))
+        self.with_reconnect(&ctx, || self.client.mutable_load(&ctx, key, key_type))
             .await
     }
 
@@ -1374,8 +1410,10 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<(), ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| self.client.mutable_store(&ctx, key, value, key_type))
-            .await
+        self.with_reconnect(&ctx, || {
+            self.client.mutable_store(&ctx, key, value, key_type)
+        })
+        .await
     }
 
     async fn mutable_compare_and_swap(
@@ -1387,7 +1425,7 @@ impl Storage for GRPCStorage {
         key_type: KeyType,
     ) -> Result<Hash, ProtocolError> {
         let ctx = self.session_context(session_id)?;
-        self.with_reconnect(|| {
+        self.with_reconnect(&ctx, || {
             self.client
                 .mutable_compare_and_swap(&ctx, key, expected, value, key_type)
         })
@@ -1837,3 +1875,6 @@ impl Environment for GRPCEnvironment {
         .await
     }
 }
+
+#[cfg(test)]
+mod refresher_lifetime;

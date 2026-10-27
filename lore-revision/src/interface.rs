@@ -1021,6 +1021,7 @@ pub struct ExecutionContext {
     user_id: Mutex<String>,
     mode: ExecutionMode,
     caller_state: Option<Arc<dyn Any + Send + Sync>>,
+    provider_resolver: Option<std::sync::Weak<dyn crate::fs::provider_registry::ProviderResolver>>,
     /// What this call's fragment writes cost, accumulated across every write it
     /// performs — including the ones a background tracker task performs and the
     /// ones inside linked and layered repositories, which run under this same
@@ -1105,6 +1106,31 @@ impl ExecutionContext {
         }
     }
 
+    /// Detach a long-lived owner from a command's callbacks and opaque caller
+    /// state, preserving its identity, credential environment and weak resolver.
+    /// Construct this before connecting transports or capturing a backend context;
+    /// copying a context cannot detach tasks already spawned under the original.
+    /// Statistics belong to the new owner rather than the completed command.
+    pub async fn for_background_owner(&self) -> Self {
+        let mut dispatcher = EventDispatcher::no_dispatch();
+        dispatcher.correlation_id = self.globals.correlation_id.to_string();
+        Self {
+            globals: self.globals.clone(),
+            dispatcher,
+            log_level: self.log_level,
+            user_id: Mutex::new(self.user_id().await),
+            mode: match self.mode {
+                ExecutionMode::Client => ExecutionMode::Client,
+                ExecutionMode::Server => ExecutionMode::Server,
+            },
+            caller_state: None,
+            provider_resolver: self.provider_resolver.clone(),
+            fragment_stats: OnceLock::new(),
+            push_stats: OnceLock::new(),
+            environment: self.environment.clone(),
+        }
+    }
+
     pub fn globals(&self) -> &LoreGlobalArgs {
         &self.globals
     }
@@ -1123,6 +1149,23 @@ impl ExecutionContext {
 
     pub fn caller_state(&self) -> Option<&Arc<dyn Any + Send + Sync>> {
         self.caller_state.as_ref()
+    }
+
+    /// Route explicitly configured experimental working instances to existing
+    /// service owners. The service or scoped command must retain the resolver;
+    /// captured contexts keep only a weak reference to avoid provider cycles.
+    /// This does not change command credentials or caller state.
+    pub fn set_provider_resolver(
+        &mut self,
+        resolver: &Arc<dyn crate::fs::provider_registry::ProviderResolver>,
+    ) {
+        self.provider_resolver = Some(Arc::downgrade(resolver));
+    }
+
+    pub fn provider_resolver(
+        &self,
+    ) -> Option<Arc<dyn crate::fs::provider_registry::ProviderResolver>> {
+        self.provider_resolver.as_ref()?.upgrade()
     }
 
     /// The counters this call's fragment writes report into. See the field.
@@ -1149,6 +1192,7 @@ impl Default for ExecutionContext {
             user_id: Mutex::default(),
             mode: ExecutionMode::Client,
             caller_state: None,
+            provider_resolver: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
             environment: None,

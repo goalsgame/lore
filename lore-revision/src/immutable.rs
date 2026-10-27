@@ -616,6 +616,33 @@ pub fn write_from_file_with_tracker(
     })
 }
 
+/// Store and hash the exact file bytes for an opted-in commit operation.
+pub(crate) async fn write_from_file_with_sha256(
+    repository: Arc<RepositoryContext>,
+    source: &lore_storage::ContentSource<'_>,
+    context: Context,
+    flags: WriteOptions,
+    tracker: Arc<lore_storage::write_tracker::WriteTracker>,
+) -> Result<(Address, u64, lore_storage::write::IngestedContent), ImmutableError> {
+    let session = if flags.remote_write {
+        resolve_session(&repository)
+    } else {
+        None
+    };
+    lore_storage::write::write_from_file_with_sha256(
+        repository.immutable_store(),
+        repository.id,
+        source,
+        context,
+        flags,
+        session,
+        write_context(Some(tracker)),
+    )
+    .await
+    .map(|(written, digest)| (written.address, written.size_content, digest))
+    .forward::<ImmutableError>("writing immutable content with SHA-256")
+}
+
 /// The hash of the address the content of `source` would be stored under.
 ///
 /// Whether a file still holds content already stored is [`file_matches`], which measures against

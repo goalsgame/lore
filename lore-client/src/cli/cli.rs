@@ -237,6 +237,9 @@ pub fn output_formatter() -> Option<LoreEventCallback> {
 
 #[derive(Subcommand)]
 pub enum LoreCommands {
+    /// Experimental Linux mount with explicit writable opt-in
+    Mount(mount::MountArgs),
+
     /// Repository commands
     Repository(repository::RepositoryArgs),
 
@@ -354,6 +357,7 @@ pub enum LoreCommands {
 
 pub fn handle_lore_commands(cmd: &LoreCommands, globals: LoreGlobalArgs) -> u8 {
     match cmd {
+        LoreCommands::Mount(args) => mount::handle_mount(globals, args),
         LoreCommands::Repository(sub_cmd) => {
             repository::handle_repository_commands(&sub_cmd.command, globals)
         }

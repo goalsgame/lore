@@ -137,9 +137,7 @@ async fn a_stop_requested_before_the_wait_still_ends_it() {
     let request = Arc::new(StopRequest::new());
     assert!(request.begin_start());
     request.set_running();
-    let wait = ServiceStopRequest {
-        request: Arc::clone(&request),
-    };
+    let wait = request.bound_stop_request().unwrap();
 
     assert!(request.request_stop());
 
@@ -151,9 +149,7 @@ async fn a_stop_requested_during_the_wait_ends_it() {
     let request = Arc::new(StopRequest::new());
     assert!(request.begin_start());
     request.set_running();
-    let wait = ServiceStopRequest {
-        request: Arc::clone(&request),
-    };
+    let wait = request.bound_stop_request().unwrap();
 
     // Both run on this task: the wait parks first, then the request lands.
     tokio::join!(wait.requested(), async {

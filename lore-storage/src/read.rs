@@ -274,6 +274,7 @@ fn landed_before_probe(address: Address, options: ReadOptions) -> Option<u64> {
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::manual_async_fn)]
 fn stored_since(
+    store: &Arc<dyn ImmutableStore>,
     partition: Partition,
     address: Address,
     landed: Option<u64>,
@@ -282,7 +283,7 @@ fn stored_since(
         let Some(landed) = landed else {
             return false;
         };
-        crate::write::wait_if_in_flight(partition, address).await
+        crate::write::wait_if_in_flight(store, partition, address).await
             || crate::write::stores_landed(address) != landed
     }
 }
@@ -496,7 +497,7 @@ pub fn load_fragment(
         let landed = landed_before_probe(address, options);
         let mut probed = probe_local(store.clone(), partition, address, options).await;
         if matches!(probed, Err(LocalFailure::Corrupt | LocalFailure::Other))
-            && stored_since(partition, address, landed).await
+            && stored_since(&store, partition, address, landed).await
         {
             probed = probe_local(store.clone(), partition, address, options).await;
         }
@@ -826,7 +827,7 @@ pub fn read_into(
         let (fragment, buffer) = if let Some(content) = expanded {
             content
         } else {
-            let local = held || stored_since(partition, address, landed).await;
+            let local = held || stored_since(&store, partition, address, landed).await;
             load_root(
                 store.clone(),
                 partition,
@@ -981,7 +982,7 @@ fn content_payload_for_buffer(
             return Ok(None);
         }
 
-        let local = reprobe || stored_since(partition, address, landed).await;
+        let local = reprobe || stored_since(&store, partition, address, landed).await;
         let (fragment, content) = Box::pin(load_fragment(
             store,
             partition,
@@ -1678,7 +1679,7 @@ fn load_resolved_local(
         let landed = landed_before_probe(address, options);
         let mut loaded = probe_local(store.clone(), partition, address, options).await;
         if matches!(loaded, Err(LocalFailure::Corrupt | LocalFailure::Other))
-            && stored_since(partition, address, landed).await
+            && stored_since(&store, partition, address, landed).await
         {
             loaded = probe_local(store, partition, address, options).await;
         }

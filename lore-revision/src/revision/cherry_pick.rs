@@ -144,6 +144,7 @@ pub(crate) async fn cherry_pick(
     revision: Hash,
     options: CherryPickOptions,
 ) -> Result<Hash, MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -294,6 +295,7 @@ pub(crate) async fn cherry_pick_restart(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), MergeError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, _current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -387,6 +389,7 @@ pub(crate) async fn cherry_pick_resolve_mine(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), StageError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     validate_merge_type(repository.clone(), None, MergeType::CherryPick)
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;
@@ -408,6 +411,7 @@ pub(crate) async fn cherry_pick_resolve_theirs(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), StageError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     validate_merge_type(repository.clone(), None, MergeType::CherryPick)
         .await
         .forward::<StageError>("Failed to deserialize revision state")?;

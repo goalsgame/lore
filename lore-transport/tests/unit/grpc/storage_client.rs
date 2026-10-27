@@ -238,11 +238,11 @@ impl StorageServiceV1 for StreamKillingServer {
 }
 
 fn test_context() -> GrpcSessionContext {
-    GrpcSessionContext {
-        partition: Partition::from(Context::from([0x11u8; 16])),
-        correlation_id: "rotation-test".to_string(),
-        auth_token: String::new(),
-    }
+    GrpcSessionContext::new(
+        Partition::from(Context::from([0x11u8; 16])),
+        "rotation-test".to_string(),
+        String::new(),
+    )
 }
 
 /// Stand up a `StorageService` talking to a `StreamKillingServer`, and hand back the
@@ -648,3 +648,5 @@ async fn copies_to_one_target_coalesce() {
     second_copy.expect("second copy");
     assert_eq!(copied.lock().unwrap().len(), 1);
 }
+
+mod request_ownership;

@@ -15,6 +15,8 @@ pub mod layer;
 pub mod link;
 pub mod lock;
 pub mod log;
+pub mod mount;
+pub mod mount_working;
 pub mod notification;
 pub mod remote;
 pub mod repository;
@@ -24,6 +26,8 @@ pub mod service;
 pub mod shared_store;
 pub mod storage;
 mod util;
+#[cfg(unix)]
+pub mod working_mount;
 
 use interface::LoreString;
 pub use lore_base::lore_spawn;
@@ -38,11 +42,36 @@ pub use lore_error_set as error_set;
 /// reads of calls cut short after it.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// Shuts the library down, returning whether this call was the one that did it.
+/// A library shutdown that did not complete.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ShutdownError {
+    #[error("the library has already entered terminal shutdown")]
+    AlreadyShutDown,
+    #[error("another library shutdown attempt is in progress")]
+    InProgress,
+    #[cfg(unix)]
+    #[error(
+        "timed out waiting for the owned service to retire; library resources are retained and shutdown may be retried"
+    )]
+    ServiceTimedOut,
+    #[cfg(unix)]
+    #[error(
+        "the owned service could not retire: {0}; library resources are retained and shutdown may be retried"
+    )]
+    ServiceRetained(String),
+    #[cfg(unix)]
+    #[error("service start admission is unavailable: {0}; library resources are retained")]
+    AdmissionUnavailable(&'static str),
+}
+
+/// Shuts the library down, returning `true` only when this call completes teardown.
 ///
-/// Only the first caller runs the teardown. Every other gets `false`, so a
-/// concurrent caller can report the library as already shut down rather than
-/// racing a second teardown against the first.
+/// Returns `false` when shutdown is already terminal, another attempt is in
+/// progress, or an owned Unix service could not retire within its bound. A
+/// service preflight failure retains the runtimes, connections and allocator;
+/// shutdown may be retried after the service can finish retiring.
+/// A panic during service start publication makes the next shutdown attempt
+/// return `false` before a retry can inspect the retained service run.
 ///
 /// Claiming the shutdown also closes admission, so calls that arrive while the
 /// drains below are still running fail instead of being admitted onto runtimes
@@ -51,9 +80,33 @@ const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Safe only once every call has completed. Calls still executing are cancelled at best effort: one
 /// not stopped in time may use the memory passed to it after this returns.
 pub fn shutdown() -> bool {
+    match try_shutdown() {
+        Ok(()) => true,
+        Err(reason) => {
+            lore_base::lore_warn!("Library shutdown did not complete: {reason}");
+            false
+        }
+    }
+}
+
+/// Attempts shutdown with an explicit reason when teardown cannot complete.
+///
+/// Has the same call-completion requirements as [`shutdown`]. On Unix, owned
+/// service retirement completes before global runtime admission is closed.
+pub fn try_shutdown() -> Result<(), ShutdownError> {
+    #[cfg(unix)]
+    {
+        service::shutdown::try_shutdown(SHUTDOWN_WAIT, teardown)
+    }
+    #[cfg(not(unix))]
+    {
+        teardown()
+    }
+}
+
+fn teardown() -> Result<(), ShutdownError> {
     if !lore_base::runtime::claim_runtime_shutdown() {
-        lore_base::lore_warn!("Shutdown was already called");
-        return false;
+        return Err(ShutdownError::AlreadyShutDown);
     }
 
     // Garbage collection stops alongside the drains rather than before them, so neither
@@ -89,7 +142,7 @@ pub fn shutdown() -> bool {
     // hold that child unreaped for however long it outlives its Lore use.
     remote::service_process::collect_exited_services();
 
-    true
+    Ok(())
 }
 
 pub fn runtime() -> tokio::runtime::Handle {

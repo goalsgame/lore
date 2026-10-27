@@ -33,6 +33,9 @@ lore-error-set = { workspace = true }
 lore-macro = { workspace = true }
 lore-notification = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+lore-vfs = { workspace = true }
+
 [target.'cfg(target_family = "windows")'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
@@ -47,6 +50,7 @@ swfs = ["lore-revision/swfs"]
 test-util = []
 
 [dev-dependencies]
+async-trait = { workspace = true }
 # The unit-test binary's process sandbox, set up before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
@@ -54,6 +58,12 @@ lore-storage = { workspace = true, features = ["test-util"] }
 rand = { workspace = true }
 serial_test = { workspace = true }
 lore = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(unix)'.dev-dependencies]
+lore-vfs = { workspace = true, features = ["test-util"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tokio = { workspace = true, features = ["process"] }
 
 [lints]
 workspace = true

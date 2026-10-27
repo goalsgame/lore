@@ -5,20 +5,29 @@
 //! This module defines the two-trait architecture that separates operation context creation
 //! (freeze for SWFS) from actual file operations (work against frozen snapshot).
 
+mod external;
+mod root_hold;
 use std::fs::Metadata;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+pub use external::ExternalOperation;
+pub use external::ExternalOperationDispatch;
 use lore_base::error::FileNotFound;
 use lore_base::error::InvalidArguments;
 use lore_base::error::LocalModifications;
 use lore_base::types::Fragment;
+use lore_base::types::Hash;
 use lore_error_set::ErrorSet;
 use lore_error_set::error_set;
 use lore_error_set::prelude::*;
+pub use root_hold::DurableRootIntent;
+pub use root_hold::RootHoldOutcome;
+pub use root_hold::RootHoldRequest;
 
 use crate::filter::FilterMode;
 use crate::filter::FilterStates;
@@ -177,6 +186,13 @@ pub struct DirectoryEntry {
 /// the same reason [`InstanceOperationImpl`] does.
 pub enum StaticDispatchDirectoryListing {
     Os(OsDirectoryListing),
+    External(Box<dyn ExternalDirectoryListing>),
+}
+
+/// Lazy directory traversal supplied by an injected provider.
+#[async_trait]
+pub trait ExternalDirectoryListing: Send {
+    async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>>;
 }
 
 /// Directory entries, resolved as the consumer asks for them.
@@ -196,6 +212,7 @@ impl DirectoryListing {
     pub async fn next(&mut self) -> Option<Result<DirectoryEntry, FsError>> {
         match &mut self.dispatch {
             StaticDispatchDirectoryListing::Os(this) => this.next().await,
+            StaticDispatchDirectoryListing::External(this) => this.next().await,
         }
     }
 }
@@ -316,6 +333,37 @@ pub struct FileModifiedCheck {
 /// For SWFS, this is where the filesystem freeze occurs.
 #[async_trait]
 pub trait FilesystemProvider: Send + Sync + 'static {
+    /// Dedicated root protocol, independent of legacy revision replacement.
+    /// Opt-in requires a durable provider implementation; ordinary providers
+    /// continue using the existing operation/finalization ordering.
+    fn supports_transactional_root_hold(&self) -> bool {
+        false
+    }
+    async fn transactional_root_hold(
+        &self,
+        _request: RootHoldRequest,
+    ) -> Result<RootHoldOutcome, FsError> {
+        Err(FsError::internal("Transactional root hold is unsupported"))
+    }
+
+    /// Whether revision replacement and merge-state commands may run against
+    /// this provider. Stage, unstage and commit do not require this capability.
+    /// A provider delegating to another provider must forward its answer.
+    fn supports_revision_replacement(&self) -> bool {
+        true
+    }
+    /// Read a small authored metadata file through this provider's current
+    /// authorization and namespace. Missing files return `FileNotFound`; other
+    /// failures must not be interpreted as an empty file. Implementations check
+    /// the requested bound before allocating content and reject larger files.
+    async fn read_metadata_file(
+        &self,
+        _path: &RelativePath,
+        _maximum: usize,
+    ) -> Result<Vec<u8>, FsError> {
+        Err(FsError::internal("provider metadata reads are unsupported"))
+    }
+
     /// Create a new filesystem operation context.
     ///
     /// A filesystem holds one operation at a time and the next begins once that one is
@@ -341,12 +389,28 @@ pub trait FilesystemProvider: Send + Sync + 'static {
     }
 }
 
+/// The enclosing operation's result, independent of whether mutation was asked
+/// for. Cancellation uses the external provider's synchronous `abort` hook.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OperationOutcome {
+    Succeeded,
+    Failed,
+    Aborted,
+}
+struct OperationAbort<'a>(&'a InstanceOperationImpl);
+impl Drop for OperationAbort<'_> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
 /// Runs `work` inside one filesystem operation, finalizing it whether or not the work
 /// succeeded so a failure never leaves a filesystem frozen.
 ///
 /// The finalize is told what the work wrote, which the operation records as each write is
 /// asked for. The work's error is reported ahead of a finalize failure, being the one that
-/// explains the run.
+/// explains the run. Queued commit digests are delivered only after both work and
+/// finalization succeed; failing or cancelled work leaves no publication notification.
 pub async fn with_operation<T, E, F>(
     filesystem: Arc<dyn FilesystemProvider>,
     work: F,
@@ -359,13 +423,20 @@ where
         .begin_operation()
         .await
         .forward_any::<E>("Failed to start filesystem operation")?;
+    let _abort = OperationAbort(operation.as_ref());
     let result = work(operation.clone()).await;
+    let outcome = if result.is_ok() {
+        OperationOutcome::Succeeded
+    } else {
+        OperationOutcome::Failed
+    };
     let finalized = operation
-        .finalize()
+        .finalize_with_outcome(outcome)
         .await
         .forward_any::<E>("Failed to finish filesystem operation");
     let value = result?;
     finalized?;
+    operation.publish_content_digests().await;
     Ok(value)
 }
 
@@ -472,6 +543,12 @@ where
 /// This type is not dyn-safe, async methods don't have their future boxed to allow static dispatch
 /// though an `impl InstanceOperation`
 pub trait InstanceOperation: Send + Sync {
+    /// Whether nested-working-copy detection may inspect host paths. Virtual
+    /// providers leave this false; their directory entries remain authoritative.
+    fn uses_host_filesystem(&self) -> bool {
+        false
+    }
+
     /// Diff the filesystem under `diff.filesystem_path` against the trees it names, answering
     /// with the changes as the walk finds them.
     ///
@@ -803,6 +880,7 @@ pub trait InstanceOperation: Send + Sync {
 /// while still not knowing which type is in use at compile time.
 pub enum StaticDispatchInstanceOperation {
     Os(OsOperation),
+    External(ExternalOperationDispatch),
     Swfs(SwfsOperation),
     #[cfg(feature = "test-util")]
     Test(test_util::TestOperation),
@@ -823,30 +901,292 @@ pub struct HoldOptions {
     pub dry_run: bool,
 }
 
+/// Exact immutable source and working-tree mount used by a commit traversal.
+/// Construction verifies the selected source against an independently loaded
+/// revision; this evidence does not authorize access to that scope.
+#[derive(Clone, Debug)]
+pub struct CommittedScope {
+    mount_path: RelativePath,
+    source_revision: Hash,
+    source_root: crate::node::NodeID,
+    source_path: String,
+}
+impl CommittedScope {
+    pub fn mount_path(&self) -> &RelativePath {
+        &self.mount_path
+    }
+    pub fn source_revision(&self) -> Hash {
+        self.source_revision
+    }
+    pub fn source_root(&self) -> crate::node::NodeID {
+        self.source_root
+    }
+    pub fn source_path(&self) -> &str {
+        &self.source_path
+    }
+    pub(crate) async fn capture(source: NodeMapping) -> Result<Self, FsError> {
+        let source_revision = source.state.revision();
+        let source_path = source
+            .state
+            .node_path_below(
+                source.repository.clone(),
+                source.node,
+                crate::node::ROOT_NODE,
+            )
+            .await
+            .map_err(|error| FsError::internal(format!("commit source path: {error}")))?
+            .ok_or_else(|| {
+                FsError::internal("commit source is not attached to its repository root")
+            })?
+            .to_string();
+        if source.path.as_str().len() > 32768 || source_path.len() > 32768 {
+            return Err(FsError::internal("commit scope path limit"));
+        }
+        let independent = State::deserialize(source.repository.clone(), source_revision)
+            .await
+            .map_err(|error| FsError::internal(format!("commit source revision: {error}")))?;
+        let root = independent
+            .find_node_link(source.repository.clone(), &source_path)
+            .await
+            .map_err(|error| FsError::internal(format!("commit source subtree: {error}")))?;
+        if root.repository != source.repository.id
+            || root.revision != source_revision
+            || !root.is_valid_or_root()
+        {
+            return Err(FsError::internal("commit source crossed owning scope"));
+        }
+        let node = independent
+            .node(source.repository.clone(), root.node)
+            .await
+            .map_err(|error| FsError::internal(format!("commit source node: {error}")))?;
+        if node.is_link() || node.is_discarded() {
+            return Err(FsError::internal("commit source is not an exposed subtree"));
+        }
+        Ok(Self {
+            mount_path: source.path,
+            source_revision,
+            source_root: root.node,
+            source_path,
+        })
+    }
+}
+
+/// Trusted whole-content digests delivered only after a successful, flushed commit.
+pub struct CommittedContentDigests {
+    repository: lore_base::types::RepositoryId,
+    revision: Hash,
+    content: Vec<lore_storage::write::IngestedContent>,
+}
+
+impl CommittedContentDigests {
+    pub fn repository(&self) -> lore_base::types::RepositoryId {
+        self.repository
+    }
+    pub fn revision(&self) -> Hash {
+        self.revision
+    }
+    pub fn content(&self) -> &[lore_storage::write::IngestedContent] {
+        &self.content
+    }
+}
+
+pub(crate) struct CommitHandoff<'a> {
+    failed: &'a AtomicBool,
+    completed: bool,
+}
+impl CommitHandoff<'_> {
+    pub(crate) fn complete(&mut self) {
+        self.completed = true;
+    }
+}
+impl Drop for CommitHandoff<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
 pub struct InstanceOperationImpl {
     dispatch: StaticDispatchInstanceOperation,
     /// What the provider that began the operation answers for [`FilesystemProvider::holds_state`].
     holds_state: bool,
     /// Whether the operation began in a dry run, which writes nothing through it.
     dry_run: bool,
+    ingested: parking_lot::Mutex<
+        Vec<(
+            lore_base::types::RepositoryId,
+            lore_storage::write::IngestedContent,
+        )>,
+    >,
+    pending_digests: parking_lot::Mutex<Vec<CommittedContentDigests>>,
     finalized: AtomicBool,
+    terminal: AtomicU8,
     changed: AtomicBool,
+    commit_handoff_failed: AtomicBool,
     modified_times: RecordedModifiedTimes,
     /// The filesystem clock, read once, the first time [`Self::clock_floor`] is asked.
     clock_floor: tokio::sync::OnceCell<u64>,
 }
 
+impl Drop for InstanceOperationImpl {
+    fn drop(&mut self) {
+        self.abort();
+    }
+}
+
 impl InstanceOperationImpl {
+    /// Wrap an injected operation without imposing a dependency on its provider crate.
+    /// `holds_state` must agree with the factory's [`FilesystemProvider::holds_state`].
+    pub fn external(operation: impl ExternalOperation, holds_state: bool) -> Self {
+        Self::new(
+            StaticDispatchInstanceOperation::External(ExternalOperationDispatch(Box::new(
+                operation,
+            ))),
+            holds_state,
+        )
+    }
+
     pub fn new(dispatch: StaticDispatchInstanceOperation, holds_state: bool) -> Self {
         Self {
             dispatch,
             holds_state,
             dry_run: crate::runtime::try_execution_context()
                 .is_some_and(|context| context.globals().dry_run()),
+            ingested: parking_lot::Mutex::new(Vec::new()),
+            pending_digests: parking_lot::Mutex::new(Vec::new()),
             finalized: AtomicBool::new(false),
+            terminal: AtomicU8::new(0),
             changed: AtomicBool::new(false),
+            commit_handoff_failed: AtomicBool::new(false),
             modified_times: RecordedModifiedTimes::default(),
             clock_floor: tokio::sync::OnceCell::new(),
+        }
+    }
+
+    /// Delivers a flushed commit through its independently checked source mapping.
+    /// The same path constructs evidence for root, link and layer traversals.
+    pub async fn committed_from_source(
+        &self,
+        source: NodeMapping,
+        committed: Arc<State>,
+    ) -> Result<(), FsError> {
+        if !self.holds_state || self.dry_run {
+            return Ok(());
+        }
+        let repository = source.repository.clone();
+        if !matches!(&self.dispatch, StaticDispatchInstanceOperation::External(_)) {
+            return self.committed(repository, committed).await;
+        }
+        let mut handoff = CommitHandoff {
+            failed: &self.commit_handoff_failed,
+            completed: false,
+        };
+        self.record_change();
+        let result = async {
+            let scope = CommittedScope::capture(source).await?;
+            let digests = CommittedContentDigests {
+                repository: repository.id,
+                revision: committed.revision(),
+                content: self
+                    .ingested
+                    .lock()
+                    .iter()
+                    .filter(|(owner, _)| *owner == repository.id)
+                    .map(|(_, content)| content.clone())
+                    .collect(),
+            };
+            if let StaticDispatchInstanceOperation::External(this) = &self.dispatch {
+                this.0
+                    .committed(repository, committed, scope, digests)
+                    .await
+            } else {
+                unreachable!()
+            }
+        }
+        .await;
+        handoff.completed = result.is_ok();
+        result
+    }
+    pub(crate) fn wants_linked_commits(&self) -> bool {
+        self.holds_state
+            && !self.dry_run
+            && matches!(&self.dispatch, StaticDispatchInstanceOperation::External(_))
+    }
+    pub(crate) fn begin_commit_handoff(&self) -> Option<CommitHandoff<'_>> {
+        if !self.wants_linked_commits() {
+            return None;
+        }
+        Some(CommitHandoff {
+            failed: &self.commit_handoff_failed,
+            completed: false,
+        })
+    }
+    #[lore_macro::test_pub]
+    pub(crate) fn requires_durable_commit_handoff(&self) -> bool {
+        self.wants_linked_commits()
+            && match &self.dispatch {
+                StaticDispatchInstanceOperation::External(this) => {
+                    this.0.requires_durable_commit_handoff()
+                }
+                _ => false,
+            }
+    }
+
+    pub(crate) fn wants_content_sha256(&self) -> bool {
+        self.holds_state
+            && !self.dry_run
+            && match &self.dispatch {
+                StaticDispatchInstanceOperation::External(this) => this.0.wants_content_sha256(),
+                _ => false,
+            }
+    }
+
+    #[lore_macro::test_pub]
+    pub(crate) fn record_ingested(
+        &self,
+        repository: lore_base::types::RepositoryId,
+        content: lore_storage::write::IngestedContent,
+    ) {
+        self.ingested.lock().push((repository, content));
+    }
+
+    #[lore_macro::test_pub]
+    pub(crate) fn queue_content_digests(
+        &self,
+        repository: lore_base::types::RepositoryId,
+        revision: Hash,
+    ) {
+        if !self.wants_content_sha256() {
+            return;
+        }
+        let mut ingested = self.ingested.lock();
+        let mut content = Vec::new();
+        ingested.retain(|(owner, digest)| {
+            if *owner == repository {
+                content.push(digest.clone());
+                false
+            } else {
+                true
+            }
+        });
+        self.pending_digests.lock().push(CommittedContentDigests {
+            repository,
+            revision,
+            content,
+        });
+    }
+
+    async fn publish_content_digests(&self) {
+        let batches = std::mem::take(&mut *self.pending_digests.lock());
+        if let StaticDispatchInstanceOperation::External(this) = &self.dispatch {
+            for batch in batches {
+                if let Err(error) = this.0.committed_digests(batch).await {
+                    crate::lore_warn!(
+                        "The filesystem provider could not cache committed content digests: {error}"
+                    );
+                }
+            }
         }
     }
 
@@ -902,15 +1242,66 @@ impl InstanceOperationImpl {
     ///   reads come from.
     /// - **`SWFS`**: Thaws the filesystem, clearing the write cache where writes were made.
     pub async fn finalize(&self) -> Result<(), FsError> {
+        self.finalize_with_outcome(OperationOutcome::Succeeded)
+            .await
+    }
+    async fn finalize_with_outcome(&self, outcome: OperationOutcome) -> Result<(), FsError> {
+        if self.terminal.load(Ordering::Acquire) == 2 {
+            return Err(FsError::internal("Operation was aborted"));
+        }
         if !self.claim_finalize() {
             return Err(FsError::internal("Operation already finalized"));
         }
+        let _abort = OperationAbort(self);
         let changes_made = self.changed.load(Ordering::Acquire);
-        match &self.dispatch {
+        let result = match &self.dispatch {
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.finalize(changes_made),
             StaticDispatchInstanceOperation::Os(_this) => Ok(()),
+            StaticDispatchInstanceOperation::External(this) => {
+                let provider_outcome = if matches!(outcome, OperationOutcome::Succeeded)
+                    && self.commit_handoff_failed.load(Ordering::Acquire)
+                {
+                    OperationOutcome::Failed
+                } else {
+                    outcome
+                };
+                this.0.finalize(changes_made, provider_outcome).await
+            }
             StaticDispatchInstanceOperation::Swfs(this) => this.finalize(changes_made).await,
+        };
+        let result = if result.is_ok()
+            && self.commit_handoff_failed.load(Ordering::Acquire)
+            && outcome == OperationOutcome::Succeeded
+        {
+            Err(FsError::internal(
+                "a scoped commit handoff failed or was cancelled",
+            ))
+        } else {
+            result
+        };
+        if result.is_ok()
+            && self
+                .terminal
+                .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+                .is_err()
+        {
+            return Err(FsError::internal("Operation aborted while finalizing"));
+        }
+        result
+    }
+    /// Cancel retained operation capabilities even when other tasks still hold
+    /// an Arc. External providers must reject their later completions.
+    pub fn abort(&self) {
+        if self
+            .terminal
+            .compare_exchange(0, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
+        if let StaticDispatchInstanceOperation::External(this) = &self.dispatch {
+            this.0.abort();
         }
     }
 
@@ -941,6 +1332,18 @@ impl InstanceOperationImpl {
             }
             return this.hold_state(&target, options);
         }
+        if let StaticDispatchInstanceOperation::External(this) = &self.dispatch
+            && self.holds_state
+        {
+            if !options.dry_run && !self.dry_run {
+                self.record_change();
+            }
+            let options = HoldOptions {
+                dry_run: options.dry_run || self.dry_run,
+                ..options
+            };
+            return this.0.hold_state(repository, target, options).await;
+        }
         let _ = (repository, target, options);
         Err(FsError::internal(
             "Unable to hold a revision through an operation that holds no State",
@@ -949,11 +1352,25 @@ impl InstanceOperationImpl {
 }
 
 impl InstanceOperation for InstanceOperationImpl {
+    fn uses_host_filesystem(&self) -> bool {
+        match &self.dispatch {
+            StaticDispatchInstanceOperation::Os(_) | StaticDispatchInstanceOperation::Swfs(_) => {
+                true
+            }
+            StaticDispatchInstanceOperation::External(this) => this.0.uses_host_filesystem(),
+            #[cfg(feature = "test-util")]
+            StaticDispatchInstanceOperation::Test(_) => false,
+        }
+    }
+
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
     ) -> ChangeStream<FilesystemDiffStats> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.changes_from_filesystem_to_state(diff)
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => {
                 this.changes_from_filesystem_to_state(diff)
@@ -969,6 +1386,7 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.file_info(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.file_info(path).await,
@@ -978,6 +1396,9 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn untracked_file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.untracked_file_info(path).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.untracked_file_info(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.untracked_file_info(path).await,
@@ -987,6 +1408,9 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.holds_name_exactly(path).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.holds_name_exactly(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.holds_name_exactly(path).await,
@@ -1000,6 +1424,9 @@ impl InstanceOperation for InstanceOperationImpl {
         name: &str,
     ) -> Result<Vec<String>, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.names_folding_to(path, name).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.names_folding_to(path, name).await,
             StaticDispatchInstanceOperation::Os(this) => this.names_folding_to(path, name).await,
@@ -1009,6 +1436,7 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.read_directory(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.read_directory(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.read_directory(path).await,
@@ -1021,6 +1449,7 @@ impl InstanceOperation for InstanceOperationImpl {
         path: &RelativePath,
     ) -> Result<lore_storage::ContentSource<'static>, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.content_source(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.content_source(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.content_source(path).await,
@@ -1037,6 +1466,11 @@ impl InstanceOperation for InstanceOperationImpl {
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0
+                    .file_holds_content(repository, path, previous, previous_size, established)
+                    .await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
@@ -1056,6 +1490,9 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.make_executable(path, executable).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
@@ -1073,6 +1510,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.create_dir_all(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.create_dir_all(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.create_dir_all(path).await,
@@ -1086,6 +1524,9 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.write_file(path, contents).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.write_file(path, contents).await,
@@ -1099,6 +1540,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.rename(from, to).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.rename(from, to).await,
@@ -1112,6 +1554,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.remove(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove(path).await,
@@ -1125,6 +1568,7 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.remove_recursive(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => this.remove_recursive(path).await,
@@ -1143,6 +1587,9 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.write_node(repository, node, path).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
@@ -1165,6 +1612,11 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0
+                    .set_file_to_immutable_store_contents(repository, address, path)
+                    .await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
@@ -1188,6 +1640,9 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.copy_file(source_path, destination_path).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(_this) => panic!(),
             StaticDispatchInstanceOperation::Os(this) => {
@@ -1201,6 +1656,7 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn infer_is_diffable(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => this.0.infer_is_diffable(path).await,
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_diffable(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_diffable(path).await,
@@ -1210,6 +1666,9 @@ impl InstanceOperation for InstanceOperationImpl {
 
     async fn infer_is_conflicted(&self, path: &RelativePath) -> Result<bool, FsError> {
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.infer_is_conflicted(path).await
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.infer_is_conflicted(path).await,
             StaticDispatchInstanceOperation::Os(this) => this.infer_is_conflicted(path).await,
@@ -1222,6 +1681,9 @@ impl InstanceOperation for InstanceOperationImpl {
             return;
         }
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(this) => {
+                this.0.stored(path, address, size, mode);
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => this.stored(path, address, size, mode),
             StaticDispatchInstanceOperation::Os(this) => this.stored(path, address, size, mode),
@@ -1239,6 +1701,12 @@ impl InstanceOperation for InstanceOperationImpl {
         }
         self.record_change();
         match &self.dispatch {
+            StaticDispatchInstanceOperation::External(_this) => {
+                self.commit_handoff_failed.store(true, Ordering::Release);
+                Err(FsError::internal(
+                    "external commit requires an explicit source scope",
+                ))
+            }
             #[cfg(feature = "test-util")]
             StaticDispatchInstanceOperation::Test(this) => {
                 this.committed(repository, committed).await
