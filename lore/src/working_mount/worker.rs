@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
+use std::sync::Arc;
 use std::sync::Mutex;
 use std::thread::JoinHandle;
 
@@ -10,7 +11,7 @@ use super::Result;
 enum State {
     Unpublished,
     Running(JoinHandle<()>),
-    Joining,
+    Joining(Option<JoinHandle<()>>),
     Joined(Result<()>),
 }
 
@@ -18,8 +19,8 @@ enum State {
 /// caller waiting for logical completion or cancellation of that wait.
 #[allow(private_interfaces)]
 #[lore_macro::test_pub]
-pub(super) struct ThreadOwner {
-    state: Mutex<State>,
+pub(crate) struct ThreadOwner {
+    state: Arc<Mutex<State>>,
 }
 
 impl Default for ThreadOwner {
@@ -30,16 +31,16 @@ impl Default for ThreadOwner {
 
 impl ThreadOwner {
     #[lore_macro::test_pub]
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
-            state: Mutex::new(State::Unpublished),
+            state: Arc::new(Mutex::new(State::Unpublished)),
         }
     }
 
     /// Install before awaiting worker results. A failed spawn has no thread to
     /// join, but still publishes that fact to a concurrently retiring record.
     #[lore_macro::test_pub]
-    pub(super) fn publish(&self, thread: Option<JoinHandle<()>>) {
+    pub(crate) fn publish(&self, thread: Option<JoinHandle<()>>) {
         let mut state = self
             .state
             .lock()
@@ -51,34 +52,57 @@ impl ThreadOwner {
         };
     }
 
-    #[lore_macro::test_pub]
-    pub(super) async fn drain(&self) -> Result<()> {
-        loop {
-            let thread = {
-                let mut state = self.state.lock().map_err(|_poison| Error::Poisoned)?;
-                match &*state {
-                    State::Joined(result) => return result.clone(),
-                    State::Running(thread) if thread.is_finished() => {
-                        let State::Running(thread) = std::mem::replace(&mut *state, State::Joining)
-                        else {
-                            unreachable!("finished worker has a thread handle");
-                        };
-                        Some(thread)
-                    }
-                    _ => None,
-                }
-            };
-            if let Some(thread) = thread {
-                // The thread has already exited. No worker is occupied waiting
-                // for user work, and cancellation cannot occur between taking
-                // the handle, joining, and publishing the shared result.
+    /// Starts a retained native joiner once and observes its recorded result.
+    /// A failed joiner spawn leaves the worker available for a later retry.
+    pub(crate) fn try_drain(&self) -> Option<Result<()>> {
+        let mut state = match self.state.lock() {
+            Ok(state) => state,
+            Err(_) => return Some(Err(Error::Poisoned)),
+        };
+        match &*state {
+            State::Joined(result) => return Some(result.clone()),
+            State::Running(_) => {}
+            _ => return None,
+        }
+        let State::Running(thread) = std::mem::replace(&mut *state, State::Joining(None)) else {
+            unreachable!("running worker has a thread handle");
+        };
+        *state = State::Joining(Some(thread));
+        let shared = self.state.clone();
+        // is_finished can precede TLS destruction. Join on a dedicated thread
+        // so even a blocked destructor never occupies an async runtime or its
+        // blocking pool. The joiner retains state after every waiter is gone.
+        let joiner = std::thread::Builder::new()
+            .name("lore-worker-join".into())
+            .spawn(move || {
+                let thread = {
+                    let mut state = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+                    let State::Joining(thread) = &mut *state else {
+                        unreachable!("joiner owns the worker handle");
+                    };
+                    thread.take().expect("one joiner owns the worker")
+                };
                 let result = thread
                     .join()
-                    .map_err(|_panic| Error::Owner("working owner thread panicked".into()));
-                *self
-                    .state
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner()) = State::Joined(result.clone());
+                    .map_err(|_panic| Error::Owner("owner thread panicked".into()));
+                *shared.lock().unwrap_or_else(|poison| poison.into_inner()) = State::Joined(result);
+            });
+        if let Err(error) = joiner {
+            let State::Joining(thread) = &mut *state else {
+                unreachable!("failed joiner leaves its worker handle");
+            };
+            *state = State::Running(thread.take().expect("unstarted joiner"));
+            return Some(Err(Error::Owner(format!(
+                "starting worker joiner: {error}"
+            ))));
+        }
+        None
+    }
+
+    #[lore_macro::test_pub]
+    pub(crate) async fn drain(&self) -> Result<()> {
+        loop {
+            if let Some(result) = self.try_drain() {
                 return result;
             }
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;

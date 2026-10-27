@@ -36,7 +36,7 @@ mod reservation;
 pub mod reservation;
 use reservation::ReservedPaths;
 #[cfg(not(feature = "test-util"))]
-mod worker;
+pub(crate) mod worker;
 #[cfg(feature = "test-util")]
 pub mod worker;
 

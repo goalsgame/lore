@@ -71,6 +71,10 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --verbose
 
+      - name: Test private revision and transport libraries
+        # These libraries set test = false, so workspace tests omit their unit tests.
+        run: cargo test --locked --package lore-revision --package lore-transport --lib --verbose
+
   vfs-mount:
     name: VFS mounted contracts (linux-x86_64)
     runs-on: ubuntu-latest

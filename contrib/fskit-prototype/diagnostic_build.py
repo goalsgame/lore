@@ -33,7 +33,7 @@ def main():
     args = parse_arguments()
     baseline = args.baseline.resolve(strict=True)
     output = ROOT / "target/fskit-prototype/diagnostic-build"
-    output.mkdir(exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
     archive = baseline / "liblore_fskit_bridge.a"
     expected = (baseline / "SHA256SUMS").read_text().splitlines()[0].split()[0]
     with archive.open("rb") as source:

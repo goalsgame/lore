@@ -10,7 +10,7 @@ ROOT = HERE.parent.parent
 
 if __name__ == "__main__":
     output = ROOT / "target/fskit-prototype"
-    output.mkdir(exist_ok=True)
+    output.mkdir(parents=True, exist_ok=True)
     executable = output / "persistent-marker-tests"
     subprocess.run(["xcrun", "swiftc", "-parse-as-library", "-warnings-as-errors",
                     "-module-cache-path", str(output / "module-cache"),

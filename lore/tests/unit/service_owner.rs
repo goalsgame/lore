@@ -403,12 +403,14 @@ fn service_main_cancellation_child() {
                 .is_cancelled()
         );
         assert!(first.try_begin_invocation().is_none());
-        tokio::time::timeout(Duration::from_secs(10), old_run.wait())
-            .await
-            .unwrap()
-            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !old_run.has_completed() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
         assert!(first.try_begin_control_invocation().is_none());
-        assert!(!retained.stop.get().unwrap().is_current());
         // Cancellation wakes the independently owned accept thread. Wait for
         // its old socket claim to finish before starting another run.
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -430,6 +432,10 @@ fn service_main_cancellation_child() {
             second.clone(),
         ));
         let current = ready(&second).await;
+        // The first restart reaps the cancelled actor without requiring an
+        // earlier caller to wait for its native thread join.
+        old_run.wait().await.unwrap();
+        assert!(!retained.stop.get().unwrap().is_current());
         assert!(!Arc::ptr_eq(&retained.state, &current.state));
         let command = message::MessageToServer {
             globals: globals.clone(),

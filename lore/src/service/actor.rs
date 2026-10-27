@@ -18,6 +18,7 @@ use crate::remote::network::UdsStream;
 use crate::remote::service_process::ServiceStartGuard;
 use crate::remote::service_process::begin_service_start_unchecked;
 use crate::remote::service_process::register_service_process;
+use crate::working_mount::worker::ThreadOwner;
 
 const MAX_CONNECTIONS: usize = 128;
 static CURRENT: Mutex<Option<Arc<RunState>>> = Mutex::new(None);
@@ -62,9 +63,9 @@ pub(crate) struct RunState {
     sockets: Mutex<Vec<(u64, UdsStream)>>,
     next_socket: Mutex<u64>,
     accepting: AtomicBool,
-    accept_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    accept_thread: Mutex<Option<Arc<ThreadOwner>>>,
     connections_changed: tokio::sync::Notify,
-    actor_thread: Mutex<Option<std::thread::JoinHandle<()>>>,
+    actor_thread: ThreadOwner,
     published: AtomicBool,
     joined: AtomicBool,
     fatal: Mutex<Option<String>>,
@@ -80,6 +81,10 @@ pub(crate) fn current_run() -> Option<RunHandle> {
         .map(RunHandle)
 }
 impl RunHandle {
+    #[lore_macro::test_pub]
+    pub(crate) fn has_completed(&self) -> bool {
+        self.0.done.borrow().is_some()
+    }
     #[cfg(feature = "test-util")]
     pub fn inject_retained_failure(&self) {
         self.0
@@ -166,27 +171,15 @@ impl RunHandle {
         }
     }
     fn try_join(&self) -> Option<Result<(), String>> {
-        if !self.0.published.load(Ordering::Acquire) {
+        if !self.0.published.load(Ordering::Acquire) || !self.has_completed() {
             return None;
         }
-        let mut thread = self
-            .0
-            .actor_thread
-            .lock()
-            .unwrap_or_else(|p| p.into_inner());
         if self.0.joined.load(Ordering::Acquire) {
             return Some(Ok(()));
         }
-        if !thread
-            .as_ref()
-            .is_some_and(std::thread::JoinHandle::is_finished)
-        {
-            return None;
-        }
-        let finished = thread.take().expect("finished actor thread");
-        drop(thread);
-        if finished.join().is_err() {
-            return Some(Err("service actor thread panicked".into()));
+        match self.0.actor_thread.try_drain()? {
+            Ok(()) => {}
+            Err(error) => return Some(Err(format!("joining service actor: {error}"))),
         }
         self.0
             .start
@@ -302,11 +295,12 @@ impl RunState {
             .accept_thread
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .take();
+            .clone();
         if let Some(thread) = thread {
             thread
-                .join()
-                .map_err(|_error| "service accept worker panicked".to_owned())?;
+                .drain()
+                .await
+                .map_err(|error| format!("joining service accept worker: {error}"))?;
         }
         self.listener
             .lock()
@@ -334,6 +328,13 @@ pub(crate) async fn run(
     globals: crate::interface::LoreGlobalArgs,
     state: Arc<ServiceStateImpl>,
 ) -> Result<(), ServiceMainError> {
+    if let Some(previous) = current_run()
+        && previous.has_completed()
+    {
+        // A cancelled waiter may leave a completed actor reserved. Finish its
+        // exact native join before trying to publish a replacement service.
+        previous.join().await.map_err(ServiceMainError::internal)?;
+    }
     let handle =
         super::shutdown::with_start_admission(|| -> Result<RunHandle, ServiceMainError> {
             if let Some(previous) = current_run() {
@@ -364,7 +365,7 @@ pub(crate) async fn run(
                 accepting: AtomicBool::new(true),
                 accept_thread: Mutex::new(None),
                 connections_changed: tokio::sync::Notify::new(),
-                actor_thread: Mutex::new(None),
+                actor_thread: ThreadOwner::new(),
                 published: AtomicBool::new(false),
                 joined: AtomicBool::new(false),
                 fatal: Mutex::new(None),
@@ -384,7 +385,7 @@ pub(crate) async fn run(
                 .spawn(move || actor_thread(owned, globals))
                 .map_err(|e| ServiceMainError::internal(format!("starting service actor: {e}")))?;
             publication.committed = true;
-            *run.actor_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread);
+            run.actor_thread.publish(Some(thread));
             run.published.store(true, Ordering::Release);
             #[cfg(feature = "test-util")]
             test_fault(2);
@@ -584,7 +585,9 @@ async fn startup(
             }
         })
         .map_err(|e| e.to_string())?;
-    *run.accept_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
+    let thread = Arc::new(ThreadOwner::new());
+    thread.publish(Some(worker));
+    *run.accept_thread.lock().unwrap_or_else(|p| p.into_inner()) = Some(thread);
     Ok(())
 }
 async fn actor_loop(run: Arc<RunState>) -> Result<(), String> {

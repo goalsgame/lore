@@ -114,3 +114,70 @@ async fn failed_spawn_publishes_that_no_thread_needs_joining() {
     owner.publish(None);
     owner.drain().await.unwrap();
 }
+
+struct TlsCapture {
+    entered: mpsc::Sender<()>,
+    release: mpsc::Receiver<()>,
+    dropped: Arc<AtomicBool>,
+}
+impl Drop for TlsCapture {
+    fn drop(&mut self) {
+        let _entered = self.entered.send(());
+        // A broken runtime join must fail the test rather than hang its process.
+        let _released = self.release.recv_timeout(DEADLINE);
+        self.dropped.store(true, Ordering::Release);
+    }
+}
+thread_local! {
+    static TLS_CAPTURE: std::cell::RefCell<Option<TlsCapture>> = const { std::cell::RefCell::new(None) };
+}
+struct ReleaseOnDrop(mpsc::Sender<()>);
+impl Drop for ReleaseOnDrop {
+    fn drop(&mut self) {
+        let _released = self.0.send(());
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_tls_destruction_keeps_timeout_live_and_join_result_after_cancellation() {
+    for panic in [false, true] {
+        let owner = ThreadOwner::new();
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release = ReleaseOnDrop(release_tx);
+        let dropped = Arc::new(AtomicBool::new(false));
+        let capture = TlsCapture {
+            entered: entered_tx,
+            release: release_rx,
+            dropped: dropped.clone(),
+        };
+        let thread = std::thread::spawn(move || {
+            TLS_CAPTURE.with(|slot| *slot.borrow_mut() = Some(capture));
+            assert!(!panic, "worker failed before TLS destruction");
+        });
+        entered_rx.recv_timeout(DEADLINE).unwrap();
+        assert!(thread.is_finished(), "the worker body has completed");
+        owner.publish(Some(thread));
+
+        let mut cancelled = Box::pin(owner.drain());
+        assert!(
+            tokio::time::timeout(STILL_RUNNING, &mut cancelled)
+                .await
+                .is_err(),
+            "a blocked native join must not prevent an async timeout"
+        );
+        drop(cancelled);
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(release);
+
+        let (first, second) = tokio::time::timeout(DEADLINE, async {
+            tokio::join!(owner.drain(), owner.drain())
+        })
+        .await
+        .unwrap();
+        assert_eq!(first.is_err(), panic);
+        assert_eq!(second.is_err(), panic);
+        assert_eq!(owner.drain().await.is_err(), panic);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+}
