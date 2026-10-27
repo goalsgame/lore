@@ -37,15 +37,16 @@ use lore_storage::write::*;
 
 /// A reader looking for a store while its guard drops finds the entry or sees the count
 /// moved, never neither: neither would let it skip the probe that finds the store.
-#[test]
-fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+#[tokio::test]
+async fn a_dropping_guard_is_never_both_gone_and_uncounted() {
+    let (_directory, store) = make_test_store().await;
     let partition = Partition::from([0xC7; 16]);
     let address = Address {
         hash: lore_storage::hash::hash_slice(b"a dropping guard"),
         context: Context::from([0xC7; 16]),
     };
     let before = stores_landed(address);
-    let guard = try_acquire_in_flight(partition, address).expect("fresh address");
+    let guard = try_acquire_in_flight(&store, partition, address).expect("fresh address");
     let seen = std::rc::Rc::new(std::cell::Cell::new(None));
     {
         let seen = seen.clone();
@@ -386,7 +387,8 @@ async fn store_fragment_follower_path_registers_in_tracker() {
     let (partition, address, fragment, buffer) = make_input(0x30);
 
     // Manually hold a STORE_IN_FLIGHT guard to force the follower path.
-    let held_guard = try_acquire_in_flight(partition, address).expect("acquire in-flight guard");
+    let held_guard =
+        try_acquire_in_flight(&store, partition, address).expect("acquire in-flight guard");
 
     let tracker = Arc::new(WriteTracker::new());
     let result = store_fragment(
@@ -2549,4 +2551,155 @@ async fn lent_content_over_one_fragment_is_stored_fragmented() {
     let content = hash_test_content(lore_storage::compress::FRAGMENT_SIZE_THRESHOLD + 4096);
     let (lent, shared) = lent_and_shared_entries(&content).await;
     assert_eq!(lent, shared);
+}
+
+#[tokio::test]
+async fn ingestion_sha256_hashes_exact_whole_file_bytes() {
+    let (dir, store) = make_test_store().await;
+    let partition = Partition::from([0xd2; 16]);
+    let context = Context::from([0x23; 16]);
+    for size in [0, 3, lore_storage::FRAGMENT_SIZE_THRESHOLD * 3 + 17] {
+        let bytes = if size == 3 {
+            b"abc".to_vec()
+        } else {
+            pseudo_random_content(size)
+        };
+        let path = PathBuf::from(dir.as_ref()).join(format!("sha256-{size}"));
+        std::fs::write(&path, &bytes).unwrap();
+        for flags in [
+            WriteOptions::default(),
+            WriteOptions::default().with_fixed_size_chunk(12345),
+        ] {
+            let (written, ingested) = write_from_file_with_sha256(
+                store.clone(),
+                partition,
+                &ContentSource::file(&path),
+                context,
+                flags,
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .unwrap();
+            let independent = ring::digest::digest(&ring::digest::SHA256, &bytes);
+            assert_eq!(ingested.sha256().as_slice(), independent.as_ref());
+            if size == 0 {
+                assert_eq!(
+                    hex::encode(ingested.sha256()),
+                    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+                );
+            } else if size == 3 {
+                assert_eq!(
+                    hex::encode(ingested.sha256()),
+                    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                );
+            }
+            assert_eq!(ingested.address(), written.address);
+            assert_eq!(ingested.address().context, context);
+            assert_eq!(ingested.size(), size as u64);
+            assert_eq!(written.size_content, size as u64);
+            if size > lore_storage::FRAGMENT_SIZE_THRESHOLD {
+                assert_ne!(ingested.sha256().as_slice(), written.address.hash.data());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn ingestion_sha256_refuses_unstored_or_unreadable_content() {
+    let (dir, store) = make_test_store().await;
+    let path = PathBuf::from(dir.as_ref()).join("digest-input");
+    std::fs::write(&path, b"abc").unwrap();
+    for flags in [WriteOptions::default().hash_only(), WriteOptions::default()] {
+        if !flags.hash_only {
+            std::fs::remove_file(&path).unwrap();
+        }
+        assert!(
+            write_from_file_with_sha256(
+                store.clone(),
+                Partition::default(),
+                &ContentSource::file(&path),
+                Context::default(),
+                flags,
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn ingestion_sha256_does_not_return_a_record_after_storage_failure() {
+    let (dir, inner) = make_test_store().await;
+    let store: Arc<dyn ImmutableStore> = Arc::new(FailingPutStore { inner });
+    for size in [128, lore_storage::FRAGMENT_SIZE_THRESHOLD * 2 + 1] {
+        let path = PathBuf::from(dir.as_ref()).join(format!("failed-digest-{size}"));
+        std::fs::write(&path, pseudo_random_content(size)).unwrap();
+        assert!(
+            write_from_file_with_sha256(
+                store.clone(),
+                Partition::default(),
+                &ContentSource::file(&path),
+                Context::default(),
+                WriteOptions::default(),
+                None,
+                WriteContext::none(),
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn tracker_dedup_never_inherits_another_store_allocation() {
+    let (_directory_a, store_a) = make_test_store().await;
+    let (_directory_b, store_b) = make_test_store().await;
+    let (partition, address, fragment, buffer) = make_input(0xE7);
+    let held = try_acquire_in_flight(&store_a, partition, address).expect("store A leads");
+    let same_store = match try_acquire_in_flight(&store_a, partition, address) {
+        Err(token) => token,
+        Ok(_) => panic!("same allocation must follow its leader"),
+    };
+    let tracker = Arc::new(WriteTracker::new());
+    let result = store_fragment(
+        store_b.clone(),
+        partition,
+        address,
+        fragment,
+        buffer,
+        false,
+        None,
+        WriteContext::tracked(Some(tracker.clone()), None),
+        None,
+    )
+    .await
+    .unwrap();
+    assert!(
+        !result.deduplicated,
+        "independent store must write its own bytes"
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(5), tracker.await_all())
+        .await
+        .expect("store B cannot wait for store A")
+        .unwrap();
+    assert_eq!(
+        query_one(&store_b, partition, address)
+            .await
+            .unwrap()
+            .match_made,
+        StoreMatch::MatchFull
+    );
+    assert_ne!(
+        query_one(&store_a, partition, address)
+            .await
+            .unwrap()
+            .match_made,
+        StoreMatch::MatchFull
+    );
+    assert!(!same_store.is_cancelled());
+    drop(held);
+    assert!(same_store.is_cancelled());
 }

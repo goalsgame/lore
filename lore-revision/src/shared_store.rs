@@ -469,6 +469,21 @@ pub async fn ensure_shared_store_for_repo(
 pub async fn get_shared_store_path_for_repo(
     config: &RepositoryConfig,
 ) -> Result<Option<PathBuf>, SharedStoreError> {
+    get_shared_store_path_for_repo_with_policy(config, true).await
+}
+
+/// Resolve existing current-format storage without creating or migrating it.
+#[cfg(unix)]
+pub(crate) async fn get_existing_shared_store_path_for_repo(
+    config: &RepositoryConfig,
+) -> Result<Option<PathBuf>, SharedStoreError> {
+    get_shared_store_path_for_repo_with_policy(config, false).await
+}
+
+async fn get_shared_store_path_for_repo_with_policy(
+    config: &RepositoryConfig,
+    migrate_legacy: bool,
+) -> Result<Option<PathBuf>, SharedStoreError> {
     Ok(
         if let Some(shared_store_to_use_config) = config.shared_store_to_use.as_ref()
             && shared_store_to_use_config.use_shared_store.unwrap_or(false)
@@ -476,12 +491,24 @@ pub async fn get_shared_store_path_for_repo(
             let directory_with_shared_store =
                 resolve_shared_store_dir(shared_store_to_use_config, &config.remote_url).await?;
             let shared_store_path = find_existing_shared_store_in_dir(directory_with_shared_store)?;
-            let shared_store_config =
-                load_shared_store_config(&shared_store_path)
-                    .await
-                    .map_err(|_err| SharedStoreNotFound {
-                        path: shared_store_path.display().to_string(),
-                    })?;
+            if !migrate_legacy
+                && shared_store_path
+                    .file_name()
+                    .is_none_or(|name| name != SHARED_STORE_DIR)
+            {
+                return Err(SharedStoreError::internal(
+                    "Working bootstrap requires a current-format shared store directory",
+                ));
+            }
+            let configuration =
+                load_shared_store_config_with_policy(&shared_store_path, migrate_legacy).await;
+            let shared_store_config = if migrate_legacy {
+                configuration.map_err(|_err| SharedStoreNotFound {
+                    path: shared_store_path.display().to_string(),
+                })?
+            } else {
+                configuration?
+            };
             if !remote_urls_equivalent(&shared_store_config.remote_url, &config.remote_url)? {
                 return Err(SharedStoreError::internal(format!(
                     "Loading the shared store for a repo with remote url \"{}\" but the shared store had the remote url \"{}\"",
@@ -499,6 +526,13 @@ pub async fn get_shared_store_path_for_repo(
 async fn load_shared_store_config(
     shared_store_path: impl AsRef<Path>,
 ) -> Result<SharedStoreConfig, SharedStoreError> {
+    load_shared_store_config_with_policy(shared_store_path, true).await
+}
+
+async fn load_shared_store_config_with_policy(
+    shared_store_path: impl AsRef<Path>,
+    migrate_legacy: bool,
+) -> Result<SharedStoreConfig, SharedStoreError> {
     let shared_store_path = shared_store_path.as_ref();
     let config_path = shared_store_path.join(SHARED_STORE_CONFIG);
     let legacy_config_path = shared_store_path.join("global.toml");
@@ -507,6 +541,11 @@ async fn load_shared_store_config(
             .await
             .forward::<SharedStoreError>("Loading shared store config")
     } else if legacy_config_path.exists() {
+        if !migrate_legacy {
+            return Err(SharedStoreError::internal(
+                "Working bootstrap requires current-format shared store configuration",
+            ));
+        }
         // If a config is found at the old location, save it to the correct location and delete the
         // original
         let legacy_config = config::load::<SharedStoreConfig>(&legacy_config_path)

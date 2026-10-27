@@ -997,3 +997,15 @@ pub fn test_execution_with(
         ),
     )
 }
+
+#[test]
+fn ordinary_filesystem_providers_keep_revision_replacement_capability() {
+    assert!(TestFilesystemProvider::default().supports_revision_replacement());
+    assert!(TestFilesystemProvider::holding_state().supports_revision_replacement());
+    let root = lore_base::test_util::TempDir::new("lore-replacement-defaults-");
+    assert!(OsFilesystem::new(root.path()).supports_revision_replacement());
+    assert!(
+        lore_revision::fs::invalid_filesystem_provider::InvalidFilesystemProvider::new()
+            .supports_revision_replacement()
+    );
+}

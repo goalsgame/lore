@@ -464,7 +464,7 @@ async fn committing_repository(
     root: &std::path::Path,
     immutable_store: Arc<dyn lore_storage::ImmutableStore>,
     mutable_store: Arc<dyn lore_storage::MutableStore>,
-    filesystem: Arc<TestFilesystemProvider>,
+    filesystem: Arc<dyn FilesystemProvider>,
     filter: Arc<Filter>,
 ) -> (CountingRepository, Arc<RepositoryContext>) {
     let fixture = counting_repository(root, immutable_store.clone(), mutable_store.clone()).await;
@@ -520,3 +520,5 @@ async fn commit_staged(
     ))
     .await
 }
+
+mod ingestion_digests;

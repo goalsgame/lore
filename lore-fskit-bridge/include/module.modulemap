@@ -1,0 +1,1 @@
+module LoreFSKitBridge { header "lore_fskit_bridge.h" export * }

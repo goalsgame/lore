@@ -1703,7 +1703,8 @@ async fn load_fragment_waits_for_in_flight_leader() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xDE);
 
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let reader_store = store.clone();
     let reader = lore_base::lore_spawn!(async move {
@@ -1752,7 +1753,8 @@ async fn a_local_hit_never_waits_on_a_store_in_flight() {
         .put(partition, address, fragment, Some(payload.clone()), false)
         .await
         .expect("put the payload locally");
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let (_, loaded) = tokio::time::timeout(
         Duration::from_secs(2),
@@ -1771,7 +1773,8 @@ async fn a_local_hit_never_waits_on_a_store_in_flight() {
 async fn a_never_waiting_miss_answers_at_once_while_a_store_is_in_flight() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xC4);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let loaded = tokio::time::timeout(
         Duration::from_secs(2),
@@ -1831,7 +1834,8 @@ async fn a_miss_with_no_store_landing_probes_once() {
 async fn a_store_landing_during_the_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xA6);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&inner, partition, address).expect("no contention in fresh test");
     let (store, counts) = CountingReadStore::with_hooks(
         inner,
         ReadHooks {
@@ -1930,7 +1934,8 @@ async fn a_buffer_read_missing_with_no_store_landing_probes_once() {
 async fn a_store_landing_during_a_read_into_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xC6);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&inner, partition, address).expect("no contention in fresh test");
     let (store, counts) = CountingReadStore::with_hooks(
         inner,
         ReadHooks {
@@ -1965,7 +1970,8 @@ async fn a_store_landing_during_a_read_into_probe_is_found_by_a_second_probe() {
 async fn a_store_landing_during_a_buffer_read_probe_is_found_by_a_second_probe() {
     let (_dir, inner) = make_test_store().await;
     let (partition, address, fragment, payload) = make_input(0xC8);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&inner, partition, address).expect("no contention in fresh test");
     let (store, counts) = CountingReadStore::with_hooks(
         inner,
         ReadHooks {
@@ -2072,7 +2078,8 @@ async fn a_placement_failing_otherwise_is_a_miss() {
 async fn a_never_waiting_read_into_answers_a_miss_at_once_while_a_store_is_in_flight() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, payload) = make_input(0xE5);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let mut slice = vec![0u8; payload.len()];
     let read = tokio::time::timeout(
@@ -2104,7 +2111,8 @@ async fn load_fragment_returns_not_found_when_leader_drops_without_writing() {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xAD);
 
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let reader_store = store.clone();
     let reader = lore_base::lore_spawn!(async move {
@@ -3553,6 +3561,7 @@ async fn never_wait_with_a_session_never_follows_a_flight() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally() {
     let (_dir, inner) = make_test_store().await;
+    let (store, counts) = CountingReadStore::wrap(inner);
     let (partition, address, fragment, payload) = make_input(0xBA);
     let (entered, release) = (
         Arc::new(tokio::sync::Notify::new()),
@@ -3560,7 +3569,7 @@ async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally()
     );
     let tracker = Arc::new(lore_storage::WriteTracker::new());
     lore_storage::write::store_fragment(
-        inner.clone(),
+        store.clone(),
         partition,
         address,
         Fragment {
@@ -3578,13 +3587,10 @@ async fn a_whole_read_into_a_buffer_reads_a_dispatched_store_it_missed_locally()
     tokio::time::timeout(Duration::from_secs(5), entered.notified())
         .await
         .expect("the leader reached its upload");
-    let (store, counts) = CountingReadStore::with_hooks(
-        inner,
-        ReadHooks {
-            release: Some(release),
-            ..ReadHooks::default()
-        },
-    );
+    *counts.hooks.lock().expect("read hooks") = ReadHooks {
+        release: Some(release),
+        ..ReadHooks::default()
+    };
 
     let mut buffer = vec![0u8; 4096];
     // SAFETY: the buffer outlives the read and nothing else touches it.
@@ -3685,7 +3691,8 @@ async fn a_never_waiting_whole_read_into_a_buffer_answers_a_miss_at_once_while_a
  {
     let (_dir, store) = make_test_store().await;
     let (partition, address, _fragment, _payload) = make_input(0xE7);
-    let guard = try_acquire_in_flight(partition, address).expect("no contention in fresh test");
+    let guard =
+        try_acquire_in_flight(&store, partition, address).expect("no contention in fresh test");
 
     let mut buffer = vec![0u8; 4096];
     // SAFETY: the buffer outlives the read and nothing else touches it.

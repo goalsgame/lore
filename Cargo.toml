@@ -10,6 +10,7 @@ members = [
     "lore-credential",
     "lore-error-set",
     "lore-error-set-macro",
+    "lore-fskit-bridge",
     "lore-gcp",
     "lore-hashicorp",
     "lore-integration-tests",
@@ -22,6 +23,7 @@ members = [
     "lore-storage",
     "lore-telemetry",
     "lore-transport",
+    "lore-vfs",
 ]
 
 [workspace.package]
@@ -117,6 +119,7 @@ lore-server = { path = "lore-server" }
 lore-storage = { path = "lore-storage" }
 lore-telemetry = { path = "lore-telemetry" }
 lore-transport = { path = "lore-transport" }
+lore-vfs = { path = "lore-vfs" }
 anstyle = "1.0.11"
 anstream = "1.0.0"
 anyhow = "1.0.103"
@@ -277,6 +280,11 @@ panic = "abort"
 [profile.iteration]
 inherits = "release"
 lto = "off"
+
+# The FSKit C boundary catches Rust panics before returning to Swift.
+[profile.fskit]
+inherits = "release"
+panic = "unwind"
 
 # The actual release build
 [profile.release-lto]

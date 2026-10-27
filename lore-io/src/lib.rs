@@ -41,6 +41,7 @@ pub mod file;
 mod iocp;
 #[cfg(all(target_family = "windows", feature = "test-util"))]
 pub mod iocp;
+pub mod lease;
 #[cfg(target_family = "windows")]
 mod overlapped;
 #[cfg(not(feature = "test-util"))]

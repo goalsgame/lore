@@ -164,8 +164,11 @@ pub fn try_lore_context() -> Option<Arc<dyn Any + Send + Sync>> {
 /// future type.
 #[pin_project(project = ContextTaskProjection)]
 pub enum ContextTask<F> {
-    Scoped(#[pin] TaskLocalFuture<Arc<dyn Any + Send + Sync>, ObservedTask<F>>),
-    Unscoped(#[pin] ObservedTask<F>),
+    Scoped(
+        #[pin]
+        lore_io::lease::IoScope<TaskLocalFuture<Arc<dyn Any + Send + Sync>, ObservedTask<F>>>,
+    ),
+    Unscoped(#[pin] lore_io::lease::IoScope<ObservedTask<F>>),
 }
 
 impl<F: Future> Future for ContextTask<F> {
@@ -183,9 +186,13 @@ impl<F: Future> Future for ContextTask<F> {
 #[track_caller]
 pub fn spawned_task<F: Future>(future: F) -> ContextTask<F> {
     let task = ObservedTask::new(future);
+    let lease = lore_io::lease::IoLease::current();
     match try_lore_context() {
-        Some(context) => ContextTask::Scoped(LORE_CONTEXT.scope(context, task)),
-        None => ContextTask::Unscoped(task),
+        Some(context) => ContextTask::Scoped(lore_io::lease::scope(
+            lease,
+            LORE_CONTEXT.scope(context, task),
+        )),
+        None => ContextTask::Unscoped(lore_io::lease::scope(lease, task)),
     }
 }
 
@@ -197,10 +204,30 @@ where
     T: 'static,
 {
     let context = try_lore_context();
-    move || match context {
-        Some(context) => LORE_CONTEXT.sync_scope(context, function),
-        None => function(),
+    let lease = lore_io::lease::IoLease::current();
+    move || {
+        lore_io::lease::sync_scope(lease, || match context {
+            Some(context) => LORE_CONTEXT.sync_scope(context, function),
+            None => function(),
+        })
     }
+}
+
+/// Bounded blocking work retains IO ownership without propagating command context.
+pub fn spawned_blocking_task_nocontext<F, T>(function: F) -> impl FnOnce() -> T + Send + 'static
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: 'static,
+{
+    let lease = lore_io::lease::IoLease::current();
+    move || lore_io::lease::sync_scope(lease, function)
+}
+
+/// Connection-lifetime tasks explicitly detach both command context and scoped IO
+/// ownership. They must not perform metadata initialization on a caller's behalf.
+#[track_caller]
+pub fn detached_task<F: Future>(future: F) -> lore_io::lease::IoScope<ObservedTask<F>> {
+    lore_io::lease::scope(None, ObservedTask::new(future))
 }
 
 /// A [`JoinSet`] that detaches its tasks when dropped rather than aborting them, for tasks that
@@ -335,7 +362,7 @@ macro_rules! lore_spawn_net_nocontext {
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            $crate::runtime::net_runtime().spawn($crate::runtime::ObservedTask::new($expression))
+            $crate::runtime::net_runtime().spawn($crate::runtime::detached_task($expression))
         }
     }};
     ($expression:expr,) => {
@@ -444,25 +471,35 @@ macro_rules! lore_spawn_blocking_nocontext {
     ($joinset:ident, $name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
+            $joinset.spawn_blocking_on(
+                $crate::runtime::spawned_blocking_task_nocontext($expression),
+                &$crate::runtime::runtime(),
+            )
         }
     }};
     ($joinset:ident, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            $joinset.spawn_blocking_on($expression, &$crate::runtime::runtime())
+            $joinset.spawn_blocking_on(
+                $crate::runtime::spawned_blocking_task_nocontext($expression),
+                &$crate::runtime::runtime(),
+            )
         }
     }};
     ($name:literal, $expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            $crate::runtime::runtime().spawn_blocking($expression)
+            $crate::runtime::runtime().spawn_blocking(
+                $crate::runtime::spawned_blocking_task_nocontext($expression),
+            )
         }
     }};
     ($expression:expr) => {{
         #[allow(clippy::disallowed_methods)]
         {
-            $crate::runtime::runtime().spawn_blocking($expression)
+            $crate::runtime::runtime().spawn_blocking(
+                $crate::runtime::spawned_blocking_task_nocontext($expression),
+            )
         }
     }};
 }
@@ -1071,7 +1108,10 @@ where
     // Internal runtime plumbing — LORE_CONTEXT is intentionally not captured
     // here; callers that want it propagated must use `lore_spawn_guarded!`.
     #[allow(clippy::disallowed_methods)]
-    tasks.spawn_on(task, &runtime());
+    tasks.spawn_on(
+        lore_io::lease::scope(lore_io::lease::IoLease::current(), task),
+        &runtime(),
+    );
 }
 
 /// Awaits all guarded tasks to completion.
@@ -1113,7 +1153,9 @@ pub fn shutdown_block_on<F>(future: F, wait_timeout: Duration) -> bool
 where
     F: Future<Output = ()> + Send + 'static,
 {
-    let bounded = async move { tokio::time::timeout(wait_timeout, future).await.is_ok() };
+    let bounded = lore_io::lease::scope(lore_io::lease::IoLease::current(), async move {
+        tokio::time::timeout(wait_timeout, future).await.is_ok()
+    });
 
     match Handle::try_current() {
         Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {

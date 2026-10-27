@@ -13,4 +13,6 @@ mod root_text_tests;
 mod status;
 mod store_config_tests;
 pub(crate) mod test_helpers;
+#[cfg(unix)]
+mod working_bootstrap;
 mod write_token_tests;

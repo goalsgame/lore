@@ -32,6 +32,7 @@ pub(crate) async fn update(
     link_path: RelativePath,
     pin: Option<String>,
 ) -> Result<(), LinkError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, parent_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await

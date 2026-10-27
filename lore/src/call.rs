@@ -22,7 +22,6 @@ use lore_revision::repository::RepositoryAccess;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::repository::RepositoryError;
 pub use lore_revision::repository::RepositoryWriteToken;
-use lore_revision::repository::get_dot_lore_path;
 use lore_revision::util;
 
 use crate::interface::LoreEventCallback;
@@ -32,10 +31,13 @@ use crate::util::log_command_info;
 tokio::task_local! {
     /// The environment of the process a call running in this task was relayed from.
     static RELAYED_ENVIRONMENT: CallEnvironment;
+    /// Resolver owned by the service executing this command, never by its caller.
+    static PROVIDER_RESOLVER: Arc<dyn lore_revision::fs::provider_registry::ProviderResolver>;
 }
 
 /// Runs `call`, relayed from a process with `environment`, so that the execution context it sets
 /// up reads that environment in place of this process's.
+#[lore_macro::test_pub]
 pub(crate) fn with_relayed_environment<F: Future>(
     environment: CallEnvironment,
     call: F,
@@ -43,15 +45,27 @@ pub(crate) fn with_relayed_environment<F: Future>(
     RELAYED_ENVIRONMENT.scope(environment, call)
 }
 
+/// Retains the service resolver while a command constructs and uses its context.
+/// Execution contexts store only a weak reference to avoid provider ownership cycles.
+#[lore_macro::test_pub]
+pub(crate) fn with_provider_resolver<F: Future>(
+    resolver: Arc<dyn lore_revision::fs::provider_registry::ProviderResolver>,
+    call: F,
+) -> impl Future<Output = F::Output> {
+    PROVIDER_RESOLVER.scope(resolver, call)
+}
+
 pub fn setup_execution(
     globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Arc<ExecutionContext> {
     let execution = ExecutionContext::new_client(globals, EventDispatcher::new(callback));
-    Arc::new(match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
+    let mut execution = match RELAYED_ENVIRONMENT.try_with(Clone::clone) {
         Ok(environment) => execution.with_environment(environment),
         Err(_) => execution,
-    })
+    };
+    let _ = PROVIDER_RESOLVER.try_with(|resolver| execution.set_provider_resolver(resolver));
+    Arc::new(execution)
 }
 
 /// Read-only repository call. No `RepositoryWriteToken` is minted, so
@@ -243,11 +257,28 @@ async fn prepare_repository_call(
     mut globals: LoreGlobalArgs,
     callback: LoreEventCallback,
 ) -> Result<(PathBuf, Arc<ExecutionContext>), i32> {
-    let repository_path = resolve_repository_path(&mut globals);
-
+    let supplied_path = resolve_repository_path(&mut globals);
+    let resolver = PROVIDER_RESOLVER.try_with(Clone::clone).ok();
+    let paths = repository::resolve_repository_paths(&supplied_path, resolver.as_ref());
+    if let Ok(paths) = &paths {
+        globals.repository_path = paths.root.display().to_string().into();
+    }
     let execution = setup_execution(globals, callback);
-
-    let dotpath = get_dot_lore_path(&repository_path).map_err(|err| err.ffi_code())?;
+    let paths = match paths {
+        Ok(paths) => paths,
+        Err(error) => {
+            return Err(LORE_CONTEXT
+                .scope(execution, async move {
+                    execution_context()
+                        .dispatcher
+                        .complete(LoreErrorDetail::from_error(&error))
+                        .await
+                })
+                .await);
+        }
+    };
+    let repository_path = paths.root;
+    let dotpath = paths.metadata;
     if !dotpath.is_dir() {
         let err = RepositoryError::from(RepositoryNotFound {
             repository: repository_path.display().to_string(),

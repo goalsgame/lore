@@ -25,6 +25,12 @@ fn runs_the_service(command: &LoreCommands) -> bool {
     )
 }
 
+/// Commands that retain their work in this foreground process.
+#[lore_macro::test_pub]
+fn runs_locally(command: &LoreCommands) -> bool {
+    runs_the_service(command) || matches!(command, LoreCommands::Mount(_))
+}
+
 pub fn client_main() -> ExitCode {
     #[cfg(target_family = "windows")]
     // safety: safe Win32 call; no invariants to uphold
@@ -74,7 +80,7 @@ pub fn client_main() -> ExitCode {
     // After the thread limit, which this reads, and before the first command: the
     // handlers below build the runtime themselves and then call the async API, so
     // by the time the library could decide this the runtime it would size exists.
-    if !runs_the_service(cli_command) {
+    if !runs_locally(cli_command) {
         lore::size_threads_for_relaying();
     }
 

@@ -118,13 +118,14 @@ impl OsDirectoryListing {
 
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
+    fn uses_host_filesystem(&self) -> bool {
+        true
+    }
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
     ) -> ChangeStream<FilesystemDiffStats> {
-        ChangeStream::spawn(async move |changes| {
-            crate::state::os_diff::diff_os_filesystem(diff, &changes).await
-        })
+        crate::state::diff_provider_filesystem(diff)
     }
 
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than

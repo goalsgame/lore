@@ -6360,6 +6360,16 @@ fn walk_filter_mode(filter_mode: FilterMode, intent: FilesystemDiffIntent) -> Fi
     filter_mode
 }
 
+/// Compare through the operation's own listing/stat/content boundary. Host nested
+/// working-copy probing runs only for operations explicitly allowing host access.
+pub fn diff_provider_filesystem(
+    diff: crate::fs::filesystem_provider::FilesystemDiffContext,
+) -> ChangeStream<FilesystemDiffStats> {
+    ChangeStream::spawn(async move |changes| {
+        os_diff::diff_provider_filesystem(diff, &changes).await
+    })
+}
+
 /// Resolves `path` on both sides and diffs the filesystem under it through
 /// `operation`, appending a change per difference to `changes`.
 ///

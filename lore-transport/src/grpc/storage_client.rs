@@ -18,7 +18,6 @@ use lore_base::error::NotFound;
 use lore_base::error::SlowDown;
 use lore_base::lore_debug;
 use lore_base::lore_error;
-use lore_base::lore_spawn_net;
 use lore_base::types::Address;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
@@ -41,6 +40,17 @@ use super::CORRELATION_ID_HEADER;
 use super::PARTITION_ID_KEY;
 use super::REPOSITORY_ID_KEY;
 use crate::error::ProtocolError;
+
+mod request_ownership;
+mod stream_terminal;
+
+use request_ownership::Item as StreamItem;
+pub(super) use request_ownership::Operation;
+use request_ownership::PreparedStream;
+use request_ownership::ReaderCleanup;
+use request_ownership::Reply;
+use request_ownership::SessionLife;
+use stream_terminal::StreamLife;
 
 /// Translate a response's in-band `status` into a [`ProtocolError`], or `None` when the item
 /// succeeded. Absence means `OK`, so a peer that predates the field reads as success.
@@ -75,6 +85,21 @@ pub struct GrpcSessionContext {
     pub partition: Partition,
     pub correlation_id: String,
     pub auth_token: String,
+    life: Arc<SessionLife>,
+}
+
+impl GrpcSessionContext {
+    pub(super) fn check_open(&self) -> Result<(), ProtocolError> {
+        self.life.check_open()
+    }
+    pub fn new(partition: Partition, correlation_id: String, auth_token: String) -> Self {
+        Self {
+            partition,
+            correlation_id,
+            auth_token,
+            life: SessionLife::new(),
+        }
+    }
 }
 
 /// Which streaming RPC a cached stream belongs to.
@@ -105,8 +130,6 @@ impl Verb {
     }
 }
 
-type StreamItem<K, S> = (K, oneshot::Sender<Result<S, ProtocolError>>);
-
 /// A live stream's request channel plus whether its RPC ever opened.
 ///
 /// `opened` is what lets `StreamCache::request` tell a stream that died mid-flight from one
@@ -115,7 +138,9 @@ type StreamItem<K, S> = (K, oneshot::Sender<Result<S, ProtocolError>>);
 /// answered it, or the task exited and dropped the channel.
 struct StreamState<K, S> {
     sender: mpsc::Sender<StreamItem<K, S>>,
-    opened: AtomicBool,
+    opened: Arc<AtomicBool>,
+    session: Arc<SessionLife>,
+    stream: Arc<StreamLife<K, S>>,
 }
 
 type StreamHandle<K, S> = Arc<StreamState<K, S>>;
@@ -123,15 +148,11 @@ type StreamHandle<K, S> = Arc<StreamState<K, S>>;
 /// Keyed by the address a request reads or writes: the address the server echoes back, or for a
 /// copy the target, see [`CopyRouting`]. A `Vec` per key so concurrent requests for the same
 /// address coalesce onto one round trip and all get woken by its response.
-type Inflight<S> = DashMap<Address, Vec<oneshot::Sender<Result<S, ProtocolError>>>>;
+type Inflight<S> = DashMap<Address, Vec<Reply<S>>>;
 
 /// Returns true for the first waiter on `key`, meaning the caller should put the request on
 /// the wire; later waiters ride along on that one round trip.
-fn register<S>(
-    inflight: &Inflight<S>,
-    key: Address,
-    sender: oneshot::Sender<Result<S, ProtocolError>>,
-) -> bool {
+fn register<S>(inflight: &Inflight<S>, key: Address, sender: Reply<S>) -> bool {
     let mut first = false;
     #[allow(clippy::disallowed_methods)] // Brief write lock; no await while held.
     inflight
@@ -149,18 +170,58 @@ fn register<S>(
 /// fault, whereas a real error tells it whether a retry is worth attempting.
 fn fail_inflight<S>(inflight: &Inflight<S>, verb: Verb, err: &ProtocolError) {
     let mut failed = 0usize;
-    inflight.retain(|_, senders| {
-        for sender in senders.drain(..) {
-            failed += 1;
-            let _ = sender.send(Err(err.clone()));
+    loop {
+        // Copy a key only; release the iterator/shard guard before removing or
+        // disposing replies whose final IO owner can run arbitrary destructors.
+        let key = inflight.iter().next().map(|entry| *entry.key());
+        let Some(key) = key else {
+            break;
+        };
+        if let Some((_, senders)) = inflight.remove(&key) {
+            for sender in senders {
+                failed += 1;
+                sender.send(Err(err.clone()));
+            }
         }
-        false
-    });
+    }
     if failed > 0 {
         lore_debug!(
             "{} stream ended with {failed} request(s) outstanding: {err}",
             verb.label()
         );
+    }
+}
+fn fail_buffered<K, S>(life: &StreamLife<K, S>, error: &ProtocolError) {
+    while let Some((payload, reply)) = life.take_failed() {
+        drop(payload);
+        reply.send(Err(error.clone()));
+    }
+}
+fn finish_address<K, S>(
+    life: &StreamLife<K, S>,
+    inflight: &Inflight<S>,
+    verb: Verb,
+    error: ProtocolError,
+) {
+    let error = life.terminate(error);
+    fail_buffered(life, &error);
+    fail_inflight(inflight, verb, &error);
+}
+fn finish_resolved<K, S>(
+    life: &StreamLife<K, S>,
+    pending: &DashMap<u64, Reply<S>>,
+    error: ProtocolError,
+) {
+    let error = life.terminate(error);
+    fail_buffered(life, &error);
+    loop {
+        let key = pending.iter().next().map(|entry| *entry.key());
+        let Some(key) = key else {
+            break;
+        };
+        if let Some((_, reply)) = pending.remove(&key) {
+            reply.send(Err(error.clone()));
+        }
     }
 }
 
@@ -237,6 +298,8 @@ struct CopyRouting {
     wire: HashMap<Address, Address>,
     /// The copies waiting for a source address on the wire, in arrival order.
     queued: HashMap<Address, VecDeque<storage_v1::CopyRequest>>,
+    ready: VecDeque<storage_v1::CopyRequest>,
+    not_yielded: usize,
 }
 
 impl CopyRouting {
@@ -266,6 +329,10 @@ impl CopyRouting {
         target: Address,
         request: storage_v1::CopyRequest,
     ) -> Option<storage_v1::CopyRequest> {
+        self.not_yielded = self
+            .not_yielded
+            .checked_add(1)
+            .expect("accepted copies are bounded by retained operation permits");
         match self.wire.entry(source) {
             Entry::Occupied(_) => {
                 self.queued.entry(source).or_default().push_back(request);
@@ -312,7 +379,8 @@ async fn pump_responses<R>(
     inflight: Arc<Inflight<R::Success>>,
     verb: Verb,
     mut route: impl FnMut(Address) -> Option<Address>,
-) where
+) -> ProtocolError
+where
     R: StreamResponse,
 {
     let mut terminal = ProtocolError::from(Disconnected);
@@ -349,13 +417,13 @@ async fn pump_responses<R>(
         let mut senders = senders;
         if let Some(last) = senders.pop() {
             for sender in senders {
-                let _ = sender.send(result.clone());
+                sender.send(result.clone());
             }
-            let _ = last.send(result);
+            last.send(result);
         }
     }
 
-    fail_inflight(&inflight, verb, &terminal);
+    terminal
 }
 
 /// The hot path is a single `DashMap` read plus an `Arc` clone — no write lock and no second
@@ -366,119 +434,165 @@ struct StreamCache<K, S> {
     streams: DashMap<(u32, Verb), StreamHandle<K, S>>,
 }
 
+struct Installed<K, S> {
+    handle: Result<StreamHandle<K, S>, ProtocolError>,
+    start: Option<PreparedStream<K, S>>,
+    discard: Option<PreparedStream<K, S>>,
+    retired: Option<StreamHandle<K, S>>,
+}
 impl<K: Clone, S> StreamCache<K, S> {
     fn new() -> Self {
         Self {
             streams: DashMap::new(),
         }
     }
-
-    /// Dropping the last sender ends the request generator, which ends the RPC and its
-    /// reader task.
-    fn remove(&self, session_id: u32, verb: Verb) {
-        self.streams.remove(&(session_id, verb));
+    fn remove(&self, session_id: u32, verb: Verb, ctx: &GrpcSessionContext) {
+        let removed = self.streams.remove_if(&(session_id, verb), |_, current| {
+            Arc::ptr_eq(&current.session, &ctx.life)
+        });
+        drop(removed);
     }
-
-    /// Drop a handle whose stream never opened, so the next request establishes a fresh one
-    /// instead of inheriting a known-dead entry and giving up on it again. Pointer identity keeps
-    /// a replacement installed by a concurrent caller safe.
     fn discard(&self, key: (u32, Verb), failed: &StreamHandle<K, S>) {
-        #[allow(clippy::disallowed_methods)] // Brief write lock; no await while held.
-        self.streams
+        let removed = self
+            .streams
             .remove_if(&key, |_, current| Arc::ptr_eq(current, failed));
+        drop(removed);
     }
-
-    /// `failed` is the handle whose send just failed. Pointer identity against the current
-    /// entry is the single-flight check, and doing it under the shard lock makes it exact: of N
-    /// callers that all failed on the same dead handle, the first to take the lock spawns and
-    /// the rest adopt its replacement, so `spawn` runs once per stream death, not per caller.
-    fn rotate(
+    fn install(
         &self,
         key: (u32, Verb),
         failed: Option<&StreamHandle<K, S>>,
-        spawn: impl FnOnce() -> StreamHandle<K, S>,
-    ) -> StreamHandle<K, S> {
+        ctx: &GrpcSessionContext,
+        fresh: PreparedStream<K, S>,
+    ) -> Installed<K, S> {
         use dashmap::mapref::entry::Entry;
-
-        #[allow(clippy::disallowed_methods)] // Cold path; `spawn` does not await.
+        // Install is synchronous; callbacks, task starts and retired resource
+        // destruction all occur after the caller releases Life/cache guards.
+        #[allow(clippy::disallowed_methods)]
         match self.streams.entry(key) {
             Entry::Occupied(mut occupied) => {
-                let superseded = match failed {
-                    Some(failed) => !Arc::ptr_eq(occupied.get(), failed),
-                    // Nothing of ours to compare against, so any cached handle wins.
-                    None => true,
-                };
-                if superseded {
-                    return occupied.get().clone();
+                if !Arc::ptr_eq(&occupied.get().session, &ctx.life) {
+                    return Installed {
+                        handle: Err(request_ownership::stopped()),
+                        start: None,
+                        discard: Some(fresh),
+                        retired: None,
+                    };
                 }
-                let fresh = spawn();
-                occupied.insert(fresh.clone());
-                fresh
+                if failed.is_none_or(|failed| !Arc::ptr_eq(occupied.get(), failed)) {
+                    return Installed {
+                        handle: Ok(occupied.get().clone()),
+                        start: None,
+                        discard: Some(fresh),
+                        retired: None,
+                    };
+                }
+                let handle = fresh.handle.clone();
+                let retired = occupied.insert(handle.clone());
+                Installed {
+                    handle: Ok(handle),
+                    start: Some(fresh),
+                    discard: None,
+                    retired: Some(retired),
+                }
             }
             Entry::Vacant(vacant) => {
-                let fresh = spawn();
-                vacant.insert(fresh.clone());
-                fresh
+                let handle = fresh.handle.clone();
+                vacant.insert(handle.clone());
+                Installed {
+                    handle: Ok(handle),
+                    start: Some(fresh),
+                    discard: None,
+                    retired: None,
+                }
             }
         }
     }
-
-    /// Reconnect and reissue on a stream death, the way the QUIC client's
-    /// `send_with_reconnect` does, so a caller never sees one.
-    ///
-    /// A death shows up three ways, all handled here: reserving a place in the queue fails
-    /// because the receiver is already gone (nothing has been sent, so nothing is lost), the
-    /// reader answers with a disconnect, or it exits without answering at all. Anything else the
-    /// reader answers is the server's verdict on this request and goes straight back —
-    /// matching QUIC, where `NotFound`, `SlowDown` and `NotAuthorized` bubble rather than
-    /// provoking a reconnect.
-    ///
-    /// Reissuing continues while the remote is still reachable. A replacement stream that will
-    /// not open means the channel is suspect rather than the stream, so it hands straight back
-    /// as `Disconnected` for `GRPCStorage` to drive `GRPCConnection::reconnect` — the same
-    /// division QUIC draws between reissuing a command and reconnecting the socket. The dead
-    /// handle is discarded on the way out, so the request that follows a successful reconnect
-    /// establishes a stream on the new channel rather than inheriting this one.
+    fn enqueue(
+        handle: &StreamHandle<K, S>,
+        ctx: &GrpcSessionContext,
+        permit: mpsc::Permit<'_, StreamItem<K, S>>,
+        payload: &K,
+        reply: Reply<S>,
+    ) -> Result<(), ProtocolError> {
+        let _session = ctx.life.admit()?;
+        let _stream = handle.stream.admit()?;
+        permit.send((payload.clone(), reply));
+        Ok(())
+    }
     async fn request(
         &self,
         key: (u32, Verb),
+        ctx: &GrpcSessionContext,
         payload: K,
-        spawn: impl Fn() -> StreamHandle<K, S>,
+        operation: &Arc<Operation>,
+        prepare: impl Fn() -> PreparedStream<K, S>,
     ) -> Result<S, ProtocolError> {
         let mut failed: Option<StreamHandle<K, S>> = None;
-
         for _ in 0..MAX_STREAM_REISSUES {
-            let handle = match (&failed, self.streams.get(&key)) {
-                (None, Some(entry)) => entry.value().clone(),
-                (_, entry) => {
-                    // `rotate` write-locks the shard this read guard holds, so keeping the
-                    // guard here self-deadlocks.
-                    drop(entry);
-                    self.rotate(key, failed.as_ref(), &spawn)
+            let current = {
+                let admission = ctx.life.admit()?;
+                let current = self.streams.get(&key).map(|entry| entry.value().clone());
+                drop(admission);
+                current
+            };
+            let handle = match (&failed, current) {
+                (None, Some(current)) => {
+                    if !Arc::ptr_eq(&current.session, &ctx.life) {
+                        return Err(request_ownership::stopped());
+                    }
+                    current
+                }
+                (_, current) => {
+                    drop(current);
+                    let fresh = prepare(); // Prepare callbacks run outside Life/cache locks.
+                    let admission = ctx.life.admit()?;
+                    let installed = self.install(key, failed.as_ref(), ctx, fresh);
+                    drop(admission);
+                    drop(installed.discard);
+                    drop(installed.retired);
+                    let handle = installed.handle?;
+                    if let Some(start) = installed.start {
+                        start.start();
+                    }
+                    handle
                 }
             };
-
-            let answer = match handle.sender.reserve().await {
-                Ok(permit) => {
-                    let (tx, rx) = oneshot::channel();
-                    permit.send((payload.clone(), tx));
-                    rx.await.ok()
+            let answer = {
+                let reserved = tokio::select! {
+                    _ = ctx.life.wait_closed() => return Err(request_ownership::stopped()),
+                    reserved = handle.sender.reserve() => reserved,
+                };
+                match reserved {
+                    Ok(permit) => {
+                        let (tx, rx) = oneshot::channel();
+                        let reply = Reply::new(tx, operation.clone());
+                        match Self::enqueue(&handle, ctx, permit, &payload, reply) {
+                            Ok(()) => rx.await.ok(),
+                            Err(error) => Some(Err(error)),
+                        }
+                    }
+                    Err(_closed) if !handle.opened.load(Ordering::Relaxed) => {
+                        handle.stream.terminal_error().map(Err)
+                    }
+                    Err(_closed) => None,
                 }
-                Err(_) => None,
             };
-            let server_verdict =
-                answer.filter(|answer| !matches!(answer, Err(err) if err.is_disconnected()));
-            if let Some(result) = server_verdict {
+            if let Some(result) =
+                answer.filter(|answer| !matches!(answer,Err(error) if error.is_disconnected()))
+            {
+                if !handle.opened.load(Ordering::Relaxed) {
+                    self.discard(key, &handle);
+                }
                 return result;
             }
-
+            ctx.life.check_open()?;
             if !handle.opened.load(Ordering::Relaxed) {
                 self.discard(key, &handle);
                 return Err(ProtocolError::from(Disconnected));
             }
             failed = Some(handle);
         }
-
         Err(ProtocolError::from(Disconnected))
     }
 }
@@ -503,7 +617,7 @@ pub struct StorageService {
         StreamCache<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>>,
     put_resolved_streams:
         StreamCache<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>>,
-    get_put_limiter: Semaphore,
+    get_put_limiter: Arc<Semaphore>,
 }
 
 fn inject_metadata<T>(request: &mut tonic::Request<T>, ctx: &GrpcSessionContext) {
@@ -539,39 +653,54 @@ impl StorageService {
             resolved_counter: AtomicU64::new(0),
             get_resolved_streams: StreamCache::new(),
             put_resolved_streams: StreamCache::new(),
-            get_put_limiter: Semaphore::new(INFLIGHT_COMMAND_LIMIT),
+            get_put_limiter: Arc::new(Semaphore::new(INFLIGHT_COMMAND_LIMIT)),
         }
     }
 
-    /// Remove streams for a session. Dropping the senders terminates the stream tasks.
-    pub fn remove_session_streams(&self, session_id: u32) {
-        self.get_streams.remove(session_id, Verb::Get);
-        self.get_streams.remove(session_id, Verb::GetMetadata);
-        self.put_streams.remove(session_id, Verb::Put);
-        self.copy_streams.remove(session_id, Verb::Copy);
+    /// Reject new work for this exact generation and initiate graceful request
+    /// half-close. Accepted operations retain ownership until reply/terminal;
+    /// returning here does not acknowledge synchronous RPC/task drainage.
+    pub fn remove_session_streams(&self, session_id: u32, ctx: &GrpcSessionContext) {
+        ctx.life.close();
+        self.get_streams.remove(session_id, Verb::Get, ctx);
+        self.get_streams.remove(session_id, Verb::GetMetadata, ctx);
+        self.put_streams.remove(session_id, Verb::Put, ctx);
+        self.copy_streams.remove(session_id, Verb::Copy, ctx);
         self.get_resolved_streams
-            .remove(session_id, Verb::GetResolved);
+            .remove(session_id, Verb::GetResolved, ctx);
         self.put_resolved_streams
-            .remove(session_id, Verb::PutResolved);
+            .remove(session_id, Verb::PutResolved, ctx);
+    }
+    pub(super) async fn operation(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> Result<Arc<Operation>, ProtocolError> {
+        Operation::acquire(&self.get_put_limiter, &ctx.life).await
     }
 
+    #[cfg(feature = "test-util")]
     pub async fn get(
         &self,
         session_id: u32,
         ctx: &GrpcSessionContext,
         address: &Address,
     ) -> Result<(Fragment, Bytes), ProtocolError> {
-        lore_debug!("gRPC get fragment: {}", address);
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
+        let operation = self.operation(ctx).await?;
+        self.get_with_operation(session_id, ctx, address, &operation)
             .await
-            .internal("permit acquire")?;
+    }
+    pub(super) async fn get_with_operation(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        address: &Address,
+        operation: &Arc<Operation>,
+    ) -> Result<(Fragment, Bytes), ProtocolError> {
+        lore_debug!("gRPC get fragment: {}", address);
 
         let (fragment, payload) = self
             .get_streams
-            .request((session_id, Verb::Get), *address, || {
+            .request((session_id, Verb::Get), ctx, *address, operation, || {
                 self.spawn_get_stream(ctx)
             })
             .await?;
@@ -608,25 +737,35 @@ impl StorageService {
     /// A `NotFound` here is an ordinary answer rather than a fault — see
     /// `RemoteImmutableStore::get_metadata`, which maps it to `MatchNone` — so it arrives
     /// in-band and costs only this lookup.
+    #[cfg(feature = "test-util")]
     pub async fn get_metadata(
         &self,
         session_id: u32,
         ctx: &GrpcSessionContext,
         address: &Address,
     ) -> Result<Fragment, ProtocolError> {
-        lore_debug!("gRPC get_metadata fragment: {}", address);
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
+        let operation = self.operation(ctx).await?;
+        self.get_metadata_with_operation(session_id, ctx, address, &operation)
             .await
-            .internal("permit acquire")?;
+    }
+    pub(super) async fn get_metadata_with_operation(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        address: &Address,
+        operation: &Arc<Operation>,
+    ) -> Result<Fragment, ProtocolError> {
+        lore_debug!("gRPC get_metadata fragment: {}", address);
 
         let (fragment, _payload) = self
             .get_streams
-            .request((session_id, Verb::GetMetadata), *address, || {
-                self.spawn_get_metadata_stream(ctx)
-            })
+            .request(
+                (session_id, Verb::GetMetadata),
+                ctx,
+                *address,
+                operation,
+                || self.spawn_get_metadata_stream(ctx),
+            )
             .await?;
 
         let fragment = Fragment {
@@ -645,6 +784,7 @@ impl StorageService {
         Ok(fragment)
     }
 
+    #[cfg(feature = "test-util")]
     pub async fn put(
         &self,
         session_id: u32,
@@ -653,13 +793,20 @@ impl StorageService {
         fragment: Fragment,
         payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
-        lore_debug!("Put fragment: {address}");
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
+        let operation = self.operation(ctx).await?;
+        self.put_with_operation(session_id, ctx, address, fragment, payload, &operation)
             .await
-            .internal("permit acquire")?;
+    }
+    pub(super) async fn put_with_operation(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        address: Address,
+        fragment: Fragment,
+        payload: Option<Bytes>,
+        operation: &Arc<Operation>,
+    ) -> Result<(), ProtocolError> {
+        lore_debug!("Put fragment: {address}");
 
         let request = storage_v1::PutRequest {
             address: Some(address.into()),
@@ -668,7 +815,7 @@ impl StorageService {
         };
 
         self.put_streams
-            .request((session_id, Verb::Put), request, || {
+            .request((session_id, Verb::Put), ctx, request, operation, || {
                 self.spawn_put_stream(ctx)
             })
             .await
@@ -736,6 +883,7 @@ impl StorageService {
             })
     }
 
+    #[cfg(feature = "test-util")]
     pub async fn copy(
         &self,
         session_id: u32,
@@ -744,18 +892,32 @@ impl StorageService {
         source_address: Address,
         target_context: Context,
     ) -> Result<(), ProtocolError> {
+        let operation = self.operation(ctx).await?;
+        self.copy_with_operation(
+            session_id,
+            ctx,
+            source_partition,
+            source_address,
+            target_context,
+            &operation,
+        )
+        .await
+    }
+    pub(super) async fn copy_with_operation(
+        &self,
+        session_id: u32,
+        ctx: &GrpcSessionContext,
+        source_partition: Partition,
+        source_address: Address,
+        target_context: Context,
+        operation: &Arc<Operation>,
+    ) -> Result<(), ProtocolError> {
         lore_debug!(
             "gRPC copy fragment: {} from partition {} (target context {})",
             source_address,
             source_partition,
             target_context
         );
-
-        let _permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
 
         let request = storage_v1::CopyRequest {
             source_repository_id: Bytes::copy_from_slice(source_partition.data()),
@@ -764,7 +926,7 @@ impl StorageService {
         };
 
         self.copy_streams
-            .request((session_id, Verb::Copy), request, || {
+            .request((session_id, Verb::Copy), ctx, request, operation, || {
                 self.spawn_copy_stream(ctx)
             })
             .await
@@ -887,25 +1049,26 @@ impl StorageService {
 
         let request_id = self
             .resolved_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_exhausted| ProtocolError::internal("resolved request id exhausted"))?
+            + 1;
         let request = storage_v1::GetResolvedRequest {
             request_id,
             key: Some(key_address.into()),
             flags,
         };
 
-        let _permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
+        let operation = self.operation(ctx).await?;
 
         let res = self
             .get_resolved_streams
-            .request((session_id, Verb::GetResolved), request, || {
-                self.spawn_get_resolved_stream(ctx)
-            })
+            .request(
+                (session_id, Verb::GetResolved),
+                ctx,
+                request,
+                &operation,
+                || self.spawn_get_resolved_stream(ctx),
+            )
             .await?;
 
         if res.resolved.len() != size_of::<Hash>() {
@@ -961,8 +1124,9 @@ impl StorageService {
 
         let request_id = self
             .resolved_counter
-            .fetch_add(1, Ordering::Relaxed)
-            .wrapping_add(1);
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .map_err(|_exhausted| ProtocolError::internal("resolved request id exhausted"))?
+            + 1;
         let request = storage_v1::PutResolvedRequest {
             request_id,
             key: Bytes::from_owner(*key),
@@ -971,389 +1135,529 @@ impl StorageService {
             payload: payload.unwrap_or_default(),
         };
 
-        let _permit = self
-            .get_put_limiter
-            .acquire()
-            .await
-            .internal("permit acquire")?;
+        let operation = self.operation(ctx).await?;
 
         self.put_resolved_streams
-            .request((session_id, Verb::PutResolved), request, || {
-                self.spawn_put_resolved_stream(ctx)
-            })
+            .request(
+                (session_id, Verb::PutResolved),
+                ctx,
+                request,
+                &operation,
+                || self.spawn_put_resolved_stream(ctx),
+            )
             .await
             .map(|_| ())
-    }
-
-    fn spawn_get_resolved_stream(
-        &self,
-        ctx: &GrpcSessionContext,
-    ) -> StreamHandle<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>> {
-        let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
-        let pending = Arc::new(DashMap::<
-            u64,
-            oneshot::Sender<Result<Arc<storage_v1::GetResolvedResponse>, ProtocolError>>,
-        >::new());
-
-        let request_pending = pending.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let request: storage_v1::GetResolvedRequest = request;
-                request_pending.insert(request.request_id, sender);
-                yield request;
-            }
-        };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            let drain = |err: ProtocolError| {
-                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
-                for id in ids {
-                    if let Some((_, sender)) = pending.remove(&id) {
-                        let _ = sender.send(Err(err.clone()));
-                    }
-                }
-            };
-
-            let mut responses = match client.get_resolved(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    response.into_inner()
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::GetResolved.label());
-                    drain(ProtocolError::from(status));
-                    return;
-                }
-            };
-
-            while let Some(response) = responses.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some((_, sender)) = pending.remove(&response.request_id) else {
-                            lore_error!(
-                                "{} unexpected result for request_id {}",
-                                Verb::GetResolved.label(),
-                                response.request_id
-                            );
-                            continue;
-                        };
-                        let result = match item_status_error(response.status.as_ref()) {
-                            Some(err) => Err(err),
-                            None => Ok(Arc::new(response)),
-                        };
-                        let _ = sender.send(result);
-                    }
-                    Err(status) => {
-                        drain(ProtocolError::from(status));
-                        return;
-                    }
-                }
-            }
-
-            drain(ProtocolError::internal(
-                "get_resolved: stream closed before responding",
-            ));
-        });
-
-        handle
-    }
-
-    /// See [`StorageService::spawn_get_resolved_stream`]; the write side, same correlation.
-    fn spawn_put_resolved_stream(
-        &self,
-        ctx: &GrpcSessionContext,
-    ) -> StreamHandle<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>> {
-        let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
-        let handle = Arc::new(StreamState {
-            sender: tx,
-            opened: AtomicBool::new(false),
-        });
-        let state = handle.clone();
-        let pending = Arc::new(DashMap::<
-            u64,
-            oneshot::Sender<Result<Arc<storage_v1::PutResolvedResponse>, ProtocolError>>,
-        >::new());
-
-        let request_pending = pending.clone();
-        let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
-                let request: storage_v1::PutResolvedRequest = request;
-                request_pending.insert(request.request_id, sender);
-                yield request;
-            }
-        };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            let drain = |err: ProtocolError| {
-                let ids: Vec<u64> = pending.iter().map(|entry| *entry.key()).collect();
-                for id in ids {
-                    if let Some((_, sender)) = pending.remove(&id) {
-                        let _ = sender.send(Err(err.clone()));
-                    }
-                }
-            };
-
-            let mut responses = match client.put_resolved(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    response.into_inner()
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::PutResolved.label());
-                    drain(ProtocolError::from(status));
-                    return;
-                }
-            };
-
-            while let Some(response) = responses.next().await {
-                match response {
-                    Ok(response) => {
-                        let Some((_, sender)) = pending.remove(&response.request_id) else {
-                            lore_error!(
-                                "{} unexpected result for request_id {}",
-                                Verb::PutResolved.label(),
-                                response.request_id
-                            );
-                            continue;
-                        };
-                        let result = match item_status_error(response.status.as_ref()) {
-                            Some(err) => Err(err),
-                            None => Ok(Arc::new(response)),
-                        };
-                        let _ = sender.send(result);
-                    }
-                    Err(status) => {
-                        drain(ProtocolError::from(status));
-                        return;
-                    }
-                }
-            }
-
-            drain(ProtocolError::internal(
-                "put_resolved: stream closed before responding",
-            ));
-        });
-
-        handle
     }
 
     fn spawn_get_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
+    ) -> PreparedStream<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
         let handle = Arc::new(StreamState {
             sender: tx,
-            opened: AtomicBool::new(false),
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
         });
-        let state = handle.clone();
         let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
-
         let request_inflight = inflight.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
         let requests = async_stream::stream! {
-            while let Some((address, sender)) = rx.recv().await {
-                if register(&request_inflight, address, sender) {
+            while let Some((address, reply)) = queue.next(&session).await {
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let first = register(&request_inflight, address, reply);
+                drop(admission);
+                if first {
                     yield model_v1::Address::from(address);
                 }
             }
         };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            match client.get(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Get, Some).await;
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::Get.label());
-                    fail_inflight(&inflight, Verb::Get, &ProtocolError::from(status));
-                }
+        let cleanup = ReaderCleanup::new({
+            let stream = stream.clone();
+            let inflight = inflight.clone();
+            move || {
+                finish_address(
+                    &stream,
+                    &inflight,
+                    Verb::Get,
+                    ProtocolError::from(Disconnected),
+                );
             }
         });
-
-        handle
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let terminal = match client.get(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    pump_responses(response.into_inner(), inflight.clone(), Verb::Get, Some).await
+                }
+                Err(status) => ProtocolError::from(status),
+            };
+            finish_address(&stream, &inflight, Verb::Get, terminal);
+        })
     }
 
-    /// A failure to open the RPC keeps its real status rather than becoming a disconnect: it
-    /// applies equally to everything queued behind it, and an `Unauthenticated` or
-    /// `Unimplemented` there should reach the caller instead of being replayed.
     fn spawn_get_metadata_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<Address, (model_v1::Fragment, Bytes)> {
+    ) -> PreparedStream<Address, (model_v1::Fragment, Bytes)> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
         let handle = Arc::new(StreamState {
             sender: tx,
-            opened: AtomicBool::new(false),
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
         });
-        let state = handle.clone();
         let inflight: Arc<Inflight<(model_v1::Fragment, Bytes)>> = Arc::new(DashMap::new());
-
         let request_inflight = inflight.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
         let requests = async_stream::stream! {
-            while let Some((address, sender)) = rx.recv().await {
-                if register(&request_inflight, address, sender) {
+            while let Some((address, reply)) = queue.next(&session).await {
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let first = register(&request_inflight, address, reply);
+                drop(admission);
+                if first {
                     yield model_v1::Address::from(address);
                 }
             }
         };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            match client.get_metadata(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::GetMetadata, Some).await;
-                }
-                Err(status) => {
-                    lore_debug!("{} request failed: {status}", Verb::GetMetadata.label());
-                    fail_inflight(&inflight, Verb::GetMetadata, &ProtocolError::from(status));
-                }
+        let cleanup = ReaderCleanup::new({
+            let stream = stream.clone();
+            let inflight = inflight.clone();
+            move || {
+                finish_address(
+                    &stream,
+                    &inflight,
+                    Verb::GetMetadata,
+                    ProtocolError::from(Disconnected),
+                );
             }
         });
-
-        handle
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let terminal = match client.get_metadata(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    pump_responses(
+                        response.into_inner(),
+                        inflight.clone(),
+                        Verb::GetMetadata,
+                        Some,
+                    )
+                    .await
+                }
+                Err(status) => ProtocolError::from(status),
+            };
+            finish_address(&stream, &inflight, Verb::GetMetadata, terminal);
+        })
     }
 
     fn spawn_put_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<storage_v1::PutRequest, ()> {
+    ) -> PreparedStream<storage_v1::PutRequest, ()> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) =
-            mpsc::channel::<StreamItem<storage_v1::PutRequest, ()>>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
         let handle = Arc::new(StreamState {
             sender: tx,
-            opened: AtomicBool::new(false),
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
         });
-        let state = handle.clone();
         let inflight: Arc<Inflight<()>> = Arc::new(DashMap::new());
-
         let request_inflight = inflight.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
         let requests = async_stream::stream! {
-            while let Some((request, sender)) = rx.recv().await {
+            while let Some((request, reply)) = queue.next(&session).await {
+                let request: storage_v1::PutRequest = request;
                 let Some(address) = request.address.as_ref().map(Address::from) else {
-                    lore_debug!("Missing address in put request");
-                    let _ = sender.send(Err(ProtocolError::internal("put: missing address")));
+                    drop(request);
+                    reply.send(Err(ProtocolError::internal("put: missing address")));
                     continue;
                 };
-                if register(&request_inflight, address, sender) {
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        drop(request);
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let first = register(&request_inflight, address, reply);
+                drop(admission);
+                if first {
                     yield request;
                 }
             }
         };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            match client.put(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Put, Some).await;
-                }
-                Err(status) => {
-                    lore_debug!("put request failed: {status}");
-                    fail_inflight(&inflight, Verb::Put, &ProtocolError::from(status));
-                }
+        let cleanup = ReaderCleanup::new({
+            let stream = stream.clone();
+            let inflight = inflight.clone();
+            move || {
+                finish_address(
+                    &stream,
+                    &inflight,
+                    Verb::Put,
+                    ProtocolError::from(Disconnected),
+                );
             }
         });
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let terminal = match client.put(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    pump_responses(response.into_inner(), inflight.clone(), Verb::Put, Some).await
+                }
+                Err(status) => ProtocolError::from(status),
+            };
+            finish_address(&stream, &inflight, Verb::Put, terminal);
+        })
+    }
 
-        handle
+    fn spawn_get_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> PreparedStream<storage_v1::GetResolvedRequest, Arc<storage_v1::GetResolvedResponse>> {
+        let mut client = StorageServiceClient::new(self.connection.channel());
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
+        let handle = Arc::new(StreamState {
+            sender: tx,
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
+        });
+        let pending = Arc::new(DashMap::<u64, Reply<Arc<storage_v1::GetResolvedResponse>>>::new());
+        let request_pending = pending.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
+        let requests = async_stream::stream! {
+            while let Some((request, reply)) = queue.next(&session).await {
+                let request: storage_v1::GetResolvedRequest = request;
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        drop(request);
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let replaced = request_pending.insert(request.request_id, reply);
+                drop(admission);
+                if let Some(replaced) = replaced {
+                    replaced.send(Err(ProtocolError::internal(
+                        "duplicate resolved request id",
+                    )));
+                }
+                yield request;
+            }
+        };
+        let cleanup = ReaderCleanup::new({
+            let stream = stream.clone();
+            let pending = pending.clone();
+            move || finish_resolved(&stream, &pending, ProtocolError::from(Disconnected))
+        });
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let mut responses = match client.get_resolved(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    response.into_inner()
+                }
+                Err(status) => {
+                    finish_resolved(&stream, &pending, ProtocolError::from(status));
+                    return;
+                }
+            };
+            let terminal = loop {
+                match responses.next().await {
+                    Some(Ok(response)) => {
+                        let Some((_, reply)) = pending.remove(&response.request_id) else {
+                            lore_error!("unexpected resolved response id {}", response.request_id);
+                            continue;
+                        };
+                        let result = match item_status_error(response.status.as_ref()) {
+                            Some(error) => Err(error),
+                            None => Ok(Arc::new(response)),
+                        };
+                        reply.send(result);
+                    }
+                    Some(Err(status)) => break ProtocolError::from(status),
+                    None => {
+                        break ProtocolError::internal(
+                            "get_resolved: stream closed before responding",
+                        );
+                    }
+                }
+            };
+            finish_resolved(&stream, &pending, terminal);
+        })
+    }
+
+    fn spawn_put_resolved_stream(
+        &self,
+        ctx: &GrpcSessionContext,
+    ) -> PreparedStream<storage_v1::PutResolvedRequest, Arc<storage_v1::PutResolvedResponse>> {
+        let mut client = StorageServiceClient::new(self.connection.channel());
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
+        let handle = Arc::new(StreamState {
+            sender: tx,
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
+        });
+        let pending = Arc::new(DashMap::<u64, Reply<Arc<storage_v1::PutResolvedResponse>>>::new());
+        let request_pending = pending.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
+        let requests = async_stream::stream! {
+            while let Some((request, reply)) = queue.next(&session).await {
+                let request: storage_v1::PutResolvedRequest = request;
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        drop(request);
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                let replaced = request_pending.insert(request.request_id, reply);
+                drop(admission);
+                if let Some(replaced) = replaced {
+                    replaced.send(Err(ProtocolError::internal(
+                        "duplicate resolved request id",
+                    )));
+                }
+                yield request;
+            }
+        };
+        let cleanup = ReaderCleanup::new({
+            let stream = stream.clone();
+            let pending = pending.clone();
+            move || finish_resolved(&stream, &pending, ProtocolError::from(Disconnected))
+        });
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let mut responses = match client.put_resolved(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    response.into_inner()
+                }
+                Err(status) => {
+                    finish_resolved(&stream, &pending, ProtocolError::from(status));
+                    return;
+                }
+            };
+            let terminal = loop {
+                match responses.next().await {
+                    Some(Ok(response)) => {
+                        let Some((_, reply)) = pending.remove(&response.request_id) else {
+                            lore_error!("unexpected resolved response id {}", response.request_id);
+                            continue;
+                        };
+                        let result = match item_status_error(response.status.as_ref()) {
+                            Some(error) => Err(error),
+                            None => Ok(Arc::new(response)),
+                        };
+                        reply.send(result);
+                    }
+                    Some(Err(status)) => break ProtocolError::from(status),
+                    None => {
+                        break ProtocolError::internal(
+                            "put_resolved: stream closed before responding",
+                        );
+                    }
+                }
+            };
+            finish_resolved(&stream, &pending, terminal);
+        })
     }
 
     fn spawn_copy_stream(
         &self,
         ctx: &GrpcSessionContext,
-    ) -> StreamHandle<storage_v1::CopyRequest, ()> {
+    ) -> PreparedStream<storage_v1::CopyRequest, ()> {
         let mut client = StorageServiceClient::new(self.connection.channel());
-        let (tx, mut rx) =
-            mpsc::channel::<StreamItem<storage_v1::CopyRequest, ()>>(STREAM_WRITE_BUFFER_SIZE);
+        let (tx, rx) = mpsc::channel(STREAM_WRITE_BUFFER_SIZE);
+        let opened = Arc::new(AtomicBool::new(false));
+        let stream = StreamLife::new(rx);
         let handle = Arc::new(StreamState {
             sender: tx,
-            opened: AtomicBool::new(false),
+            opened: opened.clone(),
+            session: ctx.life.clone(),
+            stream: stream.clone(),
         });
-        let state = handle.clone();
         let inflight: Arc<Inflight<()>> = Arc::new(DashMap::new());
         let routing = Arc::new(parking_lot::Mutex::new(CopyRouting::default()));
-        let (resend, mut resent) = mpsc::unbounded_channel::<storage_v1::CopyRequest>();
-
+        let ready = Arc::new(tokio::sync::Notify::new());
         let request_inflight = inflight.clone();
         let request_routing = routing.clone();
+        let queue = stream.clone();
+        let session = ctx.life.clone();
+        let request_ready = ready.clone();
         let requests = async_stream::stream! {
+            let mut primary_done = false;
             loop {
-                tokio::select! {
-                    received = rx.recv() => {
-                        let Some((request, sender)) = received else {
+                let notified = request_ready.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let next = request_routing.lock().ready.pop_front();
+                if let Some(next) = next {
+                    let admission = match queue.admit() {
+                        Ok(admission) => admission,
+                        Err(_terminal) => {
+                            drop(next);
                             break;
-                        };
-                        let Some((source, target)) = CopyRouting::addresses(&request) else {
-                            lore_debug!("Missing source_address or invalid target_context in copy request");
-                            let _ = sender.send(Err(ProtocolError::internal("copy: invalid request")));
-                            continue;
-                        };
-                        if !register(&request_inflight, target, sender) {
-                            continue;
                         }
-                        let admitted = request_routing.lock().admit(source, target, request);
-                        if let Some(request) = admitted {
-                            yield request;
-                        }
+                    };
+                    {
+                        let mut routing = request_routing.lock();
+                        routing.not_yielded = routing
+                            .not_yielded
+                            .checked_sub(1)
+                            .expect("one emission per accepted copy");
                     }
-                    Some(request) = resent.recv() => yield request,
+                    drop(admission);
+                    yield next;
+                    continue;
+                }
+                if primary_done && request_routing.lock().not_yielded == 0 {
+                    break;
+                }
+                let item = tokio::select! {
+                    _ = queue.wait_terminal() => break,
+                    _ = notified => continue,
+                    item = queue.next(&session), if !primary_done => item,
+                };
+                let Some((request, reply)) = item else {
+                    primary_done = true;
+                    continue;
+                };
+                let Some((source, target)) = CopyRouting::addresses(&request) else {
+                    drop(request);
+                    reply.send(Err(ProtocolError::internal("copy: invalid request")));
+                    continue;
+                };
+                let admission = match queue.admit() {
+                    Ok(admission) => admission,
+                    Err(error) => {
+                        drop(request);
+                        reply.send(Err(error));
+                        continue;
+                    }
+                };
+                if !register(&request_inflight, target, reply) {
+                    drop(admission);
+                    drop(request);
+                    continue;
+                }
+                let next = request_routing.lock().admit(source, target, request);
+                if next.is_some() {
+                    let mut routing = request_routing.lock();
+                    routing.not_yielded = routing
+                        .not_yielded
+                        .checked_sub(1)
+                        .expect("one emission per accepted copy");
+                }
+                drop(admission);
+                if let Some(next) = next {
+                    yield next;
                 }
             }
         };
-        let route = move |source| {
-            let (target, next) = routing.lock().answered(source);
-            if let Some(next) = next {
-                let _ = resend.send(next);
+        let route = {
+            let routing = routing.clone();
+            let ready = ready.clone();
+            move |source| {
+                let target = {
+                    let mut routing = routing.lock();
+                    let (target, next) = routing.answered(source);
+                    if let Some(next) = next {
+                        routing.ready.push_back(next);
+                    }
+                    target
+                };
+                ready.notify_one();
+                target
             }
-            target
         };
-
-        let ctx = ctx.clone();
-        lore_spawn_net!(async move {
-            let mut req = tonic::Request::new(requests);
-            inject_metadata(&mut req, &ctx);
-
-            match client.copy(req).await {
-                Ok(response) => {
-                    state.opened.store(true, Ordering::Relaxed);
-                    pump_responses(response.into_inner(), inflight, Verb::Copy, route).await;
-                }
-                Err(status) => {
-                    lore_debug!("copy request failed: {status}");
-                    fail_inflight(&inflight, Verb::Copy, &ProtocolError::from(status));
-                }
+        let finish = {
+            let stream = stream.clone();
+            let inflight = inflight.clone();
+            let routing = routing.clone();
+            let ready = ready.clone();
+            move |error| {
+                let error = stream.terminate(error);
+                let retired = {
+                    let mut routing = routing.lock();
+                    std::mem::take(&mut *routing)
+                };
+                drop(retired);
+                ready.notify_waiters();
+                fail_buffered(&stream, &error);
+                fail_inflight(&inflight, Verb::Copy, &error);
             }
+        };
+        let cleanup = ReaderCleanup::new({
+            let finish = finish.clone();
+            move || finish(ProtocolError::from(Disconnected))
         });
-
-        handle
+        let ctx = ctx.clone();
+        PreparedStream::new(handle, async move {
+            let _cleanup = cleanup;
+            let mut request = tonic::Request::new(requests);
+            inject_metadata(&mut request, &ctx);
+            let terminal = match client.copy(request).await {
+                Ok(response) => {
+                    opened.store(true, Ordering::Relaxed);
+                    pump_responses(response.into_inner(), inflight.clone(), Verb::Copy, route).await
+                }
+                Err(status) => ProtocolError::from(status),
+            };
+            finish(terminal);
+        })
     }
 }

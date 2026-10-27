@@ -13,7 +13,6 @@ use crate::read::Loaded;
 use crate::types::Address;
 use crate::types::Hash;
 use crate::types::Partition;
-use crate::write::StoreInFlightKey;
 
 /// Outcome the read single-flight leader publishes to its followers: `None`
 /// while the read is still running, `Some(result)` once it finishes.
@@ -76,10 +75,16 @@ impl Hasher for PassThroughHasher {
     }
 }
 
-/// A read in flight: the leader's partition and address, and the channel its outcome goes out on,
-/// which the first follower creates.
+/// The partition and address whose read outcome a leader supplies.
+#[derive(Clone)]
+struct ReadFlightSource {
+    partition: Partition,
+    address: Address,
+}
+
+/// A read in flight and the channel its first follower creates.
 struct ReadFlightEntry {
-    leader: StoreInFlightKey,
+    leader: ReadFlightSource,
     sender: Option<watch::Sender<ReadFlightResult>>,
 }
 
@@ -114,7 +119,7 @@ pub(crate) enum ReadFlight {
 /// receiver its outcome arrives on.
 #[lore_macro::test_pub]
 pub(crate) struct ReadFlightFollower {
-    leader: StoreInFlightKey,
+    leader: ReadFlightSource,
     receiver: watch::Receiver<ReadFlightResult>,
 }
 
@@ -208,7 +213,7 @@ pub(crate) fn join_read_flight(
         let follower = match in_flight.entry(key) {
             Entry::Vacant(vacant) => {
                 vacant.insert(ReadFlightEntry {
-                    leader: StoreInFlightKey { partition, address },
+                    leader: ReadFlightSource { partition, address },
                     sender: None,
                 });
                 return ReadFlight::Leader(ReadFlightGuard { key: Some(key) });

@@ -220,15 +220,21 @@ pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
-    let mut ignore = load_filter(ignore_path)?;
+    from_instances(load_filter(ignore_path)?, load_filter(view_path)?)
+}
+
+/// Assemble parsed ignore and view rules with the repository's reserved-path
+/// and temporary-file exclusions.
+pub fn from_instances(
+    mut ignore: FilterInstance,
+    view: FilterInstance,
+) -> Result<Filter, FilterError> {
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
     for suffix in MERGE_ARTIFACT_SUFFIXES {
         ignore.add_exclusion(&format!("*{suffix}"))?;
     }
     ignore.add_exclusion(&format!("*{TEMP_FILE_EXTENSION}"))?;
-
-    let view = load_filter(view_path)?;
 
     Ok(Filter {
         ignore,

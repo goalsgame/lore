@@ -9,5 +9,6 @@ pub mod filesystem_provider;
 pub mod hold;
 pub mod invalid_filesystem_provider;
 pub mod os;
+pub mod provider_registry;
 pub mod realize;
 pub mod swfs;

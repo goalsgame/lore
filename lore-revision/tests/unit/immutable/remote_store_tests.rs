@@ -86,10 +86,8 @@ async fn an_undecodable_payload_asks_no_heal() {
         & !(FragmentFlags::PayloadCompressedLZ4
             | FragmentFlags::PayloadCompressedOodle2
             | FragmentFlags::PayloadCompressedZstd);
-    let (source, address, _) = lore_storage::test_util::accepting_unvalidated_puts(remote_copy(
-        content,
-        0x73,
-        unassigned.bits(),
+    let (source, address, _) = Box::pin(lore_storage::test_util::accepting_unvalidated_puts(
+        remote_copy(content, 0x73, unassigned.bits()),
     ))
     .await;
     let remote = serving_remote(&source, Serving::default());

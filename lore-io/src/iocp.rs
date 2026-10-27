@@ -139,6 +139,7 @@ enum OpState {
 }
 
 struct OpShared<P> {
+    lease: Option<crate::lease::IoLease>,
     state: OpState,
     payload: Option<P>,
 }
@@ -206,18 +207,21 @@ unsafe fn complete_typed<P>(overlapped: *mut OVERLAPPED, result: std::io::Result
     // SAFETY: the caller guarantees this is the `Arc<Op<P>>` pointer submitted with the operation,
     // reclaimed exactly once, and `repr(C)` puts the overlapped at offset zero of the entry.
     let op = unsafe { Arc::from_raw(overlapped.cast_const().cast::<Op<P>>()) };
-    let waker = {
+    let (waker, lease) = {
         let mut shared = op.shared.lock();
         let previous = std::mem::replace(&mut shared.state, OpState::Completed(result));
-        match previous {
+        let waker = match previous {
             OpState::Waiting(waker) => waker,
             OpState::Abandoned => {
                 shared.payload = None;
                 None
             }
             OpState::Completed(_) | OpState::Taken => None,
-        }
+        };
+        (waker, shared.lease.take())
     };
+    // Lease destruction may reenter its owner; never run it under the operation lock.
+    drop(lease);
     if let Some(waker) = waker {
         waker.wake();
     }
@@ -672,6 +676,7 @@ impl IocpDriver {
                 complete: complete_typed::<P>,
             },
             shared: Mutex::new(OpShared {
+                lease: crate::lease::IoLease::current(),
                 state: OpState::Waiting(None),
                 payload: Some(payload),
             }),

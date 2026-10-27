@@ -51,3 +51,18 @@ fn trusting_the_remote_reaches_the_globals() {
         assert_eq!(globals.trust_remote, trusted, "{}", args.join(" "));
     }
 }
+
+#[test]
+fn foreground_mounts_keep_full_local_runtime_pools() {
+    assert!(lore_client::client_main::runs_locally(&command_of(&[
+        "lore",
+        "mount",
+        "--experimental",
+        "--revision",
+        "main@LATEST",
+        "/tmp/view"
+    ])));
+    assert!(!lore_client::client_main::runs_locally(&command_of(&[
+        "lore", "status"
+    ])));
+}

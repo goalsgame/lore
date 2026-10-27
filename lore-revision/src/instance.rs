@@ -43,6 +43,8 @@ use crate::metadata::Metadata;
 use crate::repository::RepositoryContext;
 use crate::repository::RepositoryContextCreationArgs;
 
+pub mod strict_anchors;
+
 pub const INSTANCE_METADATA: &str = "instance-metadata";
 pub const ANCHOR_CURRENT: &str = "anchor-current";
 pub const ANCHOR_CURRENT_BRANCH: &str = "anchor-current-branch";

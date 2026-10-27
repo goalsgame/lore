@@ -810,7 +810,7 @@ async fn commit_staged_with_layers(
             state_staged.revision()
         );
         'parent: {
-            let (committed, modified_times) = match commit_staged_revision(
+            let (committed, modified_times, committed_source) = match commit_staged_revision(
                 operation,
                 repository.clone(),
                 token.share(),
@@ -839,7 +839,9 @@ async fn commit_staged_with_layers(
                 signature,
                 current_branch,
                 token,
+                committed_source,
                 Some(operation),
+                operation,
             )
             .await?;
 
@@ -931,7 +933,7 @@ async fn commit_staged_with_layers(
         )
         .await;
 
-        let (layer_signature, layer_modified_times) = match layer_result {
+        let (layer_signature, layer_modified_times, layer_source) = match layer_result {
             Ok(committed) => committed,
             Err(err) if err.is_nothing_staged() => {
                 // The parent revision is already committed at this point, so a
@@ -975,6 +977,20 @@ async fn commit_staged_with_layers(
             )
             .await
             .forward::<CommitError>("Failed to store layer branch latest")?;
+
+            if operation.wants_linked_commits()
+                && let Err(error) = hand_over_committed(
+                    &layer_repository,
+                    operation,
+                    &layer_state.state_staged,
+                    layer_source,
+                )
+                .await
+            {
+                lore_warn!(
+                    "The filesystem provider did not take layer revision {layer_signature} as committed: {error}"
+                );
+            }
 
             layer::store_layer_current(
                 repository.clone(),
@@ -1113,7 +1129,7 @@ async fn commit_layer_only(
         layer.target_path.as_str(),
     )
     .await?;
-    let (layer_signature, layer_modified_times) = commit_staged_revision(
+    let (layer_signature, layer_modified_times, layer_source) = commit_staged_revision(
         operation,
         layer_state.repository.clone(),
         token.share(),
@@ -1147,6 +1163,20 @@ async fn commit_layer_only(
         )
         .await
         .forward::<CommitError>("Failed to store layer branch latest")?;
+
+        if operation.wants_linked_commits()
+            && let Err(error) = hand_over_committed(
+                &layer_state.repository,
+                operation,
+                &layer_state.state_staged,
+                layer_source,
+            )
+            .await
+        {
+            lore_warn!(
+                "The filesystem provider did not take layer revision {layer_signature} as committed: {error}"
+            );
+        }
 
         layer::store_layer_current(
             repository.clone(),
@@ -1313,7 +1343,7 @@ async fn commit_link_only(
     );
 
     let Ok(link_mount_path) = RelativePath::from_str(&link_path);
-    let (link_signature, link_modified_times) = commit_staged_revision(
+    let (link_signature, link_modified_times, link_source) = commit_staged_revision(
         operation,
         link_repository.clone(),
         token.share(),
@@ -1336,7 +1366,9 @@ async fn commit_link_only(
         link_signature,
         link_branch,
         &token,
+        link_source,
         None,
+        operation,
     )
     .await?;
 
@@ -1407,14 +1439,19 @@ async fn commit_link_only(
         )
         .await?;
 
-        let (child_signature, child_modified_times) = commit_staged_revision(
+        let (mount, selected_root) = if operation.wants_linked_commits() {
+            intermediate_mount(&chain, i).await?
+        } else {
+            (RelativePath::new(), ROOT_NODE)
+        };
+        let (child_signature, child_modified_times, child_source) = commit_staged_revision(
             operation,
             child_repository.clone(),
             token.share(),
             child_current.clone(),
             child_state.clone(),
-            RelativePath::new(),
-            ROOT_NODE,
+            mount,
+            selected_root,
             child_metadata,
             Arc::new(HashMap::new()),
             level.branch,
@@ -1434,7 +1471,9 @@ async fn commit_link_only(
             child_signature,
             level.branch,
             &token,
+            child_source,
             None,
+            operation,
         )
         .await?;
 
@@ -1544,7 +1583,9 @@ async fn finalize_commit(
     signature: Hash,
     branch: BranchId,
     token: &RepositoryWriteToken,
+    source: Option<NodeMapping>,
     reconciling: Option<&InstanceOperationImpl>,
+    ingesting: &InstanceOperationImpl,
 ) -> Result<(), CommitError> {
     let dry_run = execution_context().globals().dry_run();
 
@@ -1558,7 +1599,8 @@ async fn finalize_commit(
         .await?;
         if let Some(operation) = reconciling
             && operation.holds_state()
-            && let Err(error) = hand_over_committed(&repository, operation, state_staged).await
+            && let Err(error) =
+                hand_over_committed(&repository, operation, state_staged, source).await
         {
             lore_warn!(
                 "The filesystem provider did not take revision {signature} as committed: {error}"
@@ -1596,6 +1638,14 @@ async fn finalize_commit(
         }
     }
 
+    if !dry_run && ingesting.wants_content_sha256() {
+        repository
+            .flush(execution_context().globals().sync_data())
+            .await
+            .forward_any::<CommitError>("flushing content digests before publication")?;
+        ingesting.queue_content_digests(repository.id, signature);
+    }
+
     event::LoreEvent::RevisionCommitRevision(LoreRevisionCommitRevisionEventData {
         repository: repository.id,
         branch,
@@ -1612,19 +1662,38 @@ async fn finalize_commit(
 /// Hands `committed` to `operation`, whose provider holds its state, once the stores are flushed
 /// ([`InstanceOperation::committed`]). The provider may then drop the copies it kept of the files
 /// the commit read, which only a revision on disk replaces after a crash.
-async fn hand_over_committed(
+#[lore_macro::test_pub]
+pub(crate) async fn hand_over_committed(
     repository: &Arc<RepositoryContext>,
     operation: &InstanceOperationImpl,
     committed: &Arc<State>,
+    source: Option<NodeMapping>,
 ) -> Result<(), CommitError> {
+    let mut handoff = operation.begin_commit_handoff();
+    let sync_data =
+        execution_context().globals().sync_data() || operation.requires_durable_commit_handoff();
     repository
-        .flush(execution_context().globals().sync_data())
+        .flush(sync_data)
         .await
         .forward_any::<CommitError>("flushing the commit")?;
-    operation
-        .committed(repository.clone(), committed.clone())
-        .await
-        .forward::<CommitError>("handing the provider the committed revision")
+    let result = match source {
+        Some(source) => {
+            operation
+                .committed_from_source(source, committed.clone())
+                .await
+        }
+        None => {
+            operation
+                .committed(repository.clone(), committed.clone())
+                .await
+        }
+    };
+    if result.is_ok()
+        && let Some(handoff) = &mut handoff
+    {
+        handoff.complete();
+    }
+    result.forward::<CommitError>("handing the provider the committed revision")
 }
 
 /// Where a layer's commit starts: the node its configured source path names in the state being
@@ -1661,6 +1730,64 @@ async fn layer_commit_root(
     Ok((node_link.node, relative_path))
 }
 
+async fn committed_source(
+    repository: Arc<RepositoryContext>,
+    current: &State,
+    staged: &State,
+    node: NodeID,
+    path: RelativePath,
+) -> Result<NodeMapping, CommitError> {
+    let source_path = staged
+        .node_path(repository.clone(), node)
+        .await
+        .forward::<CommitError>("resolving commit source subtree")?;
+    let state = State::deserialize(repository.clone(), current.revision())
+        .await
+        .forward::<CommitError>("loading immutable commit source")?;
+    let root = state
+        .find_node_link(repository.clone(), &source_path)
+        .await
+        .forward::<CommitError>("resolving immutable commit source")?;
+    if root.repository != repository.id || root.revision != state.revision() {
+        return Err(CommitError::internal(
+            "Commit source crossed owning repository",
+        ));
+    }
+    Ok(NodeMapping {
+        repository,
+        state,
+        path,
+        node: root.node,
+    })
+}
+
+async fn intermediate_mount(
+    chain: &link::ResolvedLinkChain,
+    index: usize,
+) -> Result<(RelativePath, NodeID), CommitError> {
+    let mut path = RelativePathBuf::new();
+    let mut source_root = ROOT_NODE;
+    for level in chain.levels.iter().take(index + 1) {
+        let below = level
+            .state
+            .node_path_below(level.repository.clone(), level.link_node_id, source_root)
+            .await
+            .forward::<CommitError>("resolving intermediate mount route")?
+            .ok_or_else(|| {
+                CommitError::internal("Intermediate mount is outside selected source")
+            })?;
+        path.push(below.as_str());
+        source_root = level
+            .state
+            .node(level.repository.clone(), level.link_node_id)
+            .await
+            .forward::<CommitError>("reading intermediate selected source")?
+            .linked_node()
+            .node;
+    }
+    Ok((path.freeze(), source_root))
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn commit_staged_revision(
     operation: &Arc<InstanceOperationImpl>,
@@ -1674,7 +1801,21 @@ async fn commit_staged_revision(
     link_messages: Arc<HashMap<String, String>>,
     parent_branch: BranchId,
     reporting: CommitReporting,
-) -> Result<(Hash, Arc<RecordedModifiedTimes>), CommitError> {
+) -> Result<(Hash, Arc<RecordedModifiedTimes>, Option<NodeMapping>), CommitError> {
+    let source = if operation.wants_linked_commits() {
+        Some(
+            committed_source(
+                repository.clone(),
+                &state_current,
+                &state_staged,
+                node_id,
+                relative_path.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     let context = execution_context();
     let globals = context.globals();
 
@@ -1792,10 +1933,10 @@ async fn commit_staged_revision(
     // Original work errors take precedence; tracker drain errors surface only
     // when the work itself succeeded.
     match work_result {
-        Ok(committed) => {
+        Ok((signature, times)) => {
             drain_result
                 .forward::<CommitError>("Background fragment upload task failed during commit")?;
-            Ok(committed)
+            Ok((signature, times, source))
         }
         Err(work_err) => Err(work_err),
     }
@@ -2728,15 +2869,30 @@ fn commit_file(
                 .forward_with::<CommitError, _>(|| {
                     format!("naming the content of {relative_path}")
                 })?;
-            let (address, size_content) = immutable::write_from_file_with_tracker(
-                repository.clone(),
-                &source,
-                node.address.context,
-                immutable::write_options_from_repository(repository.clone()),
-                Some(tracker),
-            )
-            .await
-            .forward_with::<CommitError, _>(|| {
+            let written = if operation.wants_content_sha256() {
+                immutable::write_from_file_with_sha256(
+                    repository.clone(),
+                    &source,
+                    node.address.context,
+                    immutable::write_options_from_repository(repository.clone()),
+                    tracker,
+                )
+                .await
+                .map(|(address, size, digest)| {
+                    operation.record_ingested(repository.id, digest);
+                    (address, size)
+                })
+            } else {
+                immutable::write_from_file_with_tracker(
+                    repository.clone(),
+                    &source,
+                    node.address.context,
+                    immutable::write_options_from_repository(repository.clone()),
+                    Some(tracker),
+                )
+                .await
+            };
+            let (address, size_content) = written.forward_with::<CommitError, _>(|| {
                 format!(
                     "Failed writing file {} to immutable store",
                     relative_path.as_str()
@@ -2902,6 +3058,7 @@ async fn commit_link_node(
         link_state,
         relative_path,
         link_node,
+        link_reference.signature,
         branch_id,
         based_on,
         link_metadata,
@@ -2997,6 +3154,7 @@ async fn commit_link(
     state: Arc<State>,
     relative_path: RelativePath,
     node_id: NodeID,
+    source_hint: Hash,
     branch: BranchId,
     based_on: BasedOn,
     metadata: Arc<Metadata>,
@@ -3004,6 +3162,28 @@ async fn commit_link(
     stats: Arc<CommitStats>,
     parent_tracker: Arc<lore_storage::write_tracker::WriteTracker>,
 ) -> Result<(Hash, NodeID), CommitError> {
+    let source = if operation.wants_linked_commits() {
+        let source_pin = if state.committed_revision().is_zero() {
+            source_hint
+        } else {
+            state.committed_revision()
+        };
+        let current = State::deserialize(repository.clone(), source_pin)
+            .await
+            .forward::<CommitError>("loading linked commit source")?;
+        Some(
+            committed_source(
+                repository.clone(),
+                &current,
+                &state,
+                node_id,
+                relative_path.clone(),
+            )
+            .await?,
+        )
+    } else {
+        None
+    };
     // Per-link tracker: a linked sub-repo is a logically independent commit
     // and must carry its own durability gate. If we reused the parent's
     // tracker, the sub-repo's RevisionCommitRevision would fire before the
@@ -3031,6 +3211,7 @@ async fn commit_link(
     // case — no new revision, no event.
     let work_tracker = link_tracker.clone();
     let work_result: Result<Option<Hash>, CommitError> = {
+        let operation = operation.clone();
         let repository = repository.clone();
         let state = state.clone();
         let metadata = metadata.clone();
@@ -3197,6 +3378,23 @@ async fn commit_link(
         Some(sig) => sig,
         None => return Ok((state.committed_revision(), node_id)),
     };
+
+    if !execution_context().globals().dry_run()
+        && operation.wants_linked_commits()
+        && let Err(error) = hand_over_committed(&repository, &operation, &state, source).await
+    {
+        lore_warn!(
+            "The filesystem provider did not take linked revision {signature} as committed: {error}"
+        );
+    }
+
+    if !execution_context().globals().dry_run() && operation.wants_content_sha256() {
+        repository
+            .flush(execution_context().globals().sync_data())
+            .await
+            .forward_any::<CommitError>("flushing linked content digests before publication")?;
+        operation.queue_content_digests(repository.id, signature);
+    }
 
     // For linked repos, RevisionCommitRevision emission is strictly after
     // (a) the per-link tracker drain succeeded and (b) branch::store_latest

@@ -49,6 +49,10 @@ pub static RECONNECT_MAX_DELAY: u64 = 30_000;
 /// Maximum reconnect attempts before giving up
 pub static RECONNECT_MAX_ATTEMPTS: usize = 10;
 
+mod owner;
+pub use owner::OwnerConnectionSource;
+pub use owner::connect_owned;
+
 static PROTOCOL_MAP: Mutex<Option<HashMap<String, Arc<dyn Protocol>>>> = Mutex::new(None);
 
 static REGISTER_BUILTIN_PROTOCOLS: Once = Once::new();
@@ -367,6 +371,7 @@ pub async fn connect(
             identity_token,
             access_token,
             auth_mode,
+            None,
         )
         .await
     })
@@ -383,7 +388,19 @@ async fn connect_impl(
     identity_token: String,
     access_token: String,
     auth_mode: AuthMode,
+    owner_source: Option<OwnerConnectionSource>,
 ) -> Result<Arc<Connection>, ProtocolError> {
+    if let Some(source) = &owner_source {
+        source.check_environment()?;
+        if source.remote_url() != remote_url.as_str()
+            || source.identity() != identity
+            || source.auth_mode() != auth_mode
+        {
+            return Err(ProtocolError::internal(
+                "Owner connection principal mismatch",
+            ));
+        }
+    }
     let remote_domain = lore_credential::domain_from_url_or_url(&remote_url);
 
     // Forward rather than `internal`-wrap so a classified failure (such as
@@ -410,7 +427,13 @@ async fn connect_impl(
         });
 
     let mut identity = identity;
-    if !auth_endpoint.is_none() {
+    if owner_source.is_some() {
+        // An owner source pins its resolved principal. A changed server may
+        // refuse it, but must not select another stored identity implicitly.
+        if !auth_endpoint.is_none() && identity.is_empty() {
+            return Err(ProtocolError::from(lore_base::error::NotAuthenticated));
+        }
+    } else if !auth_endpoint.is_none() {
         // Ensure we are authenticated if there is an auth url defined in the environment
         if identity.is_empty() {
             let (_, _, resolved) = auth_exchange(
@@ -465,12 +488,14 @@ async fn connect_impl(
     }
 
     let from_supplied_credentials = !identity_token.is_empty() || !access_token.is_empty();
-    if let Some(connection) = find_connection(
-        remote_url.as_str(),
-        identity.as_str(),
-        from_supplied_credentials,
-        auth_mode,
-    ) {
+    if owner_source.is_none()
+        && let Some(connection) = find_connection(
+            remote_url.as_str(),
+            identity.as_str(),
+            from_supplied_credentials,
+            auth_mode,
+        )
+    {
         // As above. An unauthenticated server leaves the identity unresolved even
         // here, and that entry is shared with every other call that resolved none.
         if !identity.is_empty() {
@@ -481,9 +506,15 @@ async fn connect_impl(
         return Ok(connection);
     }
 
-    let credentials = Arc::new(SuppliedCredentials::new(&identity_token, &access_token));
+    let credentials = match &owner_source {
+        Some(source) => {
+            source.check_environment()?;
+            source.credentials.clone()
+        }
+        None => Arc::new(SuppliedCredentials::new(&identity_token, &access_token)),
+    };
 
-    let connection = Arc::new(Connection::unconnected(
+    let mut connection = Connection::unconnected(
         remote_url.clone(),
         auth_endpoint.clone(),
         identity.clone(),
@@ -491,7 +522,13 @@ async fn connect_impl(
         auth_mode,
         environment,
         protocol.clone(),
-    ));
+    );
+    if let Some(source) = &owner_source {
+        connection.principal = source.principal.clone();
+        connection.owned = true;
+        source.check_connection(&connection)?;
+    }
+    let connection = Arc::new(connection);
 
     let subtask_aborts: Arc<parking_lot::Mutex<Vec<tokio::task::AbortHandle>>> =
         Arc::new(parking_lot::Mutex::new(Vec::new()));
@@ -732,13 +769,15 @@ async fn connect_impl(
         });
     }
 
-    add_connection(
-        remote_url.as_str(),
-        identity.as_str(),
-        from_supplied_credentials,
-        auth_mode,
-        connection.clone(),
-    );
+    if owner_source.is_none() {
+        add_connection(
+            remote_url.as_str(),
+            identity.as_str(),
+            from_supplied_credentials,
+            auth_mode,
+            connection.clone(),
+        );
+    }
 
     Ok(connection)
 }
@@ -895,6 +934,9 @@ struct Connector {
 
 /// Connection over a protocol
 pub struct Connection {
+    // Recorded at creation, independent of the public diagnostic fields.
+    principal: ConnectionKey,
+    owned: bool,
     pub remote_url: Url,
     /// The authentication path selected for this connection.
     auth_endpoint: AuthEndpoint,
@@ -965,7 +1007,16 @@ impl Connection {
         environment: EnvironmentConfig,
         protocol: Arc<dyn Protocol>,
     ) -> Self {
+        let principal = (
+            remote_url.as_str().to_string(),
+            identity.clone(),
+            credentials.from_supplied_credentials(),
+            credential_store(),
+            auth_mode,
+        );
         Connection {
+            principal,
+            owned: false,
             remote_url,
             auth_endpoint,
             identity,
@@ -1345,6 +1396,10 @@ impl Connection {
     }
 
     pub async fn connect_module(&self, module: RepositoryId) -> Result<Arc<Self>, ProtocolError> {
+        if self.owned {
+            return connect_owned(&self.owner_source().await?, module, MAX_STORAGE_CONNECTIONS)
+                .await;
+        }
         // TODO(vri): UCS-19226 - Links: Connection reuse for already connected links
         let (identity_token, access_token) = self.credentials.tokens();
         connect(

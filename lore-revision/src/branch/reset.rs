@@ -115,9 +115,48 @@ pub async fn reset(
     let context = execution_context();
     let global = context.globals();
 
-    let (_current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
-        .await
-        .forward::<ResetError>("loading current anchor")?;
+    let restricted = !repository.file_system().supports_revision_replacement();
+    let (_current_revision, current_branch) = if restricted {
+        let anchors = crate::instance::strict_anchors::read(&repository)
+            .await
+            .map_err(|error| {
+                ResetError::internal(format!(
+                    "Cannot prove current instance branch before reset: {error}"
+                ))
+            })?;
+        (anchors.current, anchors.branch)
+    } else {
+        crate::instance::load_current_anchor(&repository)
+            .await
+            .forward::<ResetError>("loading current anchor")?
+    };
+    let prevalidated_branch = if restricted {
+        if branch.is_empty() || branch.parse::<Context>().ok() == Some(current_branch) {
+            crate::fs::hold::require_revision_replacement(&repository)?;
+        }
+        let requested = if branch.is_empty() {
+            current_branch.to_string()
+        } else {
+            branch.clone()
+        };
+        // Resolution may populate branch-name caches; prove the target without a write token.
+        let resolved = branch::resolve(Arc::new(repository.without_command_locks()), &requested)
+            .await
+            .map_err(|err| {
+                ResetError::BranchNotFound(
+                    BranchNotFound {
+                        branch: requested.clone(),
+                    }
+                    .chain_err_from(err, "resolving branch"),
+                )
+            })?;
+        if resolved.id == current_branch {
+            crate::fs::hold::require_revision_replacement(&repository)?;
+        }
+        Some(resolved)
+    } else {
+        None
+    };
 
     // Reject if any node is actually staged; dirty-only tracking is
     // tolerated and forwarded by `sync::sync` → `rebase_staged_anchor`
@@ -148,16 +187,20 @@ pub async fn reset(
         branch
     };
 
-    let branch = branch::resolve(repository.clone(), branch.as_str())
-        .await
-        .map_err(|err| {
-            ResetError::BranchNotFound(
-                BranchNotFound {
-                    branch: branch.clone(),
-                }
-                .chain_err_from(err, "resolving branch"),
-            )
-        })?;
+    let branch = if let Some(resolved) = prevalidated_branch {
+        resolved
+    } else {
+        branch::resolve(repository.clone(), branch.as_str())
+            .await
+            .map_err(|err| {
+                ResetError::BranchNotFound(
+                    BranchNotFound {
+                        branch: branch.clone(),
+                    }
+                    .chain_err_from(err, "resolving branch"),
+                )
+            })?
+    };
 
     let branch_metadata = branch::metadata(repository.clone(), branch.id)
         .await

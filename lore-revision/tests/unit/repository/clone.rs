@@ -459,3 +459,6 @@ async fn a_tree_warm_up_told_to_stop_walks_nothing() {
 
     assert_eq!((stopped.directories, stopped.blocks), (0, 0));
 }
+
+#[cfg(unix)]
+mod working_target;

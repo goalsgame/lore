@@ -71,6 +71,62 @@ jobs:
       - name: cargo test
         run: cargo test --workspace --verbose
 
+  vfs-mount:
+    name: VFS mounted contracts (linux-x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare FUSE and build storage
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fuse3
+          if [ ! -c /dev/fuse ]; then sudo modprobe fuse; fi
+          test -r /dev/fuse && test -w /dev/fuse
+          command -v fusermount3
+          sudo mkdir -p /mnt/cargo-target
+          sudo chown -R "$(id -u):$(id -g)" /mnt/cargo-target
+          echo "CARGO_TARGET_DIR=/mnt/cargo-target" >> "$GITHUB_ENV"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: vfs-mount-linux-x86_64
+      - name: Check portable FSKit build and mount preflight helpers
+        # These exercise path/config validation and Cargo artifact parsing only.
+        # Swift, signing and actual FSKit mounting require native macOS validation.
+        run: |
+          python3 contrib/fskit-prototype/Tests/BuildTests.py
+          python3 contrib/fskit-prototype/Tests/PreflightTests.py
+      - name: Install Bazel workload prerequisite
+        run: |
+          curl --fail --location --retry 3 https://github.com/bazelbuild/bazel/releases/download/7.5.0/bazel-7.5.0-linux-x86_64 --output "$RUNNER_TEMP/bazel"
+          echo "b774f62102de61f2889784cbe46451b098d22f1553fe366ed0f251602332fa84  $RUNNER_TEMP/bazel" | sha256sum --check
+          chmod +x "$RUNNER_TEMP/bazel"
+          echo "LORE_TEST_BAZEL=$RUNNER_TEMP/bazel" >> "$GITHUB_ENV"
+      - name: Check production service library
+        # Test dependencies enable helper features that can mask visibility errors.
+        run: cargo check --locked --package lore --lib
+      - name: Build VFS tests
+        run: |
+          cargo test --locked --package lore-vfs --lib --no-run
+          cargo test --locked --package lore --test mount --no-run
+          cargo test --locked --package lore --features test-util --test unit --no-run
+          cargo test --locked --package lore-vfs --test bazel --no-run
+      - name: Run mounted contracts
+        # Ignored tests in this crate require a real FUSE host. A missing device
+        # or mount failure must fail this job, rather than silently skip it.
+        run: |
+          timeout --kill-after=10s 180s cargo test --locked --package lore-vfs --lib -- --ignored --nocapture --test-threads=1
+          timeout --kill-after=10s 180s cargo test --locked --package lore --test mount -- --ignored --nocapture --test-threads=1
+          timeout --kill-after=10s 180s cargo test --locked --package lore --test unit working_mount::mounted_ -- --ignored --nocapture --test-threads=1
+          timeout --kill-after=10s 180s cargo test --locked --package lore --test unit service_owned_mount::mounted_ -- --ignored --nocapture --test-threads=1
+          timeout --kill-after=10s 180s cargo test --locked --package lore --features test-util --test unit working_mount_factory:: -- --ignored --nocapture --test-threads=1
+          timeout --kill-after=10s 240s cargo test --locked --package lore-vfs --test bazel -- --ignored --nocapture --test-threads=1
+
   # Runs the integration tests against the MinIO, DynamoDB Local, Firestore
   # emulator, Pub/Sub emulator, and Consul services that Docker Compose starts.
   # Only the Linux runners provide Docker. The tests connect to 127.0.0.1 on

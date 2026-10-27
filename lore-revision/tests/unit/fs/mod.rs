@@ -6,3 +6,5 @@ mod hold;
 mod os;
 mod realize;
 mod swfs;
+
+mod provider_registry;

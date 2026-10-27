@@ -49,6 +49,7 @@ pub async fn add(
     pin: Option<String>,
     disable_branching: bool,
 ) -> Result<(), LinkError> {
+    crate::fs::hold::require_revision_replacement(&repository)?;
     // The identifier is a full URL or a bare name or ID, and only a scheme tells them apart:
     // `is_valid_name` permits scoped names like `org/project`, so a slash says nothing about
     // which form this is. A schemeless identifier names a repository on the same remote as

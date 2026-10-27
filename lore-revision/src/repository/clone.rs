@@ -1006,7 +1006,22 @@ pub async fn clone(
         }));
     }
 
-    let existing_dot_dir = get_dot_lore_path(path)?;
+    let existing_dot_dir = if let Some(resolver) = context.provider_resolver() {
+        let resolved =
+            repository::resolve_repository_paths(path, Some(&resolver)).map_err(|error| {
+                InvalidPath {
+                    path: format!("{}: {error}", path.display()),
+                }
+            })?;
+        if resolved.working.is_some() {
+            return Err(CloneError::from(InvalidArguments {
+                reason: "Cloning into a service-owned working instance is not supported".into(),
+            }));
+        }
+        resolved.metadata
+    } else {
+        get_dot_lore_path(path)?
+    };
     if existing_dot_dir.exists() {
         let existing_repository_is_swfs =
             load_repository_config_from_dot_dir(existing_dot_dir.as_path())

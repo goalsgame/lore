@@ -12,6 +12,7 @@ test = false
 bytes = { workspace = true }
 lore-macro = { workspace = true }
 parking_lot = { workspace = true }
+pin-project = { workspace = true }
 
 # The uring backend is the only part of the library that calls libc, for eventfd and poll.
 [target.'cfg(target_os = "linux")'.dependencies]
