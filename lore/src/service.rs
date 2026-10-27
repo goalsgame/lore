@@ -732,6 +732,27 @@ async fn quit_local(
         if let Some(owner) = target {
             let permit = match state::admit_control(&owner) {
                 Ok(permit) => permit,
+                Err(state::ControlError::Busy)
+                    if !state::has_service_scope()
+                        && owner.status().0 == owner::Phase::ReadyToExit =>
+                {
+                    // Retirement has succeeded and the actor may already have
+                    // closed control admission while draining its last calls.
+                    // A repeated direct quit has no further work to admit.
+                    return no_repository_call(
+                        globals,
+                        callback,
+                        args,
+                        quit,
+                        move |_args| async move {
+                            if let Some(error) = owner.actor().and_then(|actor| actor.failure()) {
+                                return Err(ServiceProcessError::internal(error));
+                            }
+                            Ok::<(), ServiceProcessError>(())
+                        },
+                    )
+                    .await;
+                }
                 Err(error) => {
                     return no_repository_call(
                         globals,

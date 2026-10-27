@@ -239,7 +239,7 @@ fn registry() -> &'static Mutex<Registry> {
     REGISTRY.get_or_init(Mutex::default)
 }
 fn next() -> Result<u64, i32> {
-    NEXT.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+    NEXT.try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
         value.checked_add(1)
     })
     .map_err(|_overflow| LIMIT)

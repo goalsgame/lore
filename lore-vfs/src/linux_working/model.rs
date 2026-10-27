@@ -143,7 +143,7 @@ struct Counters {
 }
 fn reserve(counter: &AtomicU64, count: u64, limit: u64) -> std::result::Result<(), ()> {
     counter
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
             used.checked_add(count).filter(|next| *next <= limit)
         })
         .map(|_| ())

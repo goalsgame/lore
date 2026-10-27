@@ -1049,7 +1049,7 @@ impl StorageService {
 
         let request_id = self
             .resolved_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_exhausted| ProtocolError::internal("resolved request id exhausted"))?
             + 1;
         let request = storage_v1::GetResolvedRequest {
@@ -1124,7 +1124,7 @@ impl StorageService {
 
         let request_id = self
             .resolved_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_exhausted| ProtocolError::internal("resolved request id exhausted"))?
             + 1;
         let request = storage_v1::PutResolvedRequest {

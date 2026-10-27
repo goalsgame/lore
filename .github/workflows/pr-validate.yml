@@ -294,15 +294,17 @@ jobs:
   pr-validate:
     name: PR Validate
     if: ${{ always() }}
-    needs: [unit, integration, smoke]
+    needs: [unit, vfs-mount, integration, smoke]
     runs-on: ubuntu-latest
     steps:
       - name: Verify all validation jobs passed
         run: |
           echo "unit=${{ needs.unit.result }}"
+          echo "vfs-mount=${{ needs.vfs-mount.result }}"
           echo "integration=${{ needs.integration.result }}"
           echo "smoke=${{ needs.smoke.result }}"
           if [ "${{ needs.unit.result }}" != "success" ] \
+             || [ "${{ needs.vfs-mount.result }}" != "success" ] \
              || [ "${{ needs.integration.result }}" != "success" ] \
              || [ "${{ needs.smoke.result }}" != "success" ]; then
             echo "One or more validation jobs failed."

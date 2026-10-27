@@ -1255,7 +1255,7 @@ impl Storage for GRPCStorage {
 
         let session_id = self
             .session_counter
-            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
             .map_err(|_exhausted| ProtocolError::internal("gRPC session identifiers exhausted"))?;
         self.sessions.insert(
             session_id,

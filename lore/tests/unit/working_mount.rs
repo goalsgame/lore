@@ -1212,6 +1212,11 @@ async fn mounted_supervisor_normal_stage_commit_restores_receipt_and_unstaged_by
             unavailable_cache.digest(&immutable.key).await.unwrap(),
             None
         );
+        // Revision backends retain the bound repository and its reservation.
+        // Release every view before reserving the same target for recovery.
+        drop(unavailable_cache);
+        drop(no_cache);
+        drop(pinned);
         drop(repository);
         drop(model);
         supervisor.request_retirement(&handle).unwrap();

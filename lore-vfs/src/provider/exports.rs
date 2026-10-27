@@ -103,7 +103,7 @@ impl Owner {
                 #[cfg(unix)]
                 use std::os::unix::fs::DirBuilderExt;
                 let id = NEXT
-                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
+                    .try_update(Ordering::AcqRel, Ordering::Acquire, |id| id.checked_add(1))
                     .map_err(|_overflow| FsError::internal("export identity limit"))?;
                 let path = owner
                     .path

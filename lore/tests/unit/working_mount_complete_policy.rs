@@ -1,8 +1,9 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 
-use super::*;
 use std::sync::atomic::AtomicUsize;
+
+use super::*;
 
 struct Policy {
     inner: Arc<dyn AccessGate>,

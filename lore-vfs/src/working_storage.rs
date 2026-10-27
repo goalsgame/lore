@@ -604,7 +604,7 @@ impl StoreFactory for Session {
         Box::pin(async move {
             let used = session
                 .attempted
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                     used.checked_add(1)
                         .filter(|next| *next <= session.storage.limits.max_store_files_per_session)
                 })

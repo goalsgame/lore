@@ -426,7 +426,7 @@ impl OperationFreeze {
         }
         let token = self
             .next
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |value| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |value| {
                 value.checked_add(1)
             })
             .map_err(|_overflow| Error::ResourceLimit)?

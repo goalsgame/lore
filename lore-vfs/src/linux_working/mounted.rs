@@ -181,7 +181,7 @@ fn mounted_mutations_checkpoint_restart_and_limits() {
     let recovery_path = directory.0.join("recovery");
     std::fs::set_permissions(&recovery_path, std::fs::Permissions::from_mode(0o500)).unwrap();
     assert_eq!(file.sync_all().unwrap_err().raw_os_error(), Some(libc::EIO));
-    assert_eq!(std::fs::read(&path).unwrap(), b"hel");
+    assert_eq!(std::fs::read(&path).unwrap(), &b"hello"[..3]);
     std::fs::set_permissions(&recovery_path, std::fs::Permissions::from_mode(0o700)).unwrap();
     file.sync_all().unwrap();
     // Direct I/O must not negotiate writable shared mappings.
@@ -242,7 +242,10 @@ fn mounted_mutations_checkpoint_restart_and_limits() {
         ))
         .unwrap();
     let mounted = mount(restored.clone(), &runtime, &mountpoint);
-    assert_eq!(std::fs::read(mountpoint.join("persist")).unwrap(), b"hel");
+    assert_eq!(
+        std::fs::read(mountpoint.join("persist")).unwrap(),
+        &b"hello"[..3]
+    );
     assert_eq!(
         std::fs::metadata(mountpoint.join("persist"))
             .unwrap()
@@ -267,7 +270,10 @@ fn mounted_mutations_checkpoint_restart_and_limits() {
         Some(libc::ENOSPC)
     );
     drop(file);
-    assert_eq!(std::fs::read(mountpoint.join("persist")).unwrap(), b"hel");
+    assert_eq!(
+        std::fs::read(mountpoint.join("persist")).unwrap(),
+        &b"hello"[..3]
+    );
     mounted.unmount().unwrap();
 }
 #[test]

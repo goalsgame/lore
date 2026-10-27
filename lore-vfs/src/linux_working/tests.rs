@@ -336,7 +336,7 @@ async fn retained_handles_and_coherent_checkpoint_restore() {
     assert_eq!(entry.entry.inode, cc.entry.inode);
     assert_eq!(entry.mode, 0o755);
     let handle = restored.open(entry.entry.inode, READ).await.unwrap();
-    assert_eq!(restored.read(handle, 0, 10).await.unwrap(), b"hel");
+    assert_eq!(restored.read(handle, 0, 10).await.unwrap(), &b"hello"[..3]);
     assert_eq!(restored.budget().reserved_bytes(), 11);
     assert!(restored.lookup(1, b"a").await.is_err());
     assert!(restored.lookup(1, b"b").await.is_err());

@@ -58,7 +58,7 @@ impl StorageBudget {
 
     fn reserve(&self, count: u64) -> Result<()> {
         self.reserved
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(count).filter(|next| *next <= self.limit)
             })
             .map(|_| ())
