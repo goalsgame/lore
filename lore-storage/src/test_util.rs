@@ -76,8 +76,21 @@ pub enum PausePoint {
     /// anything to write.
     Scanning,
     /// A mutable store list has handed its stream back, and one of its producers, which read its
-    /// group's buckets into memory before, has sent none of their keys yet.
+    /// group's buckets into memory before, has sent none of their keys yet, and holds no lock of
+    /// its group.
     Listing,
+    /// A mutable store list producer walking its group under the group's layout has sent the keys
+    /// of a bucket and not yet read the next.
+    Walking,
+    /// A measurement of the packstores' size holds the claim it runs on and has measured none
+    /// yet.
+    Measuring,
+    /// A put that verifies its writes has stored its entry and not yet found it again to read its
+    /// payload back.
+    Verifying,
+    /// A verification of the immutable store holds a group's flush lock, has read the group's
+    /// bucket count, and has checked none of its buckets.
+    Checking,
 }
 
 /// A task the store runs of its own accord rather than for a caller, see [`count_store_tasks`].
@@ -87,21 +100,44 @@ pub enum StoreTask {
     DelayedFlush,
     /// A group's delayed flush in the mutable store.
     MutableDelayedFlush,
-    /// An eviction or compaction pass the store starts itself, periodic or when loading crosses a
-    /// cap.
-    Collection,
+    /// A pass of the periodic evictor.
+    Evictor,
+    /// A step of the periodic compactor.
+    Compactor,
+    /// An eviction then compaction pass run as one, as a load crossing a cap fires.
+    GcPass,
 }
 
 impl StoreTask {
     /// Every task, in the order [`count_store_tasks`] counts them, with its name.
-    pub const ALL: [(StoreTask, &'static str); 3] = [
+    pub const ALL: [(StoreTask, &'static str); 5] = [
         (StoreTask::DelayedFlush, "delayed-flush"),
         (StoreTask::MutableDelayedFlush, "mutable-delayed-flush"),
-        (StoreTask::Collection, "collection"),
+        (StoreTask::Evictor, "evictor"),
+        (StoreTask::Compactor, "compactor"),
+        (StoreTask::GcPass, "gc-pass"),
     ];
 }
 
 static STORE_TASKS: OnceLock<&'static [AtomicUsize]> = OnceLock::new();
+
+static EVICTOR_FLOOR: AtomicUsize = AtomicUsize::new(0);
+
+/// Makes the periodic evictor enforce capacities down to `floor` fragments in this process,
+/// rather than raising any capacity below its floor to the floor, so that a test's small stores
+/// meet its passes.
+pub fn lower_evictor_floor(floor: usize) {
+    EVICTOR_FLOOR.store(floor.max(1), Ordering::Relaxed);
+}
+
+/// The floor the periodic evictor raises a capacity to: the one [`lower_evictor_floor`] set, or
+/// `default`.
+pub(crate) fn evictor_floor(default: usize) -> usize {
+    match EVICTOR_FLOOR.load(Ordering::Relaxed) {
+        0 => default,
+        floor => floor,
+    }
+}
 
 /// Counts each [`StoreTask`] running in `counters`, one per task in the order of
 /// [`StoreTask::ALL`], from now on in this process.
@@ -521,6 +557,10 @@ impl crate::immutable_store::ImmutableStore for HoldingStore {
     ) -> Result<Option<crate::local::store_lock::StoreGuard>, crate::immutable_store::StoreError>
     {
         self.inner.clone().hold_for_command().await
+    }
+
+    fn store_lock(&self) -> Option<Arc<crate::local::store_lock::StoreLock>> {
+        self.inner.store_lock()
     }
 
     /// Joins the task claim of the store this one wraps.

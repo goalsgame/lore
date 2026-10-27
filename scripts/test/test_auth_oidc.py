@@ -20,6 +20,7 @@ import logging
 import os
 import stat
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,9 +35,12 @@ from lore_server import (
 from mock_oidc_provider import (
     ACCESS_TOKEN_TYPE,
     API_KEY_TOKEN_TYPE,
+    CLIENT_CREDENTIALS_GRANT,
     DEVICE_CODE_GRANT,
     KEY_USER,
     PAIRWISE_USER,
+    REFRESH_TOKEN_GRANT,
+    SERVICE_ACCOUNT,
     TOKEN_EXCHANGE_GRANT,
     MockOidcProvider,
     OidcUser,
@@ -286,6 +290,121 @@ def test_a_lore_token_is_stored_without_an_exchange(oidc_env, make_repo):
     assert KEY_USER.user_id in repo.run(urc_args=["auth", "list"])
 
 
+CLIENT_ID = "ci-bot"
+CLIENT_SECRET = "ci-secret-do-not-log"
+LITERAL_WARNING = "is visible to other users in the process table"
+
+
+def login_as_client(repo: Lore, remote_url: str, *args: str, **kwargs) -> str:
+    return repo.run(
+        urc_args=["auth", "login", remote_url, "--client-id", CLIENT_ID, *args],
+        **kwargs,
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize(
+    "methods", [None, ["client_secret_post"]], ids=["basic", "post"]
+)
+def test_a_client_login_takes_the_secret_from_the_environment(
+    oidc_env, make_repo, methods
+):
+    """`--client-id` with the secret in `LORE_CLIENT_SECRET` sends the
+    client credentials grant, with the credentials where the discovery
+    document's auth methods name, Basic when it names none. The token of the
+    user the client logs in as is stored, and the secret reaches neither the
+    output nor the server log, even at trace level."""
+    provider = oidc_env.provider
+    provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    provider.token_endpoint_auth_methods = methods
+    repo = make_repo(LORE_CLIENT_SECRET=CLIENT_SECRET)
+
+    output = login_as_client(repo, oidc_env.remote_url, level="trace")
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING not in output
+    assert CLIENT_SECRET not in output
+    assert CLIENT_SECRET not in Path(oidc_env.server_log).read_text(errors="replace")
+    assert not provider.requests_to("/device")
+    [request] = provider.requests_to("/token")
+    if methods is None:
+        assert request.form == {"grant_type": CLIENT_CREDENTIALS_GRANT}
+        assert request.headers["authorization"].startswith("Basic ")
+    else:
+        assert request.form == {
+            "grant_type": CLIENT_CREDENTIALS_GRANT,
+            "client_id": CLIENT_ID,
+            "client_secret": CLIENT_SECRET,
+        }
+        assert "authorization" not in request.headers
+    listing = repo.run(urc_args=["auth", "list"])
+    assert f"oidc+{provider.issuer}" in listing
+    assert SERVICE_ACCOUNT.user_id in listing
+
+
+@pytest.mark.smoke
+def test_a_client_secret_on_the_command_line_warns(oidc_env, make_repo):
+    """A literal `--client-secret` still logs in, and warns that the secret
+    is exposed."""
+    oidc_env.provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    repo = make_repo()
+
+    output = login_as_client(
+        repo, oidc_env.remote_url, "--client-secret", CLIENT_SECRET
+    )
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING in output
+    assert "LORE_CLIENT_SECRET" in output
+
+
+@pytest.mark.smoke
+def test_a_wrong_client_secret_is_refused(oidc_env, make_repo):
+    """The provider's `invalid_client` fails the login as `NotAuthenticated`,
+    and nothing is stored."""
+    oidc_env.provider.clients[CLIENT_ID] = (CLIENT_SECRET, SERVICE_ACCOUNT)
+    repo = make_repo(LORE_CLIENT_SECRET="not-the-secret")
+
+    with pytest.raises(NotAuthenticatedError):
+        login_as_client(repo, oidc_env.remote_url)
+
+    assert len(oidc_env.provider.requests_to("/token")) == 1
+    assert "oidc+" not in repo.run(urc_args=["auth", "list"])
+
+
+@pytest.mark.smoke
+def test_a_client_login_without_a_secret_asks_nothing(oidc_env, make_repo):
+    """With no secret from either source the login fails before any request,
+    naming where the secret goes."""
+    repo = make_repo()
+
+    with pytest.raises(LoreException) as failure:
+        login_as_client(repo, oidc_env.remote_url)
+
+    assert "LORE_CLIENT_SECRET" in str(failure.value)
+    assert not oidc_env.provider.requests
+
+
+@pytest.mark.smoke
+def test_a_login_token_from_the_environment_does_not_warn(oidc_env, make_repo):
+    """`--token-type` takes the token from `LORE_TOKEN` when `--token` is
+    absent, without the warning a literal `--token` prints."""
+    provider = oidc_env.provider
+    provider.api_keys["oidc-api-key"] = KEY_USER
+    repo = make_repo(LORE_TOKEN="oidc-api-key")
+
+    output = repo.run(
+        urc_args=["auth", "login", oidc_env.remote_url, "--token-type", "api-key"]
+    )
+
+    assert "Authentication successful" in output
+    assert LITERAL_WARNING not in output
+    assert provider.requests_to("/token")[0].form["subject_token"] == "oidc-api-key"
+
+    literal = login_with_token(repo, oidc_env.remote_url, "api-key", "oidc-api-key")
+    assert LITERAL_WARNING in literal
+
+
 @pytest.mark.smoke
 def test_an_expired_session_fails_the_login(oidc_env, make_repo):
     """`expired_token` ends the login on the poll that reports it, as a
@@ -364,6 +483,81 @@ def test_a_push_after_login_sends_the_login_token_unexchanged(oidc_env, make_rep
 
     grants = [r.form.get("grant_type") for r in provider.requests_to("/token")]
     assert grants == [DEVICE_CODE_GRANT], grants
+
+
+def refreshes(provider: MockOidcProvider) -> list[dict[str, str]]:
+    return [
+        r.form
+        for r in provider.requests_to("/token")
+        if r.form.get("grant_type") == REFRESH_TOKEN_GRANT
+    ]
+
+
+@pytest.mark.smoke
+def test_an_expired_login_is_refreshed_without_interaction(oidc_env, make_repo):
+    """A login whose access token has expired is refreshed by the next
+    operation, with the refresh token the login brought. The provider rotates
+    it, so the store holds the new one: the refresh after the next expiry
+    presents that, and the provider, which revokes the login when a consumed
+    refresh token comes back, still answers."""
+    provider = oidc_env.provider
+    provider.token_lifetime = -60
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    [first] = provider.valid_refresh_tokens()
+
+    # Long enough for the operation, short enough to wait out.
+    provider.token_lifetime = 3
+    repo.repository_create()
+    [second] = provider.valid_refresh_tokens()
+    time.sleep(4)
+    provider.token_lifetime = 3600
+    seed_and_commit(repo)
+    repo.push()
+
+    expected = {"grant_type": REFRESH_TOKEN_GRANT, "client_id": provider.client_id}
+    assert refreshes(provider) == [
+        {**expected, "refresh_token": first},
+        {**expected, "refresh_token": second},
+    ]
+    assert len(provider.valid_refresh_tokens()) == 1
+    assert_user_logged_in(repo, provider)
+
+
+@pytest.mark.smoke
+def test_a_refused_refresh_token_is_presented_once(oidc_env, make_repo):
+    """A refresh token the provider refuses fails the operation as an expired
+    login did before, and is dropped: the next operation asks the provider
+    nothing more."""
+    provider = oidc_env.provider
+    provider.token_lifetime = -60
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    provider.revoke_refresh_tokens()
+
+    for _ in range(2):
+        with pytest.raises(LoreException):
+            repo.repository_create()
+
+    assert len(refreshes(provider)) == 1
+
+
+@pytest.mark.smoke
+def test_a_refresh_whose_answer_is_lost_is_not_presented_again(oidc_env, make_repo):
+    """A provider that consumes the refresh token and then fails to answer
+    fails the operation. The token may be spent, so the next operation does
+    not present it again, which the provider would treat as a replay."""
+    provider = oidc_env.provider
+    provider.token_lifetime = -60
+    repo = make_repo()
+    repo.run(urc_args=["auth", "login", oidc_env.remote_url, "--no-browser"])
+    provider.lose_refresh_answers = True
+
+    for _ in range(2):
+        with pytest.raises(LoreException):
+            repo.repository_create()
+
+    assert len(refreshes(provider)) == 1
 
 
 @pytest.mark.smoke
