@@ -18,8 +18,8 @@ pub struct MountArgs {
     /// Service-owned writable overlay with private external metadata/backing
     #[arg(long)]
     pub writable: bool,
-    /// Fetch immutable file contents lazily from the source's authenticated remote
-    #[arg(long, requires_all = ["writable", "source"], conflicts_with = "offline")]
+    /// Fetch immutable file contents lazily from the source's authenticated remote; requires online execution
+    #[arg(long, requires_all = ["writable", "source"])]
     pub remote_contents: bool,
     /// Read this normal checkout's pinned revision and access policy (never convert it)
     #[arg(long, requires = "writable", value_name = "checkout")]
@@ -49,6 +49,19 @@ pub struct MountArgs {
     /// Verified digest index; offline fresh imports precompute hashes, online reads use cached hashes
     #[arg(long, value_name = "private-directory")]
     pub digest_cache: Option<PathBuf>,
+}
+
+impl MountArgs {
+    /// Check execution mode after global arguments have been resolved.
+    pub fn validate_execution_mode(&self, offline: bool) -> Result<(), &'static str> {
+        if self.writable && self.remote_contents == offline {
+            Err(
+                "Choose --offline for import, or --remote-contents without --offline for lazy online reads.",
+            )
+        } else {
+            Ok(())
+        }
+    }
 }
 
 fn parse_revision(value: &str) -> Result<String, String> {
@@ -84,10 +97,8 @@ pub fn handle_mount(globals: LoreGlobalArgs, args: &MountArgs) -> u8 {
             (Box::new(|_event: &lore::interface::LoreEvent| {}) as EventCallbackFn).with_defaults(),
         );
         if args.writable {
-            if args.remote_contents == globals.offline() {
-                crate::eprintln!(
-                    "Choose --offline for import, or --remote-contents without --offline for lazy online reads."
-                );
+            if let Err(error) = args.validate_execution_mode(globals.offline()) {
+                crate::eprintln!("{error}");
                 return 1;
             }
             // This runs in the caller's CLI process before service IPC. Send
