@@ -251,10 +251,41 @@ at most four actual-I/O jobs. Cancellation of a waiting task does not release an
 accepted job; closing the worker drains actual work and releases its claim before
 acknowledging completion.
 
-The RAM fixture is unchanged. An opt-in mounted `edit.txt` fixture in the
-extension's container is not wired or qualified yet. It must not claim mounted
-namespace durability: create, unlink, rename, and other namespace mutations remain
-unsupported.
+The default RAM fixture is unchanged. The opt-in persistent fixture stores only
+`edit.txt` inside the extension's sandbox container. It accepts `cache=none`,
+`persistent=<UUID>`, and `create=1` for a fresh run or `create=0` to reopen it.
+Writes and truncates complete their backing-store publication before their FSKit
+callbacks return; unload drains admitted work. The filesystem's namespace is
+fixed: create, unlink, rename, and other namespace mutations remain unsupported.
+
+With the signed probe already enabled, run the mounted write, truncate, and
+clean-remount check using:
+
+```sh
+python3 contrib/fskit-prototype/persistent_mount_test.py
+```
+
+The test creates a unique private run in the extension's container and leaves
+its bounded records there. It cleans up its own mount. To test the write callback,
+concurrent writes and injected publication failure without mounting, first build
+the bridge with `build.py`, then run:
+
+```sh
+python3 contrib/fskit-prototype/persistent_volume_test.py
+```
+
+An isolated extension-process crash check records the acknowledged generation
+and bytes outside the mount, terminates the verified probe process, and checks
+that a fresh mount reads that exact generation through FSKit:
+
+```sh
+python3 contrib/fskit-prototype/persistent_crash_test.py
+```
+
+The crash check refuses to terminate the probe if another FSKit mount is present
+or the process identity is ambiguous. Clean remount and extension-process crash
+recovery do not establish OS-crash or physical-power-loss durability.
+The fixture does not yet use a Lore repository or qualify namespace sync.
 
 The store uses an exclusive ownership claim and bounded actual-I/O admission.
 Immutable generation records contain a version, run identity, sequence, length,
