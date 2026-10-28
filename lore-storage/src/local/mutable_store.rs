@@ -1467,12 +1467,13 @@ impl LocalMutableStore {
             return;
         }
         let group = &self.group[group_index];
-        // Through the group's flag, set after the bucket's, so a sweep that has already
-        // cleared it sees the bucket — see [`MutableStoreGroup::scheduled`].
+        // Publish the flag only once task insertion cannot be cancelled. An explicit
+        // flush can hold this mutex while its sweep clears the flag; cancellation
+        // while waiting must leave the next writer free to schedule the dirty work.
+        let mut flush = group.flush.lock().await;
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
         }
-        let mut flush = group.flush.lock().await;
         // Clears a finished sweep, which the set would otherwise keep.
         let _ = flush.try_join_next();
         let weak_self = Arc::downgrade(&self);

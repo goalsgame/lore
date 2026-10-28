@@ -96,6 +96,24 @@ impl ReplyDrain {
             changed.await;
         }
     }
+    /// Give cooperative replies time to finish, then interrupt every socket.
+    /// Interruption alone is not completion: native writers must release their
+    /// guards before this returns successfully.
+    #[lore_macro::test_pub]
+    pub(crate) async fn close_and_shutdown(
+        &self,
+        grace: Duration,
+        drain: Duration,
+        shutdown: impl FnOnce(),
+    ) -> Result<(), String> {
+        let _grace = tokio::time::timeout(grace, self.close_and_drain()).await;
+        shutdown();
+        tokio::time::timeout(drain, self.close_and_drain())
+            .await
+            .map_err(|_timeout| {
+                "service reply writers did not drain after socket shutdown; network retained".into()
+            })
+    }
 }
 #[lore_macro::test_pub]
 pub(crate) struct ReplyGuard(Arc<ReplyDrain>);
@@ -336,15 +354,26 @@ impl RunState {
         }
         // Parsed requests admitted before this fence retain their replies;
         // later requests cannot begin acknowledgement while sockets retire.
-        tokio::time::timeout(Duration::from_secs(10), self.replies.close_and_drain())
+        self.replies
+            .close_and_shutdown(Duration::from_secs(5), Duration::from_secs(10), || {
+                let sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+                for (_, socket) in sockets.iter() {
+                    let _closed = socket.shutdown();
+                }
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), self.drain_connections())
             .await
-            .map_err(|_timeout| "service replies did not drain; network retained".to_owned())?;
-        {
-            let sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
-            for (_, socket) in sockets.iter() {
-                let _closed = socket.shutdown();
-            }
-        }
+            .map_err(|_timeout| {
+                "service connections did not drain; network retained".to_owned()
+            })??;
+        self.listener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        Ok(())
+    }
+    async fn drain_connections(&self) -> Result<(), String> {
         loop {
             let notified = self.connections_changed.notified();
             tokio::pin!(notified);
@@ -370,10 +399,6 @@ impl RunState {
                 .await
                 .map_err(|error| format!("joining service accept worker: {error}"))?;
         }
-        self.listener
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
         Ok(())
     }
 }

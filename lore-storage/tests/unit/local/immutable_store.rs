@@ -9808,3 +9808,77 @@ async fn explicit_flush_drains_delayed_io_ownership_even_after_cancelled_wait() 
         assert!(retained.upgrade().is_none());
     }
 }
+
+#[tokio::test]
+async fn cancelling_a_writer_waiting_to_schedule_does_not_strand_dirty_work() {
+    let dir = lore_base::test_util::TempDir::new("is_cancel_schedule_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let (group_index, payloads) = payloads_in_one_group(2);
+    let group = &store.group[group_index];
+    // A drain holds this mutex even after its sweep clears `scheduled`.
+    let scheduling = group.flush.lock().await;
+    let mut writer = Box::pin(put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        &payloads[0],
+        false,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut writer => panic!("writer escaped the scheduling mutex"),
+                () = tokio::task::yield_now() => {},
+            }
+            if group.dirty[0].load(atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    assert!(!group.scheduled.load(atomic::Ordering::Relaxed));
+    assert!(group.dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(scheduling.is_empty());
+    drop(scheduling);
+
+    put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        &payloads[1],
+        false,
+    )
+    .await;
+    assert!(group.scheduled.load(atomic::Ordering::Relaxed));
+    group.flush_now.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut tasks = group.flush.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!group.dirty[0].load(atomic::Ordering::Relaxed));
+    let bucket_path = format_bucket_path(store.path.as_ref().unwrap(), group_index, 0);
+    assert_eq!(
+        ImmutableStoreBucket::deserialize_files(bucket_path)
+            .await
+            .unwrap()
+            .entry
+            .len(),
+        2,
+        "the scheduled sweep persists both the cancelled write and the later write"
+    );
+}

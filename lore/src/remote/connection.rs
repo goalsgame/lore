@@ -339,6 +339,7 @@ impl IpcConnection {
                         ConnectionErrorWithId::new(error, self.id)
                     ),
                 );
+                break;
             }
         }
 

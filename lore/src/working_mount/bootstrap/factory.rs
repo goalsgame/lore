@@ -385,15 +385,39 @@ fn prepare(
         .take_ticket()?
         .promote(input)
         .map_err(|error| error.error)?;
-    let setup = publication.io_lease().map_err(problem)?;
-    let owner = lore_io::lease::sync_scope(Some(setup), || {
+    let (setup, completed) = publication.setup_io().map_err(problem)?;
+    let owner = lore_io::lease::sync_scope(Some(setup.clone()), || {
         owner::build_with_backfill(&ticket, factory, limits, options, backfill)
     })?;
     *ticket
         .record
         .owner
         .lock()
-        .map_err(|_poison| Error::Poisoned)? = Some(owner);
+        .map_err(|_poison| Error::Poisoned)? = Some(owner.clone());
+    let runtime = owner.runtime_handle()?;
+    let input = ticket.record.input()?;
+    // Root metadata reads can cache remote fragments and schedule delayed flushes.
+    // Settle these finite jobs before asking the publication permit to be unique.
+    lore_io::lease::sync_scope(Some(setup.clone()), || {
+        runtime.block_on(lore_base::runtime::LORE_CONTEXT.scope(
+            input.prepared.execution.clone(),
+            input.prepared.repository.flush(true),
+        ))
+    })
+    .map_err(problem)?;
+    drop(setup);
+    let mut cancelled = ticket.record.cancel.subscribe();
+    runtime.block_on(async {
+        tokio::select! {
+            result = completed => result.map_err(|_closed| Error::Closed),
+            _ = async {
+                while !*cancelled.borrow_and_update() {
+                    if cancelled.changed().await.is_err() { break; }
+                }
+            } => Err(Error::Closed),
+        }
+    })?;
+    ticket.check_live()?;
     // Only the permit retains the emptied Job across publication; no long-lived
     // session thread captures its caller accounting independently.
     drop(job);

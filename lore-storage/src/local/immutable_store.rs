@@ -3606,10 +3606,13 @@ impl LocalImmutableStore {
             return;
         }
         let group = &self.group[group_index];
+        // Publish the flag only once task insertion cannot be cancelled. An explicit
+        // flush can hold this mutex while its sweep clears the flag; cancellation
+        // while waiting must leave the next writer free to schedule the dirty work.
+        let mut flush = group.flush.lock().await;
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
         }
-        let mut flush = group.flush.lock().await;
         let _ = flush.try_join_next();
         lore_base::lore_spawn!(
             flush,
