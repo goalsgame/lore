@@ -82,16 +82,40 @@ The default invocation validates only:
 python3 contrib/fskit-prototype/revision_mount.py \
   --repository /absolute/source/checkout --revision main@LATEST \
   --target /tmp/lore-revision-view \
-  --config /private/approved-container/bootstrap.json --offline
+  --config /private/approved-container/bootstrap.json --offline \
+  --bookmark-helper target/fskit-prototype/repository-bookmark
 ```
 
 Only an explicit `--mount` writes a fresh mode-0600 bootstrap file and invokes an
 already-enabled module with `mount -r`. Optional `--identity` selects an existing normal Lore
 identity; `--digest-cache` enables verified cache-only digest lookup without
-backfill. Keep all metadata, credentials, stores, config and cache outside the
-mounted namespace. The extension needs actual sandbox access to them; a generic
-URL does not grant filesystem or keychain access. Network-client entitlement
+backfill. When mounting a checkout outside the extension's container, pass
+`--bookmark-helper` to create a private sidecar granting access to that checkout.
+The signed extension resolves that grant, checks it names the configured checkout,
+and retains it until bootstrap and session I/O actually finish. Keep all metadata,
+credentials, stores, config, bookmark and cache
+outside the mounted namespace. A checkout grant does not grant access to an
+external digest cache or normal credentials. Network-client entitlement
 permits the normal Rust network path but supplies no authentication or file grant.
+
+For an experimental offline read-only mount through the CLI, build and enable the
+extension as described above, then supply the compiled helper and a private directory
+inside its sandbox container:
+
+```sh
+LORE_FSKIT_MOUNT_HELPER=/absolute/path/to/lore-fskit-mount \
+LORE_FSKIT_CONFIG_DIR=/absolute/path/to/private/extension-container/directory \
+  lore --offline --repository /absolute/source/checkout mount \
+    --experimental --revision main@LATEST /absolute/empty/mountpoint
+```
+
+The helper writes a private configuration and checkout access grant in that
+directory and prints their paths. Keep both files while the mount is active so the
+extension can reload the volume; remove them after unmounting. Each session pins
+the resolved revision and remains read-only. A symbolic revision such as
+`main@LATEST` may resolve differently if the extension reloads; use an immutable
+revision identifier when that matters. These paths and the separate helper are
+prototype setup, not an installed distribution interface.
 
 Direct/manual `lorerevision://mount?config=…` mounting bypasses host preflight.
 The selected SDK does not expose the OS target path to this volume adapter, so the
@@ -251,10 +275,41 @@ at most four actual-I/O jobs. Cancellation of a waiting task does not release an
 accepted job; closing the worker drains actual work and releases its claim before
 acknowledging completion.
 
-The RAM fixture is unchanged. An opt-in mounted `edit.txt` fixture in the
-extension's container is not wired or qualified yet. It must not claim mounted
-namespace durability: create, unlink, rename, and other namespace mutations remain
-unsupported.
+The default RAM fixture is unchanged. The opt-in persistent fixture stores only
+`edit.txt` inside the extension's sandbox container. It accepts `cache=none`,
+`persistent=<UUID>`, and `create=1` for a fresh run or `create=0` to reopen it.
+Writes and truncates complete their backing-store publication before their FSKit
+callbacks return; unload drains admitted work. The filesystem's namespace is
+fixed: create, unlink, rename, and other namespace mutations remain unsupported.
+
+With the signed probe already enabled, run the mounted write, truncate, and
+clean-remount check using:
+
+```sh
+python3 contrib/fskit-prototype/persistent_mount_test.py
+```
+
+The test creates a unique private run in the extension's container and leaves
+its bounded records there. It cleans up its own mount. To test the write callback,
+concurrent writes and injected publication failure without mounting, first build
+the bridge with `build.py`, then run:
+
+```sh
+python3 contrib/fskit-prototype/persistent_volume_test.py
+```
+
+An isolated extension-process crash check records the acknowledged generation
+and bytes outside the mount, terminates the verified probe process, and checks
+that a fresh mount reads that exact generation through FSKit:
+
+```sh
+python3 contrib/fskit-prototype/persistent_crash_test.py
+```
+
+The crash check refuses to terminate the probe if another FSKit mount is present
+or the process identity is ambiguous. Clean remount and extension-process crash
+recovery do not establish OS-crash or physical-power-loss durability.
+The fixture does not yet use a Lore repository or qualify namespace sync.
 
 The store uses an exclusive ownership claim and bounded actual-I/O admission.
 Immutable generation records contain a version, run identity, sequence, length,
@@ -360,9 +415,10 @@ This does not rule out durable acknowledgment implemented in write callbacks.
 
 A real offline repository inside the extension's sandbox container passes native
 listing, file reads, case-insensitive lookup, read mmap, absent-digest behavior
-without a configured cache, and write rejection. This validates the shared Rust
-backend with container-local stores. Repositories outside that container, remote
-credentials and linked-repository mounts remain unverified. Native Bazel 7.5
+without a configured cache, and write rejection. An independently created checkout
+outside the container also passes a read-only mount and source-checksum check when
+the repository bookmark helper supplies a grant. Remote credentials, linked-repository
+mounts and external digest-cache grants remain unverified. Native Bazel 7.5
 fixture builds pass the raw-xattr and same-size rebuild workload; this does not
 qualify a real repository's digest-cache publication or a wholly mounted Bazel
 workspace.

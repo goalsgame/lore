@@ -4,10 +4,12 @@ import FSKit
 import Foundation
 import OSLog
 
+#if !PROBE_VOLUME_TEST
 @main
 struct ProbeExtension: UnaryFileSystemExtension {
     var fileSystem = ProbeFileSystem()
 }
+#endif
 
 final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     private let revisionLock = NSLock()
@@ -15,6 +17,7 @@ final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     private var loadedPath: String?
     private var loadingPath: String?
     private var loadGeneration: UInt64 = 0
+    private var persistentLoads: [String: PersistentMarkerLoad] = [:]
     private func configPath(_ url: URL) throws -> String {
         guard url.scheme == "lorerevision", url.host == "mount", url.user == nil,
               url.password == nil, url.fragment == nil,
@@ -37,15 +40,46 @@ final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         if resource.url.scheme == "loreprobe" {
             let query = URLComponents(url: resource.url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             guard Set(query.map(\.name)).count == query.count,
-                  query.allSatisfy({ ["cache", "sync-error", "ids", "revision"].contains($0.name) }) else { throw POSIXError(.EINVAL) }
+                  query.allSatisfy({ ["cache", "sync-error", "ids", "revision", "persistent", "create"].contains($0.name) }) else { throw POSIXError(.EINVAL) }
             let cachePolicy = query.first(where: { $0.name == "cache" })?.value ?? "read"
             let syncError = query.first(where: { $0.name == "sync-error" })?.value ?? "0"
             let identifiers = query.first(where: { $0.name == "ids" })?.value ?? "legacy"
             let revision = query.first(where: { $0.name == "revision" })?.value ?? "0"
             guard ["read", "none", "through", "back"].contains(cachePolicy), ["0", "1"].contains(syncError),
                   ["legacy", "reserved"].contains(identifiers), ["0", "1"].contains(revision) else { throw POSIXError(.EINVAL) }
+            let runValue = query.first(where: { $0.name == "persistent" })?.value
+            let create = query.first(where: { $0.name == "create" })?.value
+            guard !query.contains(where: { $0.name == "persistent" }) || runValue != nil,
+                  !query.contains(where: { $0.name == "create" }) || create != nil,
+                  create == nil || ["0", "1"].contains(create!),
+                  runValue != nil || create == nil else { throw POSIXError(.EINVAL) }
+            var persistent: (PersistentMarkerWorker, PersistentMarker.Image)?
+            if let runValue {
+                guard cachePolicy == "none", revision == "0", syncError == "0",
+                      let run = UUID(uuidString: runValue), let create else { throw POSIXError(.EINVAL) }
+                let parent = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+                    .appendingPathComponent("lore-fskit-persistent-probe", isDirectory: true)
+                let key = resource.url.absoluteString
+                let load = revisionLock.withLock { () -> PersistentMarkerLoad? in
+                    guard persistentLoads[key] == nil else { return nil }
+                    let load = PersistentMarkerLoad(parent: parent, run: run, create: create == "1")
+                    persistentLoads[key] = load
+                    return load
+                }
+                guard let load else { throw POSIXError(.EBUSY) }
+                do {
+                    persistent = try await load.value()
+                    let accepted = revisionLock.withLock { persistentLoads[key] === load }
+                    guard accepted, !Task.isCancelled else { throw POSIXError(.ECANCELED) }
+                } catch {
+                    revisionLock.withLock { if persistentLoads[key] === load { persistentLoads[key] = nil } }
+                    await load.close()
+                    throw error
+                }
+            }
             let volume = ProbeVolume(cachePolicy: cachePolicy, syncError: syncError == "1",
-                                     mappedIdentifiers: identifiers == "reserved", revision: revision == "1" ? 1 : 0)
+                                     mappedIdentifiers: identifiers == "reserved", revision: revision == "1" ? 1 : 0,
+                                     persistent: persistent)
             containerStatus = .ready
             return volume
         }
@@ -56,7 +90,10 @@ final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         }
         defer { revisionLock.withLock { if loadGeneration == generation { loadingPath = nil } } }
         let session: RustSession
-        do { session = try await RustSession.open(configPath: path) }
+        do {
+            let access = try RepositoryScope.open(configPath: path)
+            session = try await RustSession.open(configPath: path, access: access)
+        }
         catch let error as RustBridgeError {
             throw NSError(domain: "LoreFSKitBootstrap", code: Int(error.status), userInfo: [
                 NSLocalizedDescriptionKey: "Shared Lore revision setup failed (status \(error.status)). The extension must have access to the configured repository, normal credentials and content stores."
@@ -74,8 +111,13 @@ final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
     }
     func unloadResource(resource: FSResource, options: FSTaskOptions) async throws {
         defer { containerStatus = .notReady(status: POSIXError(.ENXIO) as NSError) }
-        guard let resource = resource as? FSGenericURLResource,
-              let path = try? configPath(resource.url) else { return }
+        guard let resource = resource as? FSGenericURLResource else { return }
+        if resource.url.scheme == "loreprobe" {
+            let load = revisionLock.withLock { persistentLoads.removeValue(forKey: resource.url.absoluteString) }
+            if let load { await load.close() }
+            return
+        }
+        guard let path = try? configPath(resource.url) else { return }
         let volume = revisionLock.withLock { () -> RevisionVolume? in
             guard loadedPath == path || loadingPath == path else { return nil }
             loadGeneration &+= 1; loadedPath = nil; loadingPath = nil
@@ -94,6 +136,8 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
                          FSVolume.XattrHandler, FSVolume.DataCacheHandler, @unchecked Sendable {
     private let lock = NSLock()
     private var model = ProbeModel()
+    private let persistent: PersistentMarkerWorker?
+    private var persistentSequence: UInt64 = 0
     private let items = Dictionary(uniqueKeysWithValues: (UInt64(1)...8).map { ($0, ProbeItem($0)) })
     private var status = "ready:0"
     private var switching = false
@@ -116,13 +160,20 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     static let statsAttribute = "user.lore.prototype.stats"
     static let cacheAttribute = "user.lore.prototype.cache"
 
-    init(cachePolicy: String = "read", syncError: Bool = false, mappedIdentifiers: Bool = false, revision: Int = 0) {
+    init(cachePolicy: String = "read", syncError: Bool = false, mappedIdentifiers: Bool = false, revision: Int = 0,
+         persistent: (PersistentMarkerWorker, PersistentMarker.Image)? = nil) {
         self.cachePolicy = cachePolicy
         self.syncError = syncError
         self.mappedIdentifiers = mappedIdentifiers
+        self.persistent = persistent?.0
         super.init(volumeID: FSVolume.Identifier(uuid: UUID()),
                    volumeName: FSFileName(string: "Lore FSKit Probe"))
         if revision == 1 { try! model.switchRevision(1); status = "ready:1" }
+        if let image = persistent?.1 {
+            persistentSequence = image.sequence
+            model.entries[3]!.bytes = image.bytes
+            model.entries[3]!.clean = false
+        }
 
     }
 
@@ -203,7 +254,7 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     }
     func deactivateVolume(options: FSDeactivateOptions) async throws {}
     func mount(options: FSTaskOptions) async throws {}
-    func unmount() async {}
+    func unmount() async { await persistent?.closeAndDrain() }
     func synchronize(flags: FSSyncFlags) async throws {
         lock.withLock {
             syncCalls += 1; syncFlags.append(flags.rawValue)
@@ -289,6 +340,17 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
 
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> FSWriteFileResult {
         let key = try id(item)
+        if let persistent {
+            guard key == 3 else { throw POSIXError(.EROFS) }
+            try lock.withLock { if let failure { throw failure } }
+            guard offset >= 0, offset <= ProbeModel.capacity,
+                  contents.count <= ProbeModel.capacity - Int(offset) else { throw POSIXError(.EFBIG) }
+            let image: PersistentMarker.Image
+            do { image = try await persistent.write(contents, at: offset) }
+            catch { lock.withLock { failure = POSIXError(.EIO) }; throw POSIXError(.EIO) }
+            let attr = lock.withLock { applyPersistent(image) }
+            return try checked(FSWriteFileResult(bytesWritten: contents.count, itemAttributes: attr, freeSpace: nil))
+        }
         let attr = try lock.withLock {
             if let failure { throw failure }
             try model.write(contents, id: key, offset: offset)
@@ -300,6 +362,17 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
     func setAttributes(_ request: FSItem.SetAttributesRequest, on item: FSItem, context: FSContext) async throws -> FSSetAttributesResult {
         let key = try id(item)
         guard request.isValid(.size) else { throw POSIXError(.ENOTSUP) }
+        if let persistent {
+            guard key == 3 else { throw POSIXError(.EROFS) }
+            try lock.withLock { if let failure { throw failure } }
+            guard request.size <= ProbeModel.capacity else { throw POSIXError(.EFBIG) }
+            let image: PersistentMarker.Image
+            do { image = try await persistent.truncate(request.size) }
+            catch { lock.withLock { failure = POSIXError(.EIO) }; throw POSIXError(.EIO) }
+            let attr = lock.withLock { applyPersistent(image) }
+            request.consumedAttributes = .size
+            return try checked(FSSetAttributesResult(attributes: attr, freeSpace: nil))
+        }
         let attr = try lock.withLock {
             if let failure { throw failure }
             try model.truncate(id: key, size: request.size)
@@ -307,6 +380,17 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
         }
         request.consumedAttributes = .size
         return try checked(FSSetAttributesResult(attributes: attr, freeSpace: nil))
+    }
+
+    // Called with lock held; concurrent completions must never install an older image.
+    private func applyPersistent(_ image: PersistentMarker.Image) -> FSItem.Attributes {
+        if image.sequence > persistentSequence {
+            persistentSequence = image.sequence
+            model.entries[3]!.bytes = image.bytes
+            model.entries[3]!.clean = false
+            model.entries[3]!.generation += 1
+        }
+        return attributes(model.entries[3]!)
     }
 
     private func coherency(_ mode: FSVolume.DataCacheMode) -> FSVolume.KernelCacheCoherencyType {
@@ -349,6 +433,7 @@ final class ProbeVolume: FSVolume, FSVolume.Handler, FSVolume.ReadWriteHandler,
                     return try JSONSerialization.data(withJSONObject: [
                         "probe_version": 2, "probe_id": diagnosticID, "ids": mappedIdentifiers ? "reserved" : "legacy",
                         "reads": model.reads, "digest_requests": model.digestRequests,
+                        "persistent_sequence": persistentSequence,
                         "sync_calls": syncCalls, "sync_flags": syncFlags, "sync_error": syncError,
                         "lookups": lookupCalls, "lookup_misses": lookupMisses, "events": events,
                         "cache_policy": cachePolicy, "diagnostic": diagnostic,

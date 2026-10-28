@@ -20,6 +20,7 @@ def main():
                     "-module-cache-path", str(output / "bridge-test-module-cache"),
                     "-I", str(build.HERE.parent.parent / "lore-fskit-bridge/include"),
                     "-Xcc", "-DLORE_FSKIT_TEST_FIXTURE",
+                    str(build.HERE / "Sources/RepositoryScope.swift"),
                     str(build.HERE / "Sources/RustBridge.swift"),
                     str(build.HERE / "Tests/BridgeTests.swift"), str(fixture), *libraries,
                     "-o", str(executable)], check=True)

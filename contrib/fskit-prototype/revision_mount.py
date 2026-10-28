@@ -109,6 +109,18 @@ def write_config(plan):
         os.fsync(output.fileno())
 
 
+def write_bookmark(plan, helper):
+    """Create a private grant for the preflighted checkout without overwriting one."""
+    sidecar = pathlib.Path(str(plan.config) + ".bookmark")
+    if sidecar.exists() or sidecar.is_symlink():
+        raise FileExistsError("repository bookmark already exists")
+    subprocess.run([str(helper), plan.contents["repository"], str(sidecar)], check=True, timeout=30)
+    info = sidecar.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or
+            info.st_mode & 0o077 or info.st_nlink != 1 or not 0 < info.st_size <= 16384):
+        raise ValueError("repository bookmark must be a private regular file")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--repository", required=True, type=pathlib.Path)
@@ -118,6 +130,8 @@ def main():
     parser.add_argument("--digest-cache", type=pathlib.Path)
     parser.add_argument("--identity")
     parser.add_argument("--offline", action="store_true")
+    parser.add_argument("--bookmark-helper", type=pathlib.Path,
+                        help="create a private repository grant using this local helper before mounting")
     parser.add_argument("--mount", action="store_true", help="write private bootstrap config and invoke an already-enabled FSKit module")
     args = parser.parse_args()
     try:
@@ -125,6 +139,8 @@ def main():
                          args.digest_cache, args.identity, args.offline)
         if args.mount:
             write_config(plan)
+            if args.bookmark_helper is not None:
+                write_bookmark(plan, args.bookmark_helper.resolve(strict=True))
             validate_target(plan)
             subprocess.run(["mount", "-r", "-F", "-t", "loreprobe", plan.resource, str(plan.target)], check=True)
         else:

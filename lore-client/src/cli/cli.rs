@@ -237,7 +237,7 @@ pub fn output_formatter() -> Option<LoreEventCallback> {
 
 #[derive(Subcommand)]
 pub enum LoreCommands {
-    /// Experimental Linux mount with explicit writable opt-in
+    /// Experimental mount (Linux, or offline read-only on macOS)
     Mount(mount::MountArgs),
 
     /// Repository commands

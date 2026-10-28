@@ -133,6 +133,9 @@ def main():
         "-o", str(extension / "Contents/MacOS/LoreFSKitExtension"))
     run("xcrun", "swiftc", *flags, str(HERE / "Host.swift"), "-o", str(app / "Contents/MacOS/LoreFSKitProbe"))
     run("xcrun", "swiftc", *flags, str(HERE / "Status.swift"), "-o", str(output / "probe-status"))
+    run("xcrun", "swiftc", "-target", target, "-module-cache-path", str(output / "module-cache"),
+        "-warnings-as-errors", str(HERE / "RepositoryBookmark.swift"), "-o", str(output / "repository-bookmark"))
+    run("xcrun", "swiftc", *flags, str(HERE / "RevisionMount.swift"), "-o", str(output / "lore-fskit-mount"))
     if args.identity != "-":
         # Check the explicitly selected team against the actual signing certificate.
         run("codesign", "--force", "--sign", args.identity, str(output / "probe-status"))
