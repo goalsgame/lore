@@ -141,6 +141,8 @@ struct IpcConnection {
     owner: Option<Arc<crate::service::owner::ServiceOwner>>,
     #[cfg(unix)]
     lease: Option<Arc<crate::service::actor::ConnectionLease>>,
+    #[cfg(unix)]
+    reply: Option<Arc<crate::service::actor::ReplyGuard>>,
 }
 
 impl IpcConnection {
@@ -169,6 +171,8 @@ impl IpcConnection {
             owner: None,
             #[cfg(unix)]
             lease: None,
+            #[cfg(unix)]
+            reply: None,
         }
     }
 
@@ -179,9 +183,13 @@ impl IpcConnection {
     ) -> Result<(), ConnectionError> {
         #[cfg(unix)]
         let lease = self.lease.clone();
+        #[cfg(unix)]
+        let reply = self.reply.clone();
         self.blocking(move || {
             #[cfg(unix)]
             let _lease = lease;
+            #[cfg(unix)]
+            let _reply = reply;
             write_payload(stream.writer(), &payload)
         })
         .await
@@ -190,7 +198,8 @@ impl IpcConnection {
         Ok(())
     }
 
-    async fn handle_connection(self) -> Result<(), ConnectionError> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    async fn handle_connection(mut self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
         #[cfg(unix)]
         let lease = self.lease.clone();
@@ -209,6 +218,13 @@ impl IpcConnection {
         let Some((command, payload)) = message else {
             return Ok(());
         };
+
+        #[cfg(unix)]
+        if let Some(actor) = self.owner.as_ref().and_then(|owner| owner.actor()) {
+            self.reply = Some(actor.admit_reply().ok_or_else(|| {
+                ConnectionError::internal("service network reply admission is closed")
+            })?);
+        }
 
         //TODO(UCS-16094): Determine if this should be unbounded or bounded
         // Create a channel so the callback task can send messages to this network thread, so they
@@ -229,6 +245,10 @@ impl IpcConnection {
         #[cfg(not(unix))]
         let admitted = invoke_state.try_begin_invocation();
         let Some(invocation) = admitted else {
+            #[cfg(unix)]
+            if self.reply_to_retired_stop(&command.command).await? {
+                return Ok(());
+            }
             return Err(ConnectionError::internal(
                 "service command admission is closed or control capacity is full",
             ));
@@ -319,9 +339,44 @@ impl IpcConnection {
                         ConnectionErrorWithId::new(error, self.id)
                     ),
                 );
+                break;
             }
         }
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn reply_to_retired_stop(
+        &self,
+        command: &crate::remote::command::LoreCommand,
+    ) -> Result<bool, ConnectionError> {
+        let Some(owner) = self.owner.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(command, crate::remote::command::LoreCommand::ServiceStop(_))
+            || owner.status().0 != crate::service::owner::Phase::ReadyToExit
+            || owner.stop_request().is_none_or(|stop| !stop.is_current())
+            || owner.actor().is_some_and(|actor| actor.failure().is_some())
+        {
+            return Ok(false);
+        }
+        // Retirement is proven, but this accepted connection can finish its
+        // initial read after control admission closes. A stop needs only the
+        // acknowledgement; it must not reopen admission or affect another run.
+        let complete = LoreEvent::Complete(lore_revision::event::LoreCompleteEventData {
+            status: 0,
+            error: Default::default(),
+        });
+        let end = LoreEvent::End(Default::default());
+        for reply in [
+            MessageToClient::Event(&complete),
+            MessageToClient::Event(&end),
+            MessageToClient::ApiResult(0),
+        ] {
+            let stream = self.connection.try_clone().internal("cloning connection")?;
+            self.send_message(stream, encode_message(&reply)).await?;
+        }
+        Ok(true)
     }
 }

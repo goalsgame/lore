@@ -3170,3 +3170,113 @@ async fn list_finds_typed_entries_at_each_fan_out_level() {
         }
     }
 }
+
+#[tokio::test]
+async fn explicit_flush_drains_delayed_io_ownership_even_after_cancelled_wait() {
+    use std::time::Duration;
+
+    use lore_storage::mutable_store::MutableStore;
+    use lore_storage::test_util::PausePoint;
+    for cancelled in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("ms_flush_delayed_owner_");
+        let store = Arc::new(
+            LocalMutableStore::new(
+                Some(dir.path()),
+                MutableStoreSettings {
+                    flush_delay_seconds: 3600,
+                    ..client_settings()
+                },
+                make_in_memory_immutable().await,
+            )
+            .await
+            .unwrap(),
+        );
+        let owner = Arc::new(());
+        let retained = Arc::downgrade(&owner);
+        let io = lore_io::lease::IoLease::new(owner);
+        let keys = io.scope(store_keys(&store, Partition::default(), 1)).await;
+        drop(io);
+        assert!(retained.upgrade().is_some());
+        if cancelled {
+            let pause = lore_storage::test_util::pause_at(PausePoint::Serializing);
+            let mut flush = Box::pin(store.clone().flush(true));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = pause.reached.notified() => {},
+                    result = &mut flush => panic!("flush escaped paused write: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+            drop(flush);
+            assert!(retained.upgrade().is_some());
+            pause.resume.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), store.clone().flush(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.upgrade().is_none());
+        assert_bucket_file_holds(dir.path(), 0, &keys[0]).await;
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_writer_waiting_to_schedule_does_not_strand_dirty_work() {
+    use std::time::Duration;
+
+    let dir = lore_base::test_util::TempDir::new("ms_cancel_schedule_");
+    let store = Arc::new(
+        LocalMutableStore::new(
+            Some(dir.path()),
+            MutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+            make_in_memory_immutable().await,
+        )
+        .await
+        .unwrap(),
+    );
+    let group = &store.group[0];
+    // A drain holds this mutex even after its sweep clears `scheduled`.
+    let scheduling = group.flush.lock().await;
+    let mut writer = Box::pin(store_keys(&store, Partition::default(), 1));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut writer => panic!("writer escaped the scheduling mutex"),
+                () = tokio::task::yield_now() => {},
+            }
+            if group.dirty[0].load(atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    assert!(!group.scheduled.load(atomic::Ordering::Relaxed));
+    assert!(group.dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(scheduling.is_empty());
+    drop(scheduling);
+
+    // A later write must schedule a sweep even though the bucket is already dirty.
+    let mut key = Hash::default();
+    key.data_mut()[1] = 0xAB;
+    lore_storage::mutable_store::MutableStore::store(
+        store.clone(),
+        Partition::default(),
+        key,
+        Hash::from_u64(2),
+        KeyType::BranchMetadata,
+    )
+    .await
+    .unwrap();
+    assert!(group.scheduled.load(atomic::Ordering::Relaxed));
+    group.flush_now.notify_one();
+    wait_for_delayed_flush(group).await;
+    assert!(!group.dirty[0].load(atomic::Ordering::Relaxed));
+    assert_bucket_file_holds(dir.path(), 0, &key).await;
+}

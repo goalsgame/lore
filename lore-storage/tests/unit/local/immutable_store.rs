@@ -9758,3 +9758,127 @@ async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
         .expect_err("an evicted entry is not loaded back");
     assert!(matches!(err, StoreError::AddressNotFound(_)));
 }
+
+#[tokio::test]
+async fn explicit_flush_drains_delayed_io_ownership_even_after_cancelled_wait() {
+    use lore_storage::immutable_store::ImmutableStore;
+    for cancelled in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_flush_delayed_owner_");
+        let store = LocalImmutableStore::new(
+            Some(dir.path().to_path_buf()),
+            ImmutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+        )
+        .await
+        .unwrap();
+        let owner = Arc::new(());
+        let retained = Arc::downgrade(&owner);
+        let io = lore_io::lease::IoLease::new(owner);
+        io.scope(put_payload(
+            &store,
+            Partition::default(),
+            Context::default(),
+            b"flush owns this write",
+            false,
+        ))
+        .await;
+        drop(io);
+        assert!(retained.upgrade().is_some());
+        if cancelled {
+            let pause = pause_at(PausePoint::Serializing);
+            let mut flush = Box::pin(store.clone().flush(true));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = pause.reached.notified() => {},
+                    result = &mut flush => panic!("flush escaped paused write: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+            drop(flush);
+            assert!(retained.upgrade().is_some());
+            pause.resume.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), store.clone().flush(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.upgrade().is_none());
+    }
+}
+
+#[tokio::test]
+async fn cancelling_a_writer_waiting_to_schedule_does_not_strand_dirty_work() {
+    let dir = lore_base::test_util::TempDir::new("is_cancel_schedule_");
+    let store = LocalImmutableStore::new(
+        Some(dir.path().to_path_buf()),
+        ImmutableStoreSettings {
+            flush_delay_seconds: 3600,
+            ..client_settings()
+        },
+    )
+    .await
+    .unwrap();
+    let (group_index, payloads) = payloads_in_one_group(2);
+    let group = &store.group[group_index];
+    // A drain holds this mutex even after its sweep clears `scheduled`.
+    let scheduling = group.flush.lock().await;
+    let mut writer = Box::pin(put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        &payloads[0],
+        false,
+    ));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            tokio::select! {
+                biased;
+                _ = &mut writer => panic!("writer escaped the scheduling mutex"),
+                () = tokio::task::yield_now() => {},
+            }
+            if group.dirty[0].load(atomic::Ordering::Relaxed) {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    drop(writer);
+    assert!(!group.scheduled.load(atomic::Ordering::Relaxed));
+    assert!(group.dirty[0].load(atomic::Ordering::Relaxed));
+    assert!(scheduling.is_empty());
+    drop(scheduling);
+
+    put_payload(
+        &store,
+        Partition::default(),
+        Context::default(),
+        &payloads[1],
+        false,
+    )
+    .await;
+    assert!(group.scheduled.load(atomic::Ordering::Relaxed));
+    group.flush_now.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut tasks = group.flush.lock().await;
+        while let Some(result) = tasks.join_next().await {
+            result.unwrap();
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!group.dirty[0].load(atomic::Ordering::Relaxed));
+    let bucket_path = format_bucket_path(store.path.as_ref().unwrap(), group_index, 0);
+    assert_eq!(
+        ImmutableStoreBucket::deserialize_files(bucket_path)
+            .await
+            .unwrap()
+            .entry
+            .len(),
+        2,
+        "the scheduled sweep persists both the cancelled write and the later write"
+    );
+}

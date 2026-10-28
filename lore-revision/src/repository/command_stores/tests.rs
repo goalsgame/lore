@@ -47,7 +47,13 @@ impl FilesystemProvider for Provider {
         ))
     }
 }
-fn admitted() -> (TempDir, TempDir, Registration, BoundLoad) {
+fn admitted() -> (
+    TempDir,
+    TempDir,
+    Registration,
+    Arc<ProviderRegistry>,
+    BoundLoad,
+) {
     use std::os::unix::fs::PermissionsExt;
     let target = TempDir::new("lore-command-stores-target-");
     let metadata = TempDir::new("lore-command-stores-metadata-");
@@ -78,7 +84,7 @@ fn admitted() -> (TempDir, TempDir, Registration, BoundLoad) {
     let location = owner.bootstrap_location().unwrap();
     owner.publish(Arc::new(Provider)).unwrap();
     let (_provider, load) = registry.resolve_bootstrap(&location).unwrap().into_parts();
-    (target, metadata, owner, load)
+    (target, metadata, owner, registry, load)
 }
 async fn raw_stores() -> (TempDir, Arc<dyn ImmutableStore>, Arc<LocalMutableStore>) {
     let directory = TempDir::new("lore-command-stores-data-");
@@ -106,7 +112,7 @@ async fn raw_stores() -> (TempDir, Arc<dyn ImmutableStore>, Arc<LocalMutableStor
 }
 #[tokio::test]
 async fn specialized_methods_and_policy_overrides_reach_the_inner_store() {
-    let (_target, _metadata, _owner, load) = admitted();
+    let (_target, _metadata, _owner, _registry, load) = admitted();
     let (_data, raw, mutable) = raw_stores().await;
     let stats = Arc::new(Stats::default());
     let expected_lock = raw.store_lock().unwrap();
@@ -166,7 +172,7 @@ async fn specialized_methods_and_policy_overrides_reach_the_inner_store() {
 }
 #[tokio::test]
 async fn retired_admission_never_reaches_inner_store_operations() {
-    let (_target, _metadata, owner, load) = admitted();
+    let (_target, _metadata, owner, _registry, load) = admitted();
     let (_data, raw, mutable) = raw_stores().await;
     let stats = Arc::new(Stats::default());
     let raw_mutable = mutable.clone();
@@ -211,7 +217,7 @@ async fn retired_admission_never_reaches_inner_store_operations() {
 struct Parent;
 #[tokio::test]
 async fn actual_list_producers_retain_facade_work_after_the_call_and_receiver_drop() {
-    let (_target, _metadata, _owner, load) = admitted();
+    let (_target, _metadata, _owner, _registry, load) = admitted();
     let (_data, immutable, mutable) = raw_stores().await;
     mutable
         .clone()
@@ -248,4 +254,85 @@ async fn actual_list_producers_retain_facade_work_after_the_call_and_receiver_dr
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+async fn working_command_flush_waits_for_admission_release_and_survives_cancellation() {
+    for cancelled in [false, true] {
+        let (_target, _metadata, _owner, registry, load) = admitted();
+        let location = load.location().clone();
+        let (_data, raw, mutable) = raw_stores().await;
+        let pause = Arc::new(probe::FlushPause::default());
+        let stats = Arc::new(Stats {
+            flush_pause: Some(pause.clone()),
+            ..Default::default()
+        });
+        let load = Arc::new(load);
+        let (immutable, mutable) = wrap(
+            Arc::new(ProbeImmutable {
+                inner: raw,
+                stats: stats.clone(),
+            }),
+            mutable,
+            load.clone(),
+        );
+        let final_store = Arc::downgrade(&immutable);
+        let mut repository = crate::repository::RepositoryContext::new_with_state(
+            None,
+            immutable,
+            mutable,
+            location.repository(),
+            location.instance(),
+            crate::repository::RemoteState::Offline,
+            Arc::default(),
+            None,
+        );
+        repository.working_admission = Some(load);
+        let mut flush = Box::pin(repository.post_command_flush(true));
+        tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                () = pause.reached.notified() => {},
+                () = &mut flush => panic!("command flush completed before its store operation"),
+            }
+        })
+        .await
+        .unwrap();
+        let (_, next) = registry.resolve_bootstrap(&location).unwrap().into_parts();
+        assert!(matches!(
+            next.exclude_command(),
+            Err(crate::fs::provider_registry::Error::AdmissionBusy)
+        ));
+        if cancelled {
+            drop(flush);
+            drop(repository);
+            assert!(final_store.upgrade().is_some());
+            assert!(matches!(
+                next.exclude_command(),
+                Err(crate::fs::provider_registry::Error::AdmissionBusy)
+            ));
+            pause.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), async {
+                loop {
+                    match next.exclude_command() {
+                        Ok(exclusive) => break exclusive,
+                        Err(crate::fs::provider_registry::Error::AdmissionBusy) => {
+                            tokio::task::yield_now().await;
+                        }
+                        Err(error) => panic!("flush admission did not reopen: {error}"),
+                    }
+                }
+            })
+            .await
+            .unwrap();
+        } else {
+            pause.resume.notify_one();
+            tokio::time::timeout(Duration::from_secs(10), flush)
+                .await
+                .unwrap();
+            drop(repository);
+            assert!(final_store.upgrade().is_none());
+        }
+        next.exclude_command().unwrap();
+        assert!(stats.calls.lock().contains(&"flush"));
+    }
 }

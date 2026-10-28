@@ -280,6 +280,355 @@ async fn accepted_old_connection_is_fenced_when_a_fresh_owner_starts() {
     drop(guard);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_stop_after_control_admission_closes_acknowledges_only_its_retired_run() {
+    use std::io::Read;
+
+    use lore::remote::message;
+    use lore::remote::network;
+
+    for current in [true, false] {
+        let request = Arc::new(StopRequest::new());
+        let (owner, guard, cleanup) = run(&request);
+        let mut guard = Some(guard);
+        let name = format!("owner-retired-stop-{}-{current}", std::process::id());
+        let listener = network::UdsListener::new(&name).unwrap();
+        let mut client =
+            std::os::unix::net::UnixStream::connect(network::unix::uds_sock_path(&name)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        lore::remote::connection::serve_owned_connection(
+            owner.clone(),
+            lore::remote::connection::ConnectionId(0),
+            listener.accept().unwrap(),
+        );
+        assert_eq!(owner.state.connection_count(), 1);
+
+        control_stop(owner.clone(), false).await.unwrap();
+        assert_eq!(owner.status().0, lore::service::owner::Phase::ReadyToExit);
+        owner.state.close_and_drain_invocations().await;
+        assert!(owner.state.try_begin_control_invocation().is_none());
+        let replacement = if current {
+            None
+        } else {
+            drop(guard.take());
+            Some(run(&request))
+        };
+        let command = message::MessageToServer {
+            globals: Default::default(),
+            command: lore::remote::command::LoreCommand::ServiceStop(Default::default()),
+            environment: Default::default(),
+        };
+        message::write_payload(&mut client, &message::encode_message(&command)).unwrap();
+        let replies = tokio::task::spawn_blocking(move || {
+            if !current {
+                let mut byte = [0];
+                match client.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("a stale stop connection must close: {result:?}"),
+                }
+                return Vec::new();
+            }
+            let mut events = Vec::new();
+            loop {
+                let (reply, _) =
+                    message::blocking_read_message::<message::MessageToClient, _>(&mut client)
+                        .unwrap()
+                        .expect("an already retired stop still receives a result");
+                match reply {
+                    message::MessageToClient::Event(lore::interface::LoreEvent::Complete(data)) => {
+                        assert_eq!(data.status, 0);
+                        assert_eq!(data.error.error_code, 0);
+                        events.push("complete");
+                    }
+                    message::MessageToClient::Event(lore::interface::LoreEvent::End(_)) => {
+                        events.push("end");
+                    }
+                    message::MessageToClient::ApiResult(code) => {
+                        assert_eq!(code, 0);
+                        events.push("result");
+                        return events;
+                    }
+                    message::MessageToClient::Event(_) => panic!("unexpected stop acknowledgement"),
+                }
+            }
+        });
+        let events = tokio::time::timeout(Duration::from_secs(10), replies)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            events,
+            if current {
+                vec!["complete", "end", "result"]
+            } else {
+                vec![]
+            }
+        );
+        if let Some((new, _, _)) = &replacement {
+            assert!(!request.is_requested());
+            assert!(new.state.try_begin_invocation().is_some());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.state.connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(listener);
+        let mut lock = network::unix::uds_sock_path(&name).into_os_string();
+        lock.push(".lock");
+        let _removed = std::fs::remove_file(lock);
+        drop(replacement);
+        drop(cleanup);
+        drop(guard);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_retirement_preserves_reply_until_native_write_finishes_after_cancellation() {
+    use lore::remote::message;
+    use lore::service::actor::ReplyDrain;
+
+    let replies = ReplyDrain::new();
+    let guard = replies.try_begin().unwrap();
+    let native_guard = guard.clone();
+    let (mut client, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let retiring_socket = writer.try_clone().unwrap();
+    let (entered, first_sent) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let native = tokio::task::spawn_blocking(move || {
+        let _guard = native_guard;
+        let complete =
+            lore::interface::LoreEvent::Complete(lore_revision::event::LoreCompleteEventData {
+                status: 0,
+                error: Default::default(),
+            });
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(&message::MessageToClient::Event(&complete)),
+        )
+        .unwrap();
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(5)).unwrap();
+        let end = lore::interface::LoreEvent::End(Default::default());
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(&message::MessageToClient::Event(&end)),
+        )
+        .unwrap();
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(
+                &message::MessageToClient::<lore::interface::LoreEvent>::ApiResult(0),
+            ),
+        )
+        .unwrap();
+    });
+    first_sent.await.unwrap();
+    let waiter = tokio::spawn(native);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    drop(guard);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), replies.close_and_drain())
+            .await
+            .is_err()
+    );
+    assert!(
+        replies.try_begin().is_none(),
+        "reply admission stays closed after cancellation"
+    );
+    let mut retirement = tokio::spawn(async move {
+        replies.close_and_drain().await;
+        retiring_socket.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let received = tokio::task::spawn_blocking(move || {
+        let mut events = Vec::new();
+        loop {
+            let (reply, _) =
+                message::blocking_read_message::<message::MessageToClient, _>(&mut client)
+                    .unwrap()
+                    .expect("retirement must preserve the complete acknowledgement");
+            match reply {
+                message::MessageToClient::Event(lore::interface::LoreEvent::Complete(data)) => {
+                    assert_eq!(data.status, 0);
+                    events.push("complete");
+                }
+                message::MessageToClient::Event(lore::interface::LoreEvent::End(_)) => {
+                    events.push("end");
+                }
+                message::MessageToClient::ApiResult(code) => {
+                    assert_eq!(code, 0);
+                    events.push("result");
+                    return events;
+                }
+                message::MessageToClient::Event(_) => panic!("unexpected acknowledgement event"),
+            }
+        }
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap(),
+        vec!["complete", "end", "result"]
+    );
+    tokio::time::timeout(Duration::from_secs(5), &mut retirement)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn disconnected_reply_peer_stops_forwarding_after_the_first_native_write_failure() {
+    use lore::remote::message;
+    use lore::remote::network;
+
+    let request = Arc::new(StopRequest::new());
+    let (owner, _guard, _cleanup) = run(&request);
+    for _ in 0..16 {
+        owner.state.push_log(
+            lore::interface::LoreLogLevel::Info,
+            "queued status message".repeat(100),
+        );
+    }
+    let name = format!("owner-dead-reply-{}", std::process::id());
+    let listener = network::UdsListener::new(&name).unwrap();
+    let mut client =
+        std::os::unix::net::UnixStream::connect(network::unix::uds_sock_path(&name)).unwrap();
+    lore::remote::connection::serve_owned_connection(
+        owner.clone(),
+        lore::remote::connection::ConnectionId(0),
+        listener.accept().unwrap(),
+    );
+    let command = message::MessageToServer {
+        globals: Default::default(),
+        command: lore::remote::command::LoreCommand::ServiceStatus(Default::default()),
+        environment: Default::default(),
+    };
+    message::write_payload(&mut client, &message::encode_message(&command)).unwrap();
+    client.shutdown(std::net::Shutdown::Both).unwrap();
+    drop(client);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while owner.state.connection_count() != 0 || owner.state.invocation_count() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let (logs, _) = owner.state.drain_logs();
+    assert_eq!(
+        logs.iter()
+            .filter(|log| log.message.contains("Failed to send message to client"))
+            .count(),
+        1
+    );
+    drop(listener);
+    let mut lock = network::unix::uds_sock_path(&name).into_os_string();
+    lock.push(".lock");
+    let _removed = std::fs::remove_file(lock);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_retirement_interrupts_a_stalled_native_reply_without_peer_disconnect() {
+    use std::io::Write;
+
+    use lore::service::actor::ReplyDrain;
+
+    let replies = ReplyDrain::new();
+    let guard = replies.try_begin().unwrap();
+    let (_nonreading_peer, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    writer.set_nonblocking(true).unwrap();
+    loop {
+        match writer.write(&[0; 4096]) {
+            Ok(written) => assert!(written > 0),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("filling the reply socket: {error}"),
+        }
+    }
+    writer.set_nonblocking(false).unwrap();
+    let first_socket = writer.try_clone().unwrap();
+    let retry_socket = writer.try_clone().unwrap();
+    let (entered, started) = tokio::sync::oneshot::channel();
+    let native = tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        entered.send(()).unwrap();
+        writer.write_all(&[1])
+    });
+    started.await.unwrap();
+    let interrupted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observe = interrupted.clone();
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(20),
+            replies.close_and_shutdown(Duration::from_secs(5), Duration::from_secs(5), move || {
+                observe.store(true, std::sync::atomic::Ordering::Release);
+                first_socket.shutdown(std::net::Shutdown::Both).unwrap();
+            }),
+        )
+        .await
+        .is_err()
+    );
+    assert!(!interrupted.load(std::sync::atomic::Ordering::Acquire));
+    assert!(
+        !native.is_finished(),
+        "cancellation must retain the native writer"
+    );
+    assert!(replies.try_begin().is_none());
+    replies
+        .close_and_shutdown(
+            Duration::from_millis(20),
+            Duration::from_secs(5),
+            move || {
+                retry_socket.shutdown(std::net::Shutdown::Both).unwrap();
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_secs(5), native)
+            .await
+            .unwrap()
+            .unwrap()
+            .is_err(),
+        "socket shutdown must interrupt the stalled write while its peer stays open"
+    );
+}
+
+#[tokio::test]
+async fn network_retirement_does_not_certify_unfinished_native_work_after_shutdown() {
+    use lore::service::actor::ReplyDrain;
+
+    let replies = ReplyDrain::new();
+    let guard = replies.try_begin().unwrap();
+    assert!(
+        replies
+            .close_and_shutdown(Duration::ZERO, Duration::from_millis(20), || {})
+            .await
+            .is_err()
+    );
+    assert!(replies.try_begin().is_none());
+    drop(guard);
+    replies
+        .close_and_shutdown(Duration::ZERO, Duration::from_secs(5), || {})
+        .await
+        .unwrap();
+}
+
 /// Service initialization configures a process-wide storage flush delay, so the
 /// actual run/cancel/restart contract runs in its own normal-harness process.
 #[test]

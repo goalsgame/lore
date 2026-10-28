@@ -88,7 +88,32 @@ struct SetupIoOwner {
     _pending: Arc<PendingIoOwner>,
     _caller: Option<IoLease>,
 }
+struct SetupCompletion(Option<tokio::sync::oneshot::Sender<()>>);
+impl Drop for SetupCompletion {
+    fn drop(&mut self) {
+        if let Some(sender) = self.0.take() {
+            let _delivered = sender.send(());
+        }
+    }
+}
+struct RetainedSetup {
+    _lease: IoLease,
+    // Notify only after the final setup lease has released pending ownership.
+    _completed: SetupCompletion,
+}
 impl PendingPublication {
+    /// Retain actual owner setup IO and report its final release independently
+    /// of cancellation of the caller waiting for it.
+    pub fn setup_io(
+        &self,
+    ) -> std::result::Result<(IoLease, tokio::sync::oneshot::Receiver<()>), Error> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let lease = IoLease::new(Arc::new(RetainedSetup {
+            _lease: self.io_lease()?,
+            _completed: SetupCompletion(Some(sender)),
+        }));
+        Ok((lease, receiver))
+    }
     pub fn io_lease(&self) -> std::result::Result<IoLease, Error> {
         match &self.state {
             PublicationState::Shared(owner) if !self.failed => {

@@ -27,6 +27,12 @@ use super::*;
 pub(super) struct Stats {
     pub(super) calls: parking_lot::Mutex<Vec<&'static str>>,
     pub(super) dropped_under_io: AtomicBool,
+    pub(super) flush_pause: Option<Arc<FlushPause>>,
+}
+#[derive(Default)]
+pub(super) struct FlushPause {
+    pub(super) reached: tokio::sync::Notify,
+    pub(super) resume: tokio::sync::Notify,
 }
 pub(super) struct ProbeImmutable {
     pub(super) inner: Arc<dyn ImmutableStore>,
@@ -184,6 +190,10 @@ impl ImmutableStore for ProbeImmutable {
     }
     async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
         self.stats.calls.lock().push("flush");
+        if let Some(pause) = &self.stats.flush_pause {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
+        }
         self.inner.clone().flush(sync_data).await
     }
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {

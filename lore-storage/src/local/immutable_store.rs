@@ -37,6 +37,7 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use lore_base::allocator::GrowVec;
 use lore_error_set::Internal;
 use lore_error_set::prelude::*;
@@ -460,6 +461,8 @@ pub struct ImmutableStoreGroup {
     pub writes: Arc<crate::local::fan_out::GroupWrites>,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
+    /// Wakes the currently scheduled sweep when an explicit flush drains it.
+    pub flush_now: Arc<tokio::sync::Notify>,
     /// Whether a delayed flush is due for this group and has not yet begun its sweep.
     ///
     /// A writer that flags a bucket schedules a sweep only when it is the one to set this,
@@ -1621,7 +1624,16 @@ impl ImmutableStoreGroup {
     /// nothing flagged.
     #[lore_macro::test_pub]
     async fn flush_delayed(weak_ref: Weak<LocalImmutableStore>, group_index: usize, delay: u64) {
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+        let Some(wake) = weak_ref
+            .upgrade()
+            .map(|store| store.group[group_index].flush_now.clone())
+        else {
+            return;
+        };
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(delay)) => {},
+            () = wake.notified() => {},
+        }
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::DelayedFlush);
         if let Some(store) = weak_ref.upgrade()
@@ -2125,6 +2137,7 @@ impl LocalImmutableStore {
                     Some(gc_counters.clone()),
                 ),
                 flush: Mutex::new(JoinSet::new()),
+                flush_now: Arc::new(tokio::sync::Notify::new()),
                 scheduled: AtomicBool::new(false),
                 payload_gate: PayloadGate::default(),
             }));
@@ -3566,6 +3579,21 @@ impl LocalImmutableStore {
         }
     }
 
+    // An explicit flush has already written the dirty buckets. Wake and join
+    // queued sweeps so their IO ownership ends without waiting out their delays.
+    // Workers never take this scheduling mutex; cancellation leaves them owned
+    // by the JoinSet for the next successful flush to drain.
+    async fn drain_scheduled_flushes(&self) {
+        for group in &self.group {
+            let mut scheduled = group.flush.lock().await;
+            if !scheduled.is_empty() {
+                group.flush_now.notify_one();
+                while scheduled.join_next().await.is_some() {}
+                let _unused_wake = group.flush_now.notified().now_or_never();
+            }
+        }
+    }
+
     /// Starts the group's delayed flush unless one is due, after an index change that leaves an
     /// entry with `flags`. A change to a durable entry waits for an explicit flush unless
     /// [`ImmutableStoreSettings::flush_background`] is set, since it is stored upstream as well.
@@ -3578,10 +3606,13 @@ impl LocalImmutableStore {
             return;
         }
         let group = &self.group[group_index];
+        // Publish the flag only once task insertion cannot be cancelled. An explicit
+        // flush can hold this mutex while its sweep clears the flag; cancellation
+        // while waiting must leave the next writer free to schedule the dirty work.
+        let mut flush = group.flush.lock().await;
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
         }
-        let mut flush = group.flush.lock().await;
         let _ = flush.try_join_next();
         lore_base::lore_spawn!(
             flush,
@@ -6007,6 +6038,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 // Nothing is flagged, so a flock an earlier span left held over state
                 // since written has nothing to keep it.
                 self.note_flushed();
+                self.drain_scheduled_flushes().await;
                 return Ok(());
             }
             PendingFlush::Stamps => Intent::Read,
@@ -6022,6 +6054,9 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         // nothing is flagged. What a failed flush could not write stays flagged, and keeps
         // the store claimed.
         drop(hold);
+        if flushed.is_ok() {
+            self.drain_scheduled_flushes().await;
+        }
         flushed
     }
 

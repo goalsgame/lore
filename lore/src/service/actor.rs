@@ -51,6 +51,82 @@ struct Command {
     next: u64,
     pending: Option<u64>,
 }
+
+#[derive(Default)]
+struct ReplyState {
+    closed: bool,
+    active: usize,
+}
+
+/// Network reply admission is separate from command admission. Closing it
+/// preserves every admitted reply through its final native write.
+#[allow(private_interfaces)]
+#[lore_macro::test_pub]
+pub(crate) struct ReplyDrain {
+    state: Mutex<ReplyState>,
+    changed: tokio::sync::Notify,
+}
+impl ReplyDrain {
+    #[lore_macro::test_pub]
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: Mutex::new(ReplyState::default()),
+            changed: tokio::sync::Notify::new(),
+        })
+    }
+    #[lore_macro::test_pub]
+    pub(crate) fn try_begin(self: &Arc<Self>) -> Option<Arc<ReplyGuard>> {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.closed {
+            return None;
+        }
+        state.active = state.active.checked_add(1)?;
+        Some(Arc::new(ReplyGuard(self.clone())))
+    }
+    #[lore_macro::test_pub]
+    pub(crate) async fn close_and_drain(&self) {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).closed = true;
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.state.lock().unwrap_or_else(|p| p.into_inner()).active == 0 {
+                return;
+            }
+            changed.await;
+        }
+    }
+    /// Give cooperative replies time to finish, then interrupt every socket.
+    /// Interruption alone is not completion: native writers must release their
+    /// guards before this returns successfully.
+    #[lore_macro::test_pub]
+    pub(crate) async fn close_and_shutdown(
+        &self,
+        grace: Duration,
+        drain: Duration,
+        shutdown: impl FnOnce(),
+    ) -> Result<(), String> {
+        let _grace = tokio::time::timeout(grace, self.close_and_drain()).await;
+        shutdown();
+        tokio::time::timeout(drain, self.close_and_drain())
+            .await
+            .map_err(|_timeout| {
+                "service reply writers did not drain after socket shutdown; network retained".into()
+            })
+    }
+}
+#[lore_macro::test_pub]
+pub(crate) struct ReplyGuard(Arc<ReplyDrain>);
+impl Drop for ReplyGuard {
+    fn drop(&mut self) {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .active -= 1;
+        self.0.changed.notify_waiters();
+    }
+}
 pub(crate) struct RunState {
     owner: Arc<ServiceOwner>,
     start: Mutex<Option<ServiceStartGuard>>,
@@ -61,6 +137,7 @@ pub(crate) struct RunState {
     done: watch::Sender<Option<Result<(), String>>>,
     listener: Mutex<Option<Arc<UdsListener>>>,
     sockets: Mutex<Vec<(u64, UdsStream)>>,
+    replies: Arc<ReplyDrain>,
     next_socket: Mutex<u64>,
     accepting: AtomicBool,
     accept_thread: Mutex<Option<Arc<ThreadOwner>>>,
@@ -232,6 +309,9 @@ impl RunState {
     pub(crate) fn runtime(&self) -> Option<tokio::runtime::Handle> {
         self.runtime.get().cloned()
     }
+    pub(crate) fn admit_reply(&self) -> Option<Arc<ReplyGuard>> {
+        self.replies.try_begin()
+    }
     pub(crate) fn track_socket(
         self: &Arc<Self>,
         socket: &UdsStream,
@@ -260,7 +340,8 @@ impl RunState {
     }
     async fn stop_network(&self) -> Result<(), String> {
         self.accepting.store(false, Ordering::Release);
-        // The reply has been enqueued before its control ticket is released.
+        // Already accepted clients have a bounded window to finish reading
+        // their request before reply admission closes.
         tokio::time::sleep(Duration::from_millis(500)).await;
         if self
             .accept_thread
@@ -271,12 +352,28 @@ impl RunState {
             let _wake = UdsStream::connect(crate::remote::service_socket_name())
                 .map_err(|e| format!("failed waking owned accept worker: {e}"))?;
         }
-        {
-            let sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
-            for (_, socket) in sockets.iter() {
-                let _closed = socket.shutdown();
-            }
-        }
+        // Parsed requests admitted before this fence retain their replies;
+        // later requests cannot begin acknowledgement while sockets retire.
+        self.replies
+            .close_and_shutdown(Duration::from_secs(5), Duration::from_secs(10), || {
+                let sockets = self.sockets.lock().unwrap_or_else(|p| p.into_inner());
+                for (_, socket) in sockets.iter() {
+                    let _closed = socket.shutdown();
+                }
+            })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(10), self.drain_connections())
+            .await
+            .map_err(|_timeout| {
+                "service connections did not drain; network retained".to_owned()
+            })??;
+        self.listener
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        Ok(())
+    }
+    async fn drain_connections(&self) -> Result<(), String> {
         loop {
             let notified = self.connections_changed.notified();
             tokio::pin!(notified);
@@ -302,10 +399,6 @@ impl RunState {
                 .await
                 .map_err(|error| format!("joining service accept worker: {error}"))?;
         }
-        self.listener
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .take();
         Ok(())
     }
 }
@@ -361,6 +454,7 @@ pub(crate) async fn run(
                 done: watch::channel(None).0,
                 listener: Mutex::new(None),
                 sockets: Mutex::new(Vec::new()),
+                replies: ReplyDrain::new(),
                 next_socket: Mutex::new(0),
                 accepting: AtomicBool::new(true),
                 accept_thread: Mutex::new(None),

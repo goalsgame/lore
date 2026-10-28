@@ -120,7 +120,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository)))
+                (detail, Some(post_command_cleanup(repository).await))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -177,7 +177,7 @@ where
                 };
                 let detail =
                     LoreErrorDetail::from_result(command(repository.clone(), token, args).await);
-                (detail, Some(post_command_cleanup(repository)))
+                (detail, Some(post_command_cleanup(repository).await))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -226,7 +226,7 @@ where
                     Err(err) => break 'call (LoreErrorDetail::from_error(&err), None),
                 };
                 let detail = LoreErrorDetail::from_result(command(repository.clone(), args).await);
-                (detail, Some(post_command_cleanup(repository)))
+                (detail, Some(post_command_cleanup(repository).await))
             };
 
             check_no_lingering_repository(weak_repository);
@@ -300,9 +300,11 @@ async fn prepare_repository_call(
     Ok((repository_path, execution))
 }
 
-fn post_command_cleanup(repository: Arc<RepositoryContext>) -> std::sync::Weak<RepositoryContext> {
+async fn post_command_cleanup(
+    repository: Arc<RepositoryContext>,
+) -> std::sync::Weak<RepositoryContext> {
     let sync_data = execution_context().globals().sync_data();
-    repository.try_spawn_post_command_flush(sync_data);
+    repository.post_command_flush(sync_data).await;
 
     if let Some(duration) = execution_context().globals().store_keep_alive_duration() {
         repository.spawn_keep_alive(duration);

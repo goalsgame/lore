@@ -615,3 +615,51 @@ fn setup_listing_retains_distinct_current_caller_after_cancellation_and_runtime_
     assert!(f.parent_dropped.load(Ordering::Acquire));
     assert!(f.client.try_lock().is_ok());
 }
+
+#[tokio::test]
+async fn setup_completion_waits_for_actual_io_after_a_cancelled_wait() {
+    let mut f = Fixture::new().await;
+    let (_directory, store) = local_store().await;
+    let (context, mut permit) = f.parts();
+    let (setup, mut completed) = permit.setup_io().unwrap();
+    let pause = lore_storage::test_util::pause_at(PausePoint::Listing);
+    let _resume = ResumeListing(pause.clone());
+    let stream = setup
+        .scope(store.list(Partition::default(), lore_storage::KeyType::BranchMetadata))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), pause.reached.notified())
+        .await
+        .unwrap();
+    drop(stream.channel());
+    drop(setup);
+    let provider = f.provider(true, false);
+    assert!(matches!(permit.prepare(&provider), Err(Error::Busy)));
+    assert!(f.client.try_lock().is_err());
+    let mut wait = Box::pin(async { (&mut completed).await });
+    tokio::select! {
+        biased;
+        result = &mut wait => panic!("setup completed before actual IO: {result:?}"),
+        () = tokio::task::yield_now() => {},
+    }
+    drop(wait);
+    assert!(f.client.try_lock().is_err());
+    assert!(!f.parent_dropped.load(Ordering::Acquire));
+    pause.resume.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), completed)
+        .await
+        .unwrap()
+        .unwrap();
+    let cleanup = {
+        let mut prepared = permit.prepare(&provider).unwrap();
+        prepared.release_client().unwrap();
+        f.success.store(true, Ordering::Release);
+        prepared.commit().unwrap()
+    };
+    drop(cleanup);
+    drop(permit);
+    drop(context);
+    drop(provider);
+    assert!(f.client.try_lock().is_ok());
+    assert!(f.parent_dropped.load(Ordering::Acquire));
+}
