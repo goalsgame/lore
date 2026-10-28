@@ -955,8 +955,8 @@ impl RepositoryContext {
     /// order every command takes them in, and a deadlock against a command in
     /// another process holding that store and waiting for the repository.
     ///
-    /// Working commands await completion so their admission cannot outlive the
-    /// terminal callback. Cancellation leaves the guarded flush running.
+    /// Working commands await completion so the flush retains no admission past
+    /// the terminal callback. Cancellation leaves the guarded flush running.
     pub async fn post_command_flush(&self, sync_data: bool) {
         let (completed, completion) = if self.working_admission.is_some() {
             let (sender, receiver) = tokio::sync::oneshot::channel();
