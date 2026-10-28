@@ -388,6 +388,111 @@ async fn accepted_stop_after_control_admission_closes_acknowledges_only_its_reti
     }
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn network_retirement_preserves_reply_until_native_write_finishes_after_cancellation() {
+    use lore::remote::message;
+    use lore::service::actor::ReplyDrain;
+
+    let replies = ReplyDrain::new();
+    let guard = replies.try_begin().unwrap();
+    let native_guard = guard.clone();
+    let (mut client, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+    client
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let retiring_socket = writer.try_clone().unwrap();
+    let (entered, first_sent) = tokio::sync::oneshot::channel();
+    let (release, released) = std::sync::mpsc::channel();
+    let native = tokio::task::spawn_blocking(move || {
+        let _guard = native_guard;
+        let complete =
+            lore::interface::LoreEvent::Complete(lore_revision::event::LoreCompleteEventData {
+                status: 0,
+                error: Default::default(),
+            });
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(&message::MessageToClient::Event(&complete)),
+        )
+        .unwrap();
+        entered.send(()).unwrap();
+        released.recv_timeout(Duration::from_secs(5)).unwrap();
+        let end = lore::interface::LoreEvent::End(Default::default());
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(&message::MessageToClient::Event(&end)),
+        )
+        .unwrap();
+        message::write_payload(
+            &mut writer,
+            &message::encode_message(
+                &message::MessageToClient::<lore::interface::LoreEvent>::ApiResult(0),
+            ),
+        )
+        .unwrap();
+    });
+    first_sent.await.unwrap();
+    let waiter = tokio::spawn(native);
+    waiter.abort();
+    assert!(waiter.await.unwrap_err().is_cancelled());
+    drop(guard);
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), replies.close_and_drain())
+            .await
+            .is_err()
+    );
+    assert!(
+        replies.try_begin().is_none(),
+        "reply admission stays closed after cancellation"
+    );
+    let mut retirement = tokio::spawn(async move {
+        replies.close_and_drain().await;
+        retiring_socket.shutdown(std::net::Shutdown::Both).unwrap();
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut retirement)
+            .await
+            .is_err()
+    );
+    release.send(()).unwrap();
+    let received = tokio::task::spawn_blocking(move || {
+        let mut events = Vec::new();
+        loop {
+            let (reply, _) =
+                message::blocking_read_message::<message::MessageToClient, _>(&mut client)
+                    .unwrap()
+                    .expect("retirement must preserve the complete acknowledgement");
+            match reply {
+                message::MessageToClient::Event(lore::interface::LoreEvent::Complete(data)) => {
+                    assert_eq!(data.status, 0);
+                    events.push("complete");
+                }
+                message::MessageToClient::Event(lore::interface::LoreEvent::End(_)) => {
+                    events.push("end");
+                }
+                message::MessageToClient::ApiResult(code) => {
+                    assert_eq!(code, 0);
+                    events.push("result");
+                    return events;
+                }
+                message::MessageToClient::Event(_) => panic!("unexpected acknowledgement event"),
+            }
+        }
+    });
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(5), received)
+            .await
+            .unwrap()
+            .unwrap(),
+        vec!["complete", "end", "result"]
+    );
+    tokio::time::timeout(Duration::from_secs(5), &mut retirement)
+        .await
+        .unwrap()
+        .unwrap();
+}
+
 /// Service initialization configures a process-wide storage flush delay, so the
 /// actual run/cancel/restart contract runs in its own normal-harness process.
 #[test]

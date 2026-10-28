@@ -141,6 +141,8 @@ struct IpcConnection {
     owner: Option<Arc<crate::service::owner::ServiceOwner>>,
     #[cfg(unix)]
     lease: Option<Arc<crate::service::actor::ConnectionLease>>,
+    #[cfg(unix)]
+    reply: Option<Arc<crate::service::actor::ReplyGuard>>,
 }
 
 impl IpcConnection {
@@ -169,6 +171,8 @@ impl IpcConnection {
             owner: None,
             #[cfg(unix)]
             lease: None,
+            #[cfg(unix)]
+            reply: None,
         }
     }
 
@@ -179,9 +183,13 @@ impl IpcConnection {
     ) -> Result<(), ConnectionError> {
         #[cfg(unix)]
         let lease = self.lease.clone();
+        #[cfg(unix)]
+        let reply = self.reply.clone();
         self.blocking(move || {
             #[cfg(unix)]
             let _lease = lease;
+            #[cfg(unix)]
+            let _reply = reply;
             write_payload(stream.writer(), &payload)
         })
         .await
@@ -190,7 +198,8 @@ impl IpcConnection {
         Ok(())
     }
 
-    async fn handle_connection(self) -> Result<(), ConnectionError> {
+    #[cfg_attr(not(unix), allow(unused_mut))]
+    async fn handle_connection(mut self) -> Result<(), ConnectionError> {
         let mut connection = self.connection.try_clone().internal("cloning connection")?;
         #[cfg(unix)]
         let lease = self.lease.clone();
@@ -209,6 +218,13 @@ impl IpcConnection {
         let Some((command, payload)) = message else {
             return Ok(());
         };
+
+        #[cfg(unix)]
+        if let Some(actor) = self.owner.as_ref().and_then(|owner| owner.actor()) {
+            self.reply = Some(actor.admit_reply().ok_or_else(|| {
+                ConnectionError::internal("service network reply admission is closed")
+            })?);
+        }
 
         //TODO(UCS-16094): Determine if this should be unbounded or bounded
         // Create a channel so the callback task can send messages to this network thread, so they
