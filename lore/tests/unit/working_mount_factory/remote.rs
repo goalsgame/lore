@@ -85,6 +85,8 @@ async fn online_factory_hydrates_only_after_read_and_reuses_local_checkpoint() {
             };
             let attrs = model.lookup(1, b"original.txt").await.unwrap();
             assert!(server.metadata_gets() > 0);
+            assert_eq!(server.branch_queries(), 0);
+            assert_eq!(server.mutations(), 0);
             assert_eq!(model.digest(attrs.entry.inode).await.unwrap(), None);
             assert_eq!(
                 server.payload_gets(),

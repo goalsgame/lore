@@ -71,6 +71,20 @@ async fn source() -> (Arc<RepositoryContext>, Hash, lore_base::types::Address) {
         .serialize(repository.clone(), repository.try_write_token().unwrap())
         .await
         .unwrap();
+    lore_revision::branch::create(
+        repository.clone(),
+        repository.try_write_token().unwrap(),
+        [62; 16].into(),
+        "main",
+        lore_revision::branch::default_category(),
+        "fixture",
+        1,
+        vec![],
+        false,
+        false,
+    )
+    .await
+    .unwrap();
     repository.flush(true).await.unwrap();
     (repository, revision, address)
 }
@@ -135,6 +149,8 @@ async fn bound_remote_state_is_metadata_only_then_verified_payload_is_cached_aft
             })
             .await;
         assert_eq!(prepared.selection(), &selection);
+        assert_eq!(server.branch_queries(), 0);
+        assert_eq!(server.mutations(), 0);
         assert!(server.metadata_gets() > 0);
         assert_eq!(server.payload_gets(), 0);
         let payload = prepared.into_owner_build().unwrap();

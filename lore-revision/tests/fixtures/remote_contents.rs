@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Address;
+use lore_base::types::BranchPoint;
 use lore_base::types::Context;
 use lore_base::types::Fragment;
 use lore_base::types::Hash;
@@ -37,6 +38,8 @@ pub struct RemoteFixture {
     payload_denied: AtomicBool,
     sessions_detached: AtomicBool,
     metadata_gets: AtomicUsize,
+    branch_queries: AtomicUsize,
+    mutations: AtomicUsize,
     url: String,
 }
 impl RemoteFixture {
@@ -49,6 +52,8 @@ impl RemoteFixture {
             payload_denied: AtomicBool::new(false),
             sessions_detached: AtomicBool::new(true),
             metadata_gets: AtomicUsize::new(0),
+            branch_queries: AtomicUsize::new(0),
+            mutations: AtomicUsize::new(0),
             url: format!("{scheme}://example.com"),
         });
         lore_transport::add(&scheme, Arc::new(FixtureProtocol(Arc::downgrade(&fixture)))).unwrap();
@@ -68,6 +73,12 @@ impl RemoteFixture {
     }
     pub fn metadata_gets(&self) -> usize {
         self.metadata_gets.load(Ordering::SeqCst)
+    }
+    pub fn branch_queries(&self) -> usize {
+        self.branch_queries.load(Ordering::SeqCst)
+    }
+    pub fn mutations(&self) -> usize {
+        self.mutations.load(Ordering::SeqCst)
     }
     pub async fn contents(self: &Arc<Self>, execution: Arc<ExecutionContext>) -> RemoteContents {
         let execution = Arc::new(execution.for_background_owner().await);
@@ -145,6 +156,11 @@ impl Storage for FixtureStorage {
         _fragment: Fragment,
         _payload: Option<Bytes>,
     ) -> Result<(), ProtocolError> {
+        self.fixture
+            .upgrade()
+            .ok_or_else(unsupported)?
+            .mutations
+            .fetch_add(1, Ordering::SeqCst);
         Err(unsupported())
     }
     async fn query(&self, _session: u32, _addresses: &[Address]) -> Result<Bytes, ProtocolError> {
@@ -210,7 +226,7 @@ impl Protocol for FixtureProtocol {
         _repository: RepositoryId,
         _credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Revision>, ProtocolError> {
-        Err(unsupported())
+        Ok(Arc::new(FixtureRevision(self.0.clone())))
     }
     async fn repository(
         &self,
@@ -242,6 +258,94 @@ impl Protocol for FixtureProtocol {
         _repository: RepositoryId,
         _credentials: &Arc<SuppliedCredentials>,
     ) -> Result<Arc<dyn Lock>, ProtocolError> {
+        Err(unsupported())
+    }
+}
+
+struct FixtureRevision(Weak<RemoteFixture>);
+impl FixtureRevision {
+    fn refuse_mutation(&self) -> ProtocolError {
+        if let Some(fixture) = self.0.upgrade() {
+            fixture.mutations.fetch_add(1, Ordering::SeqCst);
+        }
+        unsupported()
+    }
+}
+#[async_trait]
+impl Revision for FixtureRevision {
+    async fn branch_query(
+        &self,
+        id: Option<lore_base::types::BranchId>,
+        name: Option<&str>,
+    ) -> Result<BranchQueryResponse, ProtocolError> {
+        let fixture = self.0.upgrade().ok_or_else(unsupported)?;
+        fixture.branch_queries.fetch_add(1, Ordering::SeqCst);
+        let repository = fixture.repository.clone();
+        let branch = match id {
+            Some(id) => id,
+            None => lore_revision::branch::load_name_to_id_local(
+                repository.clone(),
+                name.ok_or_else(unsupported)?,
+            )
+            .await
+            .map_err(|error| ProtocolError::internal(error.to_string()))?,
+        };
+        let metadata = lore_revision::branch::metadata_hash(repository.clone(), branch)
+            .await
+            .map_err(|error| ProtocolError::internal(error.to_string()))?;
+        let latest = lore_revision::branch::load_latest(repository, branch)
+            .await
+            .map_err(|error| ProtocolError::internal(error.to_string()))?;
+        Ok(BranchQueryResponse {
+            id: branch,
+            latest,
+            metadata,
+            deleted: false,
+        })
+    }
+    async fn branch_metadata_get(
+        &self,
+        branch: lore_base::types::BranchId,
+    ) -> Result<Hash, ProtocolError> {
+        Ok(self.branch_query(Some(branch), None).await?.metadata)
+    }
+    async fn branch_create(
+        &self,
+        _: lore_base::types::BranchId,
+        _: &str,
+        _: &str,
+        _: &str,
+        _: &[BranchPoint],
+    ) -> Result<Hash, ProtocolError> {
+        Err(self.refuse_mutation())
+    }
+    async fn branch_delete(&self, _: lore_base::types::BranchId) -> Result<(), ProtocolError> {
+        Err(self.refuse_mutation())
+    }
+    async fn branch_push(
+        &self,
+        _: lore_base::types::BranchId,
+        _: Hash,
+        _: bool,
+        _: bool,
+    ) -> Result<BranchPushResponse, ProtocolError> {
+        Err(self.refuse_mutation())
+    }
+    async fn branch_metadata_set(
+        &self,
+        _: lore_base::types::BranchId,
+        _: Hash,
+        _: Hash,
+    ) -> Result<MetadataSetResult, ProtocolError> {
+        Err(self.refuse_mutation())
+    }
+    async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError> {
+        Err(unsupported())
+    }
+    async fn revision_list(
+        &self,
+        _: RevisionListStart,
+    ) -> Result<RevisionListResponse, ProtocolError> {
         Err(unsupported())
     }
 }

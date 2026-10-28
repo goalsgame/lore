@@ -520,6 +520,12 @@ mod platform {
         selection: &Selection,
         config: &RepositoryConfig,
     ) -> Result<()> {
+        // Seed only the private branch cache. The selected branch can already
+        // exist remotely, and its name and identity must remain unchanged.
+        let repository = Arc::new(repository.with_filter_and_remote(
+            repository.filter.clone(),
+            Err(lore_base::error::NoRemote.into()),
+        ));
         match branch::load_name_to_id_local(repository.clone(), &selection.branch_name).await {
             Ok(id) if id == selection.branch => {}
             Ok(_other) => return Err(Error::InvalidSelection),
