@@ -7,6 +7,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 MODULE = pathlib.Path(__file__).resolve().parents[1] / "revision_mount.py"
 SPEC = importlib.util.spec_from_file_location("revision_mount", MODULE)
@@ -88,6 +89,27 @@ class PreflightTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.plan(digest_cache=cache)
         self.assertFalse(self.config.exists())
+
+    def test_bookmark_creation_preserves_existing_and_rejects_unsafe_files(self):
+        plan = self.plan()
+        sidecar = pathlib.Path(str(self.config) + ".bookmark")
+        sidecar.write_bytes(b"existing")
+        with patch.object(mount.subprocess, "run") as run:
+            with self.assertRaises(FileExistsError):
+                mount.write_bookmark(plan, self.root / "helper")
+            run.assert_not_called()
+        self.assertEqual(sidecar.read_bytes(), b"existing")
+        sidecar.unlink()
+
+        def create(*args, **kwargs):
+            sidecar.write_bytes(b"grant")
+            sidecar.chmod(0o644)
+
+        with patch.object(mount.subprocess, "run", side_effect=create):
+            with self.assertRaises(ValueError):
+                mount.write_bookmark(plan, self.root / "helper")
+        sidecar.chmod(0o600)
+        self.assertEqual(sidecar.read_bytes(), b"grant")
 
 
 if __name__ == "__main__":

@@ -8,7 +8,7 @@ use lore::interface::LoreGlobalArgs;
 
 #[derive(Args)]
 pub struct MountArgs {
-    /// Explicitly opt into experimental Linux mounting
+    /// Explicitly opt into experimental mounting
     #[arg(long, required = true)]
     pub experimental: bool,
     /// Revision to resolve once and retain for the mount lifetime
@@ -73,11 +73,61 @@ fn parse_revision(value: &str) -> Result<String, String> {
 }
 
 pub fn handle_mount(globals: LoreGlobalArgs, args: &MountArgs) -> u8 {
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
         let _ = (globals, args);
         crate::eprintln!("Experimental foreground mounts are supported only on Linux.");
         1
+    }
+    #[cfg(target_os = "macos")]
+    {
+        if args.writable || args.reuse || args.remote_contents || args.digest_cache.is_some() {
+            crate::eprintln!(
+                "macOS currently supports only offline pinned read-only mounts without a digest cache."
+            );
+            return 1;
+        }
+        if !globals.offline()
+            || globals.dry_run()
+            || crate::cli::output_formatter().is_some()
+            || globals.identity().is_some()
+            || !globals.identity_token().is_empty()
+            || !globals.access_token().is_empty()
+            || globals.remote()
+            || globals.trust_remote()
+        {
+            crate::eprintln!(
+                "macOS FSKit mounts require --offline and do not support remote options, identity overrides, --json or --dry-run."
+            );
+            return 1;
+        }
+        let Some(helper) = std::env::var_os("LORE_FSKIT_MOUNT_HELPER") else {
+            crate::eprintln!("Set LORE_FSKIT_MOUNT_HELPER to the installed FSKit mount helper.");
+            return 1;
+        };
+        let Some(config_dir) = std::env::var_os("LORE_FSKIT_CONFIG_DIR") else {
+            crate::eprintln!(
+                "Set LORE_FSKIT_CONFIG_DIR to a private directory in the FSKit extension container."
+            );
+            return 1;
+        };
+        let result = std::process::Command::new(helper)
+            .arg(globals.repository_path())
+            .arg(args.revision.as_deref().unwrap_or_default())
+            .arg(&args.mountpoint)
+            .arg(config_dir)
+            .status();
+        return match result {
+            Ok(status) if status.success() => 0,
+            Ok(status) => {
+                crate::eprintln!("FSKit mount helper failed: {status}");
+                1
+            }
+            Err(error) => {
+                crate::eprintln!("Could not start FSKit mount helper: {error}");
+                1
+            }
+        };
     }
     #[cfg(target_os = "linux")]
     {

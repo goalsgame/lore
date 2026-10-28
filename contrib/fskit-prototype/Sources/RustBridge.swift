@@ -144,6 +144,8 @@ private let rustCompletion: @convention(c) (UnsafeMutableRawPointer?, UInt64) ->
 }
 
 private final class RustBootstrap: @unchecked Sendable {
+    private let access: RepositoryScope?
+    init(access: RepositoryScope?) { self.access = access }
     private let lock = NSLock()
     private var continuation: CheckedContinuation<RustSession, Error>?
     private var cancelled = false
@@ -173,12 +175,12 @@ private final class RustBootstrap: @unchecked Sendable {
         guard let continuation else {
             // A cancelled bootstrap returns promptly; late successful setup is
             // cleaned up on this background queue and never becomes a volume.
-            if session != 0 { _ = lore_fskit_session_close(session) }
+            if session != 0 { RepositoryScope.retainIfUncertain(access, status: lore_fskit_session_close(session)) }
             return
         }
         guard status == 0 else { continuation.resume(throwing: RustBridgeError(status: status)); return }
-        do { continuation.resume(returning: try RustSession(retaining: session)) }
-        catch { _ = lore_fskit_session_close(session); continuation.resume(throwing: error) }
+        do { continuation.resume(returning: try RustSession(retaining: session, access: access)) }
+        catch { RepositoryScope.retainIfUncertain(access, status: lore_fskit_session_close(session)); continuation.resume(throwing: error) }
     }
 }
 
@@ -188,14 +190,16 @@ final class RustSession: @unchecked Sendable {
     private var closing = false
     private var closeResult: Int32?
     private var closeWaiters: [CheckedContinuation<Int32, Never>] = []
-    init(retaining value: UInt64) throws {
+    private let access: RepositoryScope?
+    init(retaining value: UInt64, access: RepositoryScope? = nil) throws {
         guard lore_fskit_abi_version() == 1, value != 0 else { throw RustBridgeError(status: 19) }
         self.value = value
+        self.access = access
     }
-    static func open(configPath: String) async throws -> RustSession {
+    static func open(configPath: String, access: RepositoryScope? = nil) async throws -> RustSession {
         guard lore_fskit_abi_version() == 1 else { throw RustBridgeError(status: 19) }
         guard !configPath.isEmpty, configPath.utf8.count <= 4096 else { throw RustBridgeError(status: 6) }
-        let bootstrap = RustBootstrap()
+        let bootstrap = RustBootstrap(access: access)
         let session: RustSession = try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { continuation in
                 guard bootstrap.install(continuation) else { return }
@@ -257,6 +261,7 @@ final class RustSession: @unchecked Sendable {
             guard let session else { return }
             DispatchQueue.global(qos: .utility).async {
                 let status = lore_fskit_session_close(session)
+                RepositoryScope.retainIfUncertain(self.access, status: status)
                 let waiters = self.lock.withLock { () -> [CheckedContinuation<Int32, Never>] in
                     self.closeResult = status
                     let waiters = self.closeWaiters; self.closeWaiters.removeAll()
@@ -269,7 +274,10 @@ final class RustSession: @unchecked Sendable {
     deinit {
         let session = value
         if session != 0 {
-            DispatchQueue.global(qos: .utility).async { _ = lore_fskit_session_close(session) }
+            let access = self.access
+            DispatchQueue.global(qos: .utility).async {
+                RepositoryScope.retainIfUncertain(access, status: lore_fskit_session_close(session))
+            }
         }
     }
 }

@@ -90,7 +90,10 @@ final class ProbeFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         }
         defer { revisionLock.withLock { if loadGeneration == generation { loadingPath = nil } } }
         let session: RustSession
-        do { session = try await RustSession.open(configPath: path) }
+        do {
+            let access = try RepositoryScope.open(configPath: path)
+            session = try await RustSession.open(configPath: path, access: access)
+        }
         catch let error as RustBridgeError {
             throw NSError(domain: "LoreFSKitBootstrap", code: Int(error.status), userInfo: [
                 NSLocalizedDescriptionKey: "Shared Lore revision setup failed (status \(error.status)). The extension must have access to the configured repository, normal credentials and content stores."
