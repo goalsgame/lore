@@ -736,6 +736,7 @@ fn test_group(dir: &TempDir) -> Arc<lore_storage::local::immutable_store::Immuta
         writes: Arc::default(),
         packstore: PackStore::new(Some(dir.to_path_buf()), 1, None),
         flush: tokio::sync::Mutex::new(JoinSet::new()),
+        flush_now: Arc::default(),
         scheduled: std::sync::atomic::AtomicBool::new(false),
         payload_gate: Default::default(),
     })

@@ -280,6 +280,114 @@ async fn accepted_old_connection_is_fenced_when_a_fresh_owner_starts() {
     drop(guard);
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accepted_stop_after_control_admission_closes_acknowledges_only_its_retired_run() {
+    use std::io::Read;
+
+    use lore::remote::message;
+    use lore::remote::network;
+
+    for current in [true, false] {
+        let request = Arc::new(StopRequest::new());
+        let (owner, guard, cleanup) = run(&request);
+        let mut guard = Some(guard);
+        let name = format!("owner-retired-stop-{}-{current}", std::process::id());
+        let listener = network::UdsListener::new(&name).unwrap();
+        let mut client =
+            std::os::unix::net::UnixStream::connect(network::unix::uds_sock_path(&name)).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        lore::remote::connection::serve_owned_connection(
+            owner.clone(),
+            lore::remote::connection::ConnectionId(0),
+            listener.accept().unwrap(),
+        );
+        assert_eq!(owner.state.connection_count(), 1);
+
+        control_stop(owner.clone(), false).await.unwrap();
+        assert_eq!(owner.status().0, lore::service::owner::Phase::ReadyToExit);
+        owner.state.close_and_drain_invocations().await;
+        assert!(owner.state.try_begin_control_invocation().is_none());
+        let replacement = if current {
+            None
+        } else {
+            drop(guard.take());
+            Some(run(&request))
+        };
+        let command = message::MessageToServer {
+            globals: Default::default(),
+            command: lore::remote::command::LoreCommand::ServiceStop(Default::default()),
+            environment: Default::default(),
+        };
+        message::write_payload(&mut client, &message::encode_message(&command)).unwrap();
+        let replies = tokio::task::spawn_blocking(move || {
+            if !current {
+                let mut byte = [0];
+                match client.read(&mut byte) {
+                    Ok(0) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => {}
+                    result => panic!("a stale stop connection must close: {result:?}"),
+                }
+                return Vec::new();
+            }
+            let mut events = Vec::new();
+            loop {
+                let (reply, _) =
+                    message::blocking_read_message::<message::MessageToClient, _>(&mut client)
+                        .unwrap()
+                        .expect("an already retired stop still receives a result");
+                match reply {
+                    message::MessageToClient::Event(lore::interface::LoreEvent::Complete(data)) => {
+                        assert_eq!(data.status, 0);
+                        assert_eq!(data.error.error_code, 0);
+                        events.push("complete");
+                    }
+                    message::MessageToClient::Event(lore::interface::LoreEvent::End(_)) => {
+                        events.push("end");
+                    }
+                    message::MessageToClient::ApiResult(code) => {
+                        assert_eq!(code, 0);
+                        events.push("result");
+                        return events;
+                    }
+                    message::MessageToClient::Event(_) => panic!("unexpected stop acknowledgement"),
+                }
+            }
+        });
+        let events = tokio::time::timeout(Duration::from_secs(10), replies)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            events,
+            if current {
+                vec!["complete", "end", "result"]
+            } else {
+                vec![]
+            }
+        );
+        if let Some((new, _, _)) = &replacement {
+            assert!(!request.is_requested());
+            assert!(new.state.try_begin_invocation().is_some());
+        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while owner.state.connection_count() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(listener);
+        let mut lock = network::unix::uds_sock_path(&name).into_os_string();
+        lock.push(".lock");
+        let _removed = std::fs::remove_file(lock);
+        drop(replacement);
+        drop(cleanup);
+        drop(guard);
+    }
+}
+
 /// Service initialization configures a process-wide storage flush delay, so the
 /// actual run/cancel/restart contract runs in its own normal-harness process.
 #[test]

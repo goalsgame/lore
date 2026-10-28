@@ -9758,3 +9758,53 @@ async fn the_first_flush_writes_a_bucket_emptied_since_its_file_was_written() {
         .expect_err("an evicted entry is not loaded back");
     assert!(matches!(err, StoreError::AddressNotFound(_)));
 }
+
+#[tokio::test]
+async fn explicit_flush_drains_delayed_io_ownership_even_after_cancelled_wait() {
+    use lore_storage::immutable_store::ImmutableStore;
+    for cancelled in [false, true] {
+        let dir = lore_base::test_util::TempDir::new("is_flush_delayed_owner_");
+        let store = LocalImmutableStore::new(
+            Some(dir.path().to_path_buf()),
+            ImmutableStoreSettings {
+                flush_delay_seconds: 3600,
+                ..client_settings()
+            },
+        )
+        .await
+        .unwrap();
+        let owner = Arc::new(());
+        let retained = Arc::downgrade(&owner);
+        let io = lore_io::lease::IoLease::new(owner);
+        io.scope(put_payload(
+            &store,
+            Partition::default(),
+            Context::default(),
+            b"flush owns this write",
+            false,
+        ))
+        .await;
+        drop(io);
+        assert!(retained.upgrade().is_some());
+        if cancelled {
+            let pause = pause_at(PausePoint::Serializing);
+            let mut flush = Box::pin(store.clone().flush(true));
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    () = pause.reached.notified() => {},
+                    result = &mut flush => panic!("flush escaped paused write: {result:?}"),
+                }
+            })
+            .await
+            .unwrap();
+            drop(flush);
+            assert!(retained.upgrade().is_some());
+            pause.resume.notify_one();
+        }
+        tokio::time::timeout(Duration::from_secs(10), store.clone().flush(true))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.upgrade().is_none());
+    }
+}

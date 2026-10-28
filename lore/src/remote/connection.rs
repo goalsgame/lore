@@ -229,6 +229,10 @@ impl IpcConnection {
         #[cfg(not(unix))]
         let admitted = invoke_state.try_begin_invocation();
         let Some(invocation) = admitted else {
+            #[cfg(unix)]
+            if self.reply_to_retired_stop(&command.command).await? {
+                return Ok(());
+            }
             return Err(ConnectionError::internal(
                 "service command admission is closed or control capacity is full",
             ));
@@ -323,5 +327,39 @@ impl IpcConnection {
         }
 
         Ok(())
+    }
+
+    #[cfg(unix)]
+    async fn reply_to_retired_stop(
+        &self,
+        command: &crate::remote::command::LoreCommand,
+    ) -> Result<bool, ConnectionError> {
+        let Some(owner) = self.owner.as_ref() else {
+            return Ok(false);
+        };
+        if !matches!(command, crate::remote::command::LoreCommand::ServiceStop(_))
+            || owner.status().0 != crate::service::owner::Phase::ReadyToExit
+            || owner.stop_request().is_none_or(|stop| !stop.is_current())
+            || owner.actor().is_some_and(|actor| actor.failure().is_some())
+        {
+            return Ok(false);
+        }
+        // Retirement is proven, but this accepted connection can finish its
+        // initial read after control admission closes. A stop needs only the
+        // acknowledgement; it must not reopen admission or affect another run.
+        let complete = LoreEvent::Complete(lore_revision::event::LoreCompleteEventData {
+            status: 0,
+            error: Default::default(),
+        });
+        let end = LoreEvent::End(Default::default());
+        for reply in [
+            MessageToClient::Event(&complete),
+            MessageToClient::Event(&end),
+            MessageToClient::ApiResult(0),
+        ] {
+            let stream = self.connection.try_clone().internal("cloning connection")?;
+            self.send_message(stream, encode_message(&reply)).await?;
+        }
+        Ok(true)
     }
 }

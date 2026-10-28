@@ -930,7 +930,7 @@ impl RepositoryContext {
     }
 
     /// Spawn a background task that flushes pending store writes to disk.
-    /// Called by the client dispatcher after a command completes.
+    /// Called by the client dispatcher before its terminal callback.
     ///
     /// The immutable store is flushed unconditionally: read-only commands
     /// can still dirty it by caching remote-fetched fragments locally (see
@@ -954,7 +954,16 @@ impl RepositoryContext {
     /// the repository flock while it claims a store again — the reverse of the
     /// order every command takes them in, and a deadlock against a command in
     /// another process holding that store and waiting for the repository.
-    pub fn try_spawn_post_command_flush(&self, sync_data: bool) {
+    ///
+    /// Working commands await completion so their admission cannot outlive the
+    /// terminal callback. Cancellation leaves the guarded flush running.
+    pub async fn post_command_flush(&self, sync_data: bool) {
+        let (completed, completion) = if self.working_admission.is_some() {
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            (Some(sender), Some(receiver))
+        } else {
+            (None, None)
+        };
         let immutable_store = self.immutable_store.clone();
         let mutable_store = self
             .write_token
@@ -967,16 +976,24 @@ impl RepositoryContext {
                 as Arc<dyn std::any::Any + Send + Sync>,
             || {
                 lore_spawn_guarded!(async move {
-                    let _ = immutable_store.flush(sync_data).await;
-                    if let Some(mutable_store) = mutable_store {
-                        let _ = mutable_store.flush(sync_data).await;
+                    let _ = immutable_store.clone().flush(sync_data).await;
+                    if let Some(mutable_store) = &mutable_store {
+                        let _ = mutable_store.clone().flush(sync_data).await;
                     }
                     // The repository flock first, then the store claims it was taken inside.
                     drop(repo_lock);
                     drop(own_stores);
+                    drop(immutable_store);
+                    drop(mutable_store);
+                    if let Some(completed) = completed {
+                        let _delivered = completed.send(());
+                    }
                 });
             },
         );
+        if let Some(completion) = completion {
+            let _completed = completion.await;
+        }
     }
 
     /// Keeps this context's stores for `duration`, as [`keep_stores_alive`] describes. Called

@@ -14,6 +14,7 @@ use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use futures::FutureExt;
 use lore_base::allocator::GrowVec;
 use lore_error_set::prelude::*;
 use tokio::sync::Mutex;
@@ -221,6 +222,8 @@ pub struct MutableStoreGroup {
     /// The set is also its own reaping: `try_join_next` clears finished tasks, where
     /// an `Option<JoinHandle>` needs an `is_finished` poll to do the same job.
     pub flush: Mutex<JoinSet<()>>,
+    /// Wakes the currently scheduled sweep when an explicit flush drains it.
+    pub flush_now: Arc<tokio::sync::Notify>,
     /// Whether a delayed flush is due for this group and has not yet begun its sweep.
     ///
     /// A writer that flags a bucket schedules a sweep only when it is the one to set this,
@@ -1147,6 +1150,7 @@ impl LocalMutableStore {
                 layout: RwLock::new(()),
                 writes: Arc::default(),
                 flush: Mutex::new(JoinSet::new()),
+                flush_now: Arc::new(tokio::sync::Notify::new()),
                 scheduled: AtomicBool::new(false),
             }));
         }
@@ -1440,6 +1444,21 @@ impl LocalMutableStore {
         }
     }
 
+    // An explicit flush has already written the dirty buckets. Wake and join
+    // queued sweeps so their IO ownership ends without waiting out their delays.
+    // Workers never take this scheduling mutex; cancellation leaves them owned
+    // by the JoinSet for the next successful flush to drain.
+    async fn drain_scheduled_flushes(&self) {
+        for group in &self.group {
+            let mut scheduled = group.flush.lock().await;
+            if !scheduled.is_empty() {
+                group.flush_now.notify_one();
+                while scheduled.join_next().await.is_some() {}
+                let _unused_wake = group.flush_now.notified().now_or_never();
+            }
+        }
+    }
+
     /// Schedules the group's delayed flush unless one is scheduled, for a bucket a write has just
     /// flagged, whether or not it was flagged before: a sweep that fails leaves its buckets flagged
     /// and none scheduled. The writer sets the bucket's flag itself, under its write lock.
@@ -1483,7 +1502,16 @@ impl LocalMutableStore {
     /// it was about to write had already been invalidated and must not reach disk.
     #[lore_macro::test_pub]
     async fn flush_delayed(weak_ref: Weak<LocalMutableStore>, group_index: usize, delay: u64) {
-        tokio::time::sleep(Duration::from_secs(delay)).await;
+        let Some(wake) = weak_ref
+            .upgrade()
+            .map(|store| store.group[group_index].flush_now.clone())
+        else {
+            return;
+        };
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_secs(delay)) => {},
+            () = wake.notified() => {},
+        }
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::MutableDelayedFlush);
         if let Some(store) = weak_ref.upgrade()
@@ -2329,6 +2357,7 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         }
         if !flagged {
             self.note_flushed();
+            self.drain_scheduled_flushes().await;
             return Ok(());
         }
         let hold = self.hold(Intent::Write).await?;
@@ -2342,6 +2371,9 @@ impl crate::mutable_store::MutableStore for LocalMutableStore {
         // stays flagged, and keeps the store claimed.
         drop(hold);
         self.note_flushed();
+        if flushed.is_ok() {
+            self.drain_scheduled_flushes().await;
+        }
         flushed
     }
 }
