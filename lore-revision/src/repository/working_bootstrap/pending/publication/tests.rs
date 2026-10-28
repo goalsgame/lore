@@ -650,11 +650,12 @@ async fn setup_completion_waits_for_actual_io_after_a_cancelled_wait() {
         .await
         .unwrap()
         .unwrap();
-    let mut prepared = permit.prepare(&provider).unwrap();
-    prepared.release_client().unwrap();
-    f.success.store(true, Ordering::Release);
-    let cleanup = prepared.commit().unwrap();
-    drop(prepared);
+    let cleanup = {
+        let mut prepared = permit.prepare(&provider).unwrap();
+        prepared.release_client().unwrap();
+        f.success.store(true, Ordering::Release);
+        prepared.commit().unwrap()
+    };
     drop(cleanup);
     drop(permit);
     drop(context);
