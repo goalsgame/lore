@@ -23,6 +23,9 @@ pub struct ConnectionId(pub usize);
 
 #[derive(Default)]
 pub struct AttributeMap {
+    /// Legacy storage requests retain a read guard through dispatch; reconnects
+    /// replace the repository, verified token and grants under a write guard.
+    pub(crate) storage_authorization: Arc<tokio::sync::RwLock<()>>,
     map: Arc<RwLock<AnyMap>>,
     updated: tokio::sync::watch::Sender<()>,
 }
