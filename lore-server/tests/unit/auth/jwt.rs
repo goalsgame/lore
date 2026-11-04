@@ -1432,7 +1432,7 @@ mod name_scoped_create {
             .into();
         let resources = vec![entry("urc-name:goalables/*", &["create", "read"])];
         assert!(!matcher.any_match(&resources, repository));
-        assert!(!matcher.permits(&resources, repository, "read"));
+        assert!(!matcher.permits(&resources, repository, Action::Read));
         assert!(
             matcher
                 .merged_permissions(&resources, repository)
