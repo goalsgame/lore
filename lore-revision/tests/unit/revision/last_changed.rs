@@ -228,8 +228,9 @@ async fn history_at(
 /// the second parent's latest added records no first-parent change and reports the second
 /// parent's. A file the second parent added earlier and modified in its latest records the add
 /// on its first-parent line and the modification on the second, and reports the modification,
-/// including one that changes only the file's mode. All hold in the merge and in a later revision
-/// that leaves the files alone.
+/// including one that changes only the file's mode, one that moves it to another directory under
+/// the same name and one that changes only the case of its name. All hold in the merge and in a
+/// later revision that leaves the files alone.
 #[tokio::test]
 async fn a_divergent_merge_reports_the_newest_second_parent_change() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
@@ -266,6 +267,30 @@ async fn a_divergent_merge_reports_the_newest_second_parent_change() {
             "chmod.txt",
         )
         .await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("moved.txt"),
+            "moved.txt",
+        )
+        .await;
+        let destination = add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            in_memory::directory("dest"),
+            "dest",
+        )
+        .await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("case.txt"),
+            "case.txt",
+        )
+        .await;
         let local_added = commit(&repository, &state, base, local).await;
 
         let state = revision_state(&repository, local_added).await;
@@ -294,6 +319,16 @@ async fn a_divergent_merge_reports_the_newest_second_parent_change() {
             )
             .await
             .expect("staging the mode change");
+        let moved = node_id_at(&state, &repository, "moved.txt").await;
+        state
+            .move_node(repository.clone(), moved, destination, "moved.txt")
+            .await
+            .expect("moving the file");
+        let renamed = node_id_at(&state, &repository, "case.txt").await;
+        state
+            .move_node(repository.clone(), renamed, ROOT_NODE, "Case.txt")
+            .await
+            .expect("renaming the file");
         add(
             &state,
             repository.clone(),
@@ -350,22 +385,28 @@ async fn a_divergent_merge_reports_the_newest_second_parent_change() {
                 (local_added, local_latest),
                 "edited.txt history as of {revision}"
             );
-            assert_eq!(
-                history_at(&repository, revision, "chmod.txt").await,
-                (local_added, local_latest),
-                "chmod.txt history as of {revision}"
-            );
+            for path in ["chmod.txt", "dest/moved.txt", "Case.txt"] {
+                assert_eq!(
+                    history_at(&repository, revision, path).await,
+                    (local_added, local_latest),
+                    "{path} history as of {revision}"
+                );
+            }
         }
 
         for (revision, path, expected) in [
             (merge, "local.txt", local_latest),
             (merge, "edited.txt", local_latest),
             (merge, "chmod.txt", local_latest),
+            (merge, "dest/moved.txt", local_latest),
+            (merge, "Case.txt", local_latest),
             (merge, "remote.txt", merge),
             (merge, "base.txt", base),
             (after, "local.txt", local_latest),
             (after, "edited.txt", local_latest),
             (after, "chmod.txt", local_latest),
+            (after, "dest/moved.txt", local_latest),
+            (after, "Case.txt", local_latest),
             (after, "remote.txt", merge),
             (after, "base.txt", after),
         ] {

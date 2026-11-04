@@ -1294,16 +1294,18 @@ pub async fn tree(
 ///
 /// File metadata holds a first-parent and a second-parent change. The first-parent change is the
 /// answer unless only the second-parent one is recorded, or only the second-parent revision holds
-/// the node as it is now, compared by [`entry_attributes`], as for a node a merge of divergent
+/// the node as it is now, compared by [`EntryAttributes`] and its path, as for a node a merge of divergent
 /// history takes from its second parent after that parent changed it again.
 ///
 /// Reads one delta block per distinct state and one file metadata block per run of nodes in the
-/// same block, plus one node per recorded revision where both changes are recorded, so resolving
-/// the entries of a listing never walks history.
+/// same block. Where both changes are recorded, it also reads the node and its path in each
+/// recorded revision, once per distinct revision and node. Resolving the entries of a listing
+/// never walks history.
 pub struct LastChangedResolver {
     repository: Arc<RepositoryContext>,
     states: HashMap<(RepositoryId, Hash), LastChangedState>,
     history_states: HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
+    history_entries: HashMap<(RepositoryId, Hash, NodeID), Option<(EntryAttributes, String)>>,
 }
 
 struct LastChangedState {
@@ -1320,6 +1322,7 @@ impl LastChangedResolver {
             repository,
             states: HashMap::new(),
             history_states: HashMap::new(),
+            history_entries: HashMap::new(),
         }
     }
 
@@ -1379,22 +1382,32 @@ impl LastChangedResolver {
             });
         }
 
-        let current = entry_attributes(
-            &entry
+        let current = Some((
+            entry_attributes(
+                &entry
+                    .state
+                    .node(entry.repository.clone(), link.node)
+                    .await?,
+            ),
+            entry
                 .state
-                .node(entry.repository.clone(), link.node)
+                .node_path(entry.repository.clone(), link.node)
                 .await?,
-        );
+        ));
         let repository = entry.repository.clone();
         for slot in 0..2 {
-            let held = node_in(
-                &mut self.history_states,
-                &repository,
-                history.revision[slot],
-                history.node[slot],
-            )
-            .await;
-            if held.as_ref().map(entry_attributes) == Some(current) {
+            let key = (repository.id, history.revision[slot], history.node[slot]);
+            if !self.history_entries.contains_key(&key) {
+                let held = entry_in(
+                    &mut self.history_states,
+                    &repository,
+                    history.revision[slot],
+                    history.node[slot],
+                )
+                .await;
+                self.history_entries.insert(key, held);
+            }
+            if self.history_entries[&key] == current {
                 return Ok(history.revision[slot]);
             }
         }
@@ -1403,9 +1416,11 @@ impl LastChangedResolver {
 }
 
 /// The attributes of a node whose change a commit records as a change of the entry: its kind,
-/// name, mode, size and address, and for a link the node it targets. Staging and dirty
-/// tracking flags are left out.
-fn entry_attributes(node: &Node) -> (u16, u64, u16, u64, Address, NodeID) {
+/// case-insensitive name hash, mode, size and address, and for a link the node it targets.
+/// Staging and dirty tracking flags are left out.
+type EntryAttributes = (u16, u64, u16, u64, Address, NodeID);
+
+fn entry_attributes(node: &Node) -> EntryAttributes {
     let kind = node.flags & (NodeFlags::File.bits() | NodeFlags::Link.bits());
     let target = if node.is_link() { node.child } else { 0 };
     (
@@ -1418,14 +1433,14 @@ fn entry_attributes(node: &Node) -> (u16, u64, u16, u64, Address, NodeID) {
     )
 }
 
-/// Node `node_id` of `revision`, or `None` when the revision cannot be read or holds no such
-/// node.
-async fn node_in(
+/// The attributes and path of node `node_id` of `revision`, or `None` when the revision cannot
+/// be read or holds no such node.
+async fn entry_in(
     states: &mut HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
     repository: &Arc<RepositoryContext>,
     revision: Hash,
     node_id: NodeID,
-) -> Option<Node> {
+) -> Option<(EntryAttributes, String)> {
     let state = match states.entry((repository.id, revision)) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -1433,7 +1448,9 @@ async fn node_in(
         }
     }
     .as_ref()?;
-    state.node(repository.clone(), node_id).await.ok()
+    let node = state.node(repository.clone(), node_id).await.ok()?;
+    let path = state.node_path(repository.clone(), node_id).await.ok()?;
+    Some((entry_attributes(&node), path))
 }
 
 /// What a revision specifier names on a branch.
