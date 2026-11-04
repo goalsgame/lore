@@ -65,7 +65,11 @@ async fn expired_writer_is_rejected_before_dispatch() {
     let service = service().await;
     let repository = random::<RepositoryId>();
     let context = connected(repository, &["write"]);
-    let mut token = context.get::<AuthorizationToken>().unwrap();
+    let mut token = context
+        .get::<AuthorizationToken>()
+        .unwrap()
+        .as_ref()
+        .clone();
     token.expires = 0;
     context.insert(token);
     assert!(refused(
