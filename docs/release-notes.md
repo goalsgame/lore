@@ -7,6 +7,57 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
 
 ### Breaking changes
 
+- `lore-server`: with authorization configured, operations that change a partition check for the `write` permission.
+  Any permission on a partition still allows reading it, but no longer allows writing. Servers without authorization
+  configured allow every caller to read, write and administer repositories
+- `lore-server`: changing branch protection, through branch protect and unprotect or by setting the `protect` key in
+  branch metadata, needs `owner` or `admin` on the repository, or `write` for its creator. Previously anyone with
+  access to the repository could set the branch protection rules
+- `lore-server`: vending a presigned URL needs the `presign` permission on the repository instead of the
+  `is_service_account` token claim. Servers without authorization configured still allow every caller to vend
+- Server hooks: `Hook::pre_handler` is now `async`, so a pre-handler can call other services without blocking a worker
+  thread. Custom hooks must make their `pre_handler` async and rebuild. A pre-handler is cancelled at its timeout
+  (1 second, or the hook's own `pre_handler_timeout`), and a timeout now fails the request with `UNAVAILABLE` instead of
+  `INTERNAL`
+- A client connected to a `lores://` remote refuses to connect, failing with `NotSupported`, if the server advertises a
+  storage, revision, lock, repository, or notification endpoint whose scheme doesn't authenticate the server, such as
+  `lore://`. It used to connect to that endpoint without validating its certificate, and for gRPC without TLS. A
+  server that advertises these endpoints must give them a scheme that authenticates the server, such as `lores://`
+
+### Features
+
+- `lore-server`: forward the lock service's `Query` to a remote Lore server, opt-in via `lock_query` under
+  `[server.grpc_public_services.forwarded_requests.enabled_rpcs]`. The peer serves it only when it has a lock store
+- QUIC connections to replication peers configured under `[immutable_store.composite.replica_factory]` start with a
+  1 MiB initial congestion window, set with `initial_cwnd_bytes`. Values below 2400 bytes are rejected at startup. A
+  periodically refreshed connection starts at no less than this window
+- `lore-server`: connections accepted by `[server.quic_internal]` start sending responses with a 1 MiB congestion
+  window. Set it per endpoint with `initial_cwnd_bytes`; `[server.quic]` keeps its congestion controller's default
+  unless set. Values below 2400 bytes are rejected at startup
+
+### Fixes & Improvements
+
+- A revision named by number, such as `<branch>@<number>`, resolves from the first page the remote returns for it,
+  rather than walking the branch's history back from its latest revision one page at a time
+- Following a branch's history through the remote no longer takes the revisions a page holds above the one it was
+  asked for as that revision's ancestors. A page the server serves from a cached segment holds them, and finding the
+  revision two branches share could answer with one of them, newer than the one they really share
+- On Windows, a Lore service started while another serves the same socket exits without serving, as it does on Linux
+  and macOS. It used to take the socket over and leave the first service running unreachable, holding its SWFS mounts
+  until killed, so commands that each started a service at the same moment could leave one behind per extra command
+- A branch push reads each mutable store key once, loads the branch alongside the pushed revision, and checks the
+  branch name while it verifies the revision's fragments rather than before, so a push spends fewer store round trips
+  before it moves the branch. A push the server refuses because the branch is protected no longer reinstates the name
+  of a deleted branch first
+- The deprecated `urc.rpc` `BranchPush` RPC treats a missing or deleted branch as `lore.revision.v1` `BranchPush`
+  does: a branch without metadata is `NOT_FOUND` rather than an internal error, and a push to a deleted branch
+  reinstates its name, or fails with `ALREADY_EXISTS` when another branch holds the name, rather than failing with
+  `NOT_FOUND`
+
+## v0.12.0 (Oct 26th 2026) [#1966]
+
+### Breaking changes
+
 ### Features
 
 - `lore service run` runs the Lore service in the current process, returning once it stops, whether by
@@ -18,8 +69,17 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   §6) on the next operation, without a new `lore auth login`. The provider's rotated refresh token replaces the used
   one, and a refresh token the provider refuses is dropped, so the next operation asks for a new login. A client
   credentials login stores no refresh token
+- `lore auth logout` (C API: `lore_auth_logout`) revokes an OIDC login's refresh token at the provider (OAuth 2.0
+  token revocation, RFC 7009) if the provider advertises a revocation endpoint. A failed revocation, such as at an
+  unreachable provider, now fails the logout, after the login is removed from this machine
 
 ### Fixes & Improvements
+
+- Clone and sync continue materializing available files after an individual write fails, restoring
+  the behavior established by UCS-14675. Failures are reported and the command still exits nonzero.
+
+- `lore file obliterate` warns before deleting content needed by an active branch’s latest revision, including
+  shared child fragments. Incomplete checks report unknown impact; the administrative deletion still proceeds.
 
 - `lore repository verify` fails where it can't read part of the local store, where it passed over it, and checks and
   heals every fragment a flush in the same process moves to other index buckets meanwhile
@@ -52,6 +112,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   remote
 - `lore repository gc --dry-run` collects no garbage, where it evicted and compacted the local store, and
   `repository verify --heal --dry-run` heals nothing, reporting what it finds as `repository verify` does
+- `lore auth login --dry-run` authenticates and stores no token, and `auth logout --dry-run` and `auth clear --dry-run`
+  remove no token, where all three changed the token store
 - Processes running commands on one repository or shared store at once, such as several `lore history`, no longer wait
   on each other forever. A command whose process still had the immutable store open from the previous command, and not
   the mutable store, took the mutable store's lock before the immutable store's, against a process holding the immutable
@@ -65,6 +127,8 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   (RUSTSEC-2026-0285). A forged ServerHello no longer makes later connections to the same server offer only a classical
   key share, which a server could accept without post-quantum key exchange (RUSTSEC-2026-0349). Debug output of a
   client session leaves out its secrets (RUSTSEC-2026-0346)
+- `lore stage --case keep` of several paths under a directory spelled in another case than the repository's stages them
+  as modified under the repository's case, where on a case-sensitive file system it staged them as deleted
 
 ## v0.11.0 (Oct 21st 2026) [#1892]
 
@@ -297,6 +361,10 @@ Release notes for the open source Lore project. Releases before v0.8.4 predate t
   completes. `data_out` must stay valid until completion, and `lore_shutdown` is safe only once every call has
   completed, as `lore.h` now documents, correcting its earlier claim that argument memory could be freed once an
   asynchronous call returned
+- `lore-server`: server-to-server QUIC traffic uses Cubic congestion control throughout. The internal QUIC server,
+  the replicated immutable store's client and replication clients to peers in every region now use Cubic, where the
+  server and cross-region clients used BBR. Cubic only shrinks the congestion window on packet loss, so a connection
+  that sits quiet between bursts keeps its window rather than having it drained. The public QUIC server keeps BBR
 
 ## v0.10.1 (Oct 5th 2026) [#1475]
 

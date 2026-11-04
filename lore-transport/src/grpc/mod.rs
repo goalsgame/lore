@@ -7,7 +7,10 @@ mod environment_client;
 pub mod environment_client;
 mod lock_client;
 mod repository_client;
+#[cfg(not(feature = "test-util"))]
 mod revision_client;
+#[cfg(feature = "test-util")]
+pub mod revision_client;
 #[cfg(not(feature = "test-util"))]
 mod storage_client;
 #[cfg(feature = "test-util")]
@@ -60,6 +63,7 @@ use crate::connection::RECONNECT_MAX_ATTEMPTS;
 use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::SuppliedCredentials;
+use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
 use crate::traits::*;
 use crate::types::*;
@@ -732,8 +736,7 @@ pub async fn connect(
         .host_str()
         .ok_or_else(|| ProtocolError::internal(format!("remote {remote_url} is invalid")))?;
 
-    // Possible HTTPS schemes: urcs, grpcs, lores
-    let (scheme, default_port) = if parsed_url.scheme().ends_with("s") {
+    let (scheme, default_port) = if authenticates_server(&parsed_url) {
         ("https", GRPCS_PORT_DEFAULT)
     } else {
         ("http", GRPC_PORT_DEFAULT)
@@ -1536,6 +1539,18 @@ impl Revision for GRPCRevision {
         with_reconnect(
             &self.connection,
             || async { self.client.read().await.branch_list().await },
+            |reconnect_id| self.reconnect(reconnect_id),
+        )
+        .await
+    }
+
+    async fn branch_list_bounded(
+        &self,
+        limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        with_reconnect(
+            &self.connection,
+            || async { self.client.read().await.branch_list_bounded(limit).await },
             |reconnect_id| self.reconnect(reconnect_id),
         )
         .await

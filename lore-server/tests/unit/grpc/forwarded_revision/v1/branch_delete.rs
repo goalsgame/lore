@@ -65,7 +65,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         repository_context.clone(),
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
@@ -103,6 +103,7 @@ fn make_forwarded_request(
     CallerContext {
         repository_id: repository,
         user_id: "alice".into(),
+        is_service_account: false,
         correlation_id: String::new(),
         authorization: None,
     }

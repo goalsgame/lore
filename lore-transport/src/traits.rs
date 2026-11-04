@@ -286,6 +286,17 @@ pub trait Revision: Send + Sync {
     /// List all branches
     async fn branch_list(&self) -> Result<BranchListResponse, ProtocolError>;
 
+    /// List at most `limit` branches. `None` means enumeration exceeded the limit.
+    /// Implementations must stop consuming the stream when the limit is exceeded.
+    async fn branch_list_bounded(
+        &self,
+        _limit: usize,
+    ) -> Result<Option<BranchListResponse>, ProtocolError> {
+        Err(ProtocolError::from(lore_base::error::NotSupported {
+            operation: "bounded branch listing".to_string(),
+        }))
+    }
+
     async fn revision_list(
         &self,
         signature: RevisionListStart,
@@ -446,6 +457,17 @@ pub trait Authentication: Send + Sync {
         refresh_token: &str,
         correlation_id: &str,
     ) -> Result<AuthenticationToken, ProtocolError>;
+
+    /// Revokes the refresh token of a login at the auth backend.
+    ///
+    /// Fails with [`NotSupported`](lore_base::error::NotSupported) when the backend offers no
+    /// revocation.
+    async fn revoke_refresh_token(
+        &self,
+        auth_url: &str,
+        refresh_token: &str,
+        correlation_id: &str,
+    ) -> Result<(), ProtocolError>;
 
     /// Exchanges an authentication token for an authorization token scoped
     /// to the given repository.

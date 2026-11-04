@@ -20,7 +20,6 @@ use lore_revision::store::composite::replica_factory::ReplicaTargets;
 use lore_revision::util::time::RetryPolicy;
 use lore_transport::make_user_agent_with_component;
 use lore_transport::quic::client::CertificateSettings as QuicCertificateSettings;
-use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::DEFAULT_EXPECTED_RTT_MS;
 use lore_transport::user_agent_product;
 use opentelemetry::KeyValue;
@@ -30,6 +29,8 @@ use tonic::transport::Channel;
 use tonic::transport::ClientTlsConfig;
 
 use crate::quic::client_monitor::default_quic_client_monitor_interval_secs;
+use crate::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::replication_store_service::client_container;
 use crate::quic::replication_store_service::client_container::ClientContainerConfig;
 use crate::store::grpc_replica::GrpcReplica;
@@ -63,6 +64,10 @@ pub struct ReplicaFactorySettings {
     /// for peers with the `SameRegion` locality.
     #[serde(default = "default_enable_same_region_write")]
     pub enable_same_region_write: bool,
+    /// Initial congestion window, in bytes, for a new QUIC replica connection, and the floor for
+    /// the window a periodically refreshed connection carries over.
+    #[serde(default = "default_initial_cwnd_bytes")]
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 fn default_read_replicas_enabled() -> bool {
@@ -77,6 +82,10 @@ fn default_enable_same_region_write() -> bool {
     true
 }
 
+fn default_initial_cwnd_bytes() -> InitialCwndBytes {
+    DEFAULT_PEER_INITIAL_CWND_BYTES
+}
+
 #[derive(Debug)]
 pub struct ReplicationStoreTargetFactory {
     grpc_tls: Option<ClientTlsConfig>,
@@ -87,6 +96,7 @@ pub struct ReplicationStoreTargetFactory {
     use_grpc_write_replication: bool,
     pub quic_monitor_interval: Duration,
     pub enable_same_region_write: bool,
+    pub initial_cwnd_bytes: InitialCwndBytes,
 }
 
 impl ReplicationStoreTargetFactory {
@@ -107,6 +117,7 @@ impl ReplicationStoreTargetFactory {
             use_grpc_write_replication,
             quic_monitor_interval: Duration::from_secs(default_quic_client_monitor_interval_secs()),
             enable_same_region_write: true,
+            initial_cwnd_bytes: DEFAULT_PEER_INITIAL_CWND_BYTES,
         }
     }
 
@@ -162,26 +173,10 @@ impl ReplicationStoreTargetFactory {
             None
         };
 
-        let (rtt_ms, congestion_algorithm, user_agent_component) = match peer_info.locality {
-            // Communication within a region will have no packet loss
-            // so we don't need to worry about Cubic's aggressive ramp down
-            // of cwnd in the event of packet loss - we don't see it happening.
-            // The benefit of Cubic is that it only adjusts the cwnd in the event of
-            // packet loss. So quiet periods of time don't inadvertently scale down
-            // the cwnd then get blindsided by a large get/put message causing latency spikes.
-            // We want same region replication to be as fast as possible
-            Locality::SameRegion => (10, CongestionAlgorithm::Cubic, "replication-same-region"),
+        let (rtt_ms, user_agent_component) = match peer_info.locality {
+            Locality::SameRegion => (10, "replication-same-region"),
             // todo(plockhart) configure expected_rtt_ms based off latency to replication target
-            //
-            // We see packet loss in cross region communication. Bbr readjusts the cwnd within
-            // a few cycles of RTT, much faster than Cubic at recoverying from packet loss, at
-            // the expensive that periodically the internals of the algorithm ramp down cwnd
-            // based off bandwidth usage (which means quiet periods inadvertently reduce cwnd)
-            Locality::OtherRegion => (
-                DEFAULT_EXPECTED_RTT_MS,
-                CongestionAlgorithm::Bbr,
-                "replication-other-region",
-            ),
+            Locality::OtherRegion => (DEFAULT_EXPECTED_RTT_MS, "replication-other-region"),
         };
 
         let mut factory =
@@ -191,7 +186,7 @@ impl ReplicationStoreTargetFactory {
         factory.quic_max_reconnects = Some(5);
         factory.sni_override = sni_override;
         factory.transport_config.expected_rtt_ms = rtt_ms;
-        factory.transport_config.congestion_algorithm = congestion_algorithm;
+        factory.transport_config.initial_cwnd = Some(self.initial_cwnd_bytes.get());
         factory.user_agent = Some(make_user_agent_with_component(
             user_agent_product(),
             user_agent_component,
