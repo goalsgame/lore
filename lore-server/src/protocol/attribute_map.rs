@@ -28,9 +28,9 @@ pub struct AttributeMap {
 }
 
 impl AttributeMap {
-    /// Notified every time an attribute is inserted.
+    /// Notified every time an attribute is inserted or removed.
     ///
-    /// The sender is held privately so that a notification means an insert happened, which is what
+    /// The sender is held privately so that a notification means an attribute changed, which is what
     /// lets an observer treat one as "the attributes I derived from this have changed".
     pub fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
         self.updated.subscribe()
@@ -63,6 +63,19 @@ impl AttributeMap {
 
         // Notified with the lock released: a subscriber reads the map as soon as it wakes, so
         // notifying while still holding it invites the subscriber to block on this very insert.
+        let _ = self.updated.send(());
+    }
+
+    pub fn remove<T: Send + Sync + 'static>(&self) {
+        match self.map.write() {
+            Ok(mut map) => {
+                map.remove(&TypeId::of::<T>());
+            }
+            Err(error) => {
+                warn!("Failed to get write lock when removing an attribute: {error:?}");
+                return;
+            }
+        }
         let _ = self.updated.send(());
     }
 

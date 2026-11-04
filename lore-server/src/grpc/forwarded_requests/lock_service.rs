@@ -23,13 +23,9 @@ pub struct GrpcForwardedLockServiceClient {
 }
 
 impl GrpcForwardedLockServiceClient {
-    pub fn new(channel: Channel) -> Self {
-        // The origin re-encodes the response under its own
-        // `lock_service.general.max_encoding_message_size`, which is what bounds
-        // what its client receives. tonic's 4 MiB decode default would otherwise
-        // refuse a query result the origin is configured to serve.
-        let client =
-            ProtoForwardedLockServiceClient::new(channel).max_decoding_message_size(usize::MAX);
+    pub fn new(channel: Channel, max_response_bytes: usize) -> Self {
+        let client = ProtoForwardedLockServiceClient::new(channel)
+            .max_decoding_message_size(max_response_bytes);
         Self { client }
     }
 }

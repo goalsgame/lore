@@ -174,9 +174,16 @@ impl CallerContext {
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct ForwardedRequestsSettings {
+    /// Maximum decoded response size for forwarded lock queries, in bytes.
+    #[serde(default = "default_max_lock_response_bytes")]
+    pub max_lock_response_bytes: usize,
     pub client: GrpcInternalClientSettings,
     #[serde(default)]
     pub enabled_rpcs: RpcFlags,
+}
+
+fn default_max_lock_response_bytes() -> usize {
+    64 * 1024 * 1024
 }
 
 #[derive(Clone, Default, Debug, Deserialize)]
@@ -244,6 +251,7 @@ async fn make_channel(settings: &GrpcInternalClientSettings) -> Result<Channel, 
 }
 
 pub struct GrpcForwardedRequests {
+    max_lock_response_bytes: usize,
     channel: Channel,
     flags: RpcFlags,
 }
@@ -255,6 +263,7 @@ impl GrpcForwardedRequests {
         Ok(Self {
             channel,
             flags: settings.enabled_rpcs.clone(),
+            max_lock_response_bytes: settings.max_lock_response_bytes,
         })
     }
 }
@@ -275,7 +284,8 @@ impl ForwardedRequests for GrpcForwardedRequests {
     }
 
     fn forwarded_lock_service(&self) -> Box<dyn ForwardedLockServiceClient> {
-        let client = GrpcForwardedLockServiceClient::new(self.channel.clone());
+        let client =
+            GrpcForwardedLockServiceClient::new(self.channel.clone(), self.max_lock_response_bytes);
         Box::new(client)
     }
 }

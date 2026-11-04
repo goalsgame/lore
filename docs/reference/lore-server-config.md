@@ -375,6 +375,11 @@ key here is ignored, so a name that is not yet forwardable forwards nothing.
 its own `[lock_store]` is at a mode other than `none`; otherwise it answers
 `UNIMPLEMENTED`, which the forwarding server relays to its client.
 
+`max_lock_response_bytes` under `[server.grpc_public_services.forwarded_requests]`
+bounds each forwarded lock response during decoding (default 64 MiB). Oversized
+responses fail before they are forwarded to the caller. This is independent of
+the public lock service's outbound encoding limit.
+
 `[server.grpc_public_services.forwarded_requests.client]` configures the channel to
 the peer. The defaults suit a long-lived connection that sits idle between
 forwards; tune them to the path the peer is actually reached over:

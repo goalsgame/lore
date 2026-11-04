@@ -110,6 +110,7 @@ impl Message for Connect {
                         .map_err(|status| {
                             MessageHandleError::AuthorizationFailure(status.message().to_string())
                         })?;
+                    context.remove::<PartitionGrants>();
                     if let Some(grants) = grants {
                         context.insert(PartitionGrants {
                             repository_id: self.repository,
@@ -128,19 +129,20 @@ impl Message for Connect {
                     return Err(MessageHandleError::MissingToken);
                 }
             }
-        } else if let Some(grants) = repository_authorizer
-            .granted_access(None, self.repository)
-            .await
-            .map_err(|status| {
-                MessageHandleError::AuthorizationFailure(status.message().to_string())
-            })?
-        {
-            // Enumerated without a token too, so each command is a set lookup
-            // rather than an authorizer call.
-            context.insert(PartitionGrants {
-                repository_id: self.repository,
-                grants,
-            });
+        } else {
+            let grants = repository_authorizer
+                .granted_access(None, self.repository)
+                .await
+                .map_err(|status| {
+                    MessageHandleError::AuthorizationFailure(status.message().to_string())
+                })?;
+            context.remove::<PartitionGrants>();
+            if let Some(grants) = grants {
+                context.insert(PartitionGrants {
+                    repository_id: self.repository,
+                    grants,
+                });
+            }
         }
 
         // A first connect, or a reconnect to the same repository; the

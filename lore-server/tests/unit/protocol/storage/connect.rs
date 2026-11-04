@@ -277,6 +277,65 @@ mod authorized_connect {
         assert!(context.get::<AuthorizationToken>().is_some());
     }
 
+    struct SelectiveEnumeration;
+
+    #[async_trait]
+    impl RepositoryAuthorizer for SelectiveEnumeration {
+        async fn check_repository_access(
+            &self,
+            token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
+            repository: RepositoryId,
+            action: Action,
+        ) -> Result<(), tonic::Status> {
+            AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                .check_repository_access(token, repository, action)
+                .await
+        }
+
+        async fn granted_actions(
+            &self,
+            token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
+            repository: RepositoryId,
+        ) -> Result<Option<lore_server::authnz::repository_authorizer::Grants>, tonic::Status>
+        {
+            if self
+                .check_repository_access(token, repository, Action::Write)
+                .await
+                .is_err()
+            {
+                return Ok(None);
+            }
+            AuthClientAuthorizer::new("https://auth.invalid".to_string())
+                .granted_actions(token, repository)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn reconnect_to_a_reader_discards_enumerated_writer_grants() {
+        let repository = random::<RepositoryId>();
+        let context = Arc::new(AttributeMap::default());
+        let authorizer: Arc<dyn RepositoryAuthorizer> = Arc::new(SelectiveEnumeration);
+        for permissions in [&["write"][..], &["read"][..]] {
+            Connect {
+                repository,
+                auth_token: Some(signed_token(&format!("urc-{repository}"), permissions)),
+            }
+            .handle_auth(context.clone(), verifier(), authorizer.clone())
+            .await
+            .unwrap();
+            assert_eq!(
+                connection_permits(&context, authorizer.as_ref(), Action::Write).await,
+                Some(permissions.contains(&"write"))
+            );
+        }
+        assert!(context.get::<PartitionGrants>().is_none());
+        assert_eq!(
+            connection_permits(&context, authorizer.as_ref(), Action::Read).await,
+            Some(true)
+        );
+    }
+
     #[tokio::test]
     async fn ungranted_connect_is_refused() {
         let message = Connect {
