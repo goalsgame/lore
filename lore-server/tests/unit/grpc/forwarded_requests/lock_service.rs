@@ -60,7 +60,7 @@ async fn forwarded_response_is_bounded_while_decoding() {
     let incoming = async_stream::stream! {
         loop { yield listener.accept().await.map(|(socket, _)| socket); }
     };
-    let server = tokio::spawn(async move {
+    let server = lore_base::lore_spawn!(async move {
         tonic::transport::Server::builder()
             .add_service(ForwardedLockServiceServer::new(Peer))
             .serve_with_incoming(incoming)
