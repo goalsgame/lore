@@ -97,12 +97,19 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 | --- | --- | --- |
 | `auth_url` | none | The authentication service clients log in at and exchange tokens with. Setting it requires `[server.auth]`. If `auth_url` and `[server.auth]` are not set, starts the server unauthenticated. |
 | `user_url` | none | A user directory served over `lore.user.v1.UserService`, which clients use to resolve user IDs to display names, and back. If not set, clients speak the `UrcAuthApi` `GetUserInfo` and `GetUserId` RPCs to `auth_url` instead. If neither is set, clients fall back to an offline resolver that returns user IDs as names. When set, the server's repository catalog also lists partitions there by default (see `repository_catalog`), and the server registers the repositories it creates and deletes there with `PartitionAdd` and `PartitionRemove` instead of the `RebacApi` `CreateResource` and `DeleteResource` calls to `auth_url`. A refused `PartitionAdd` fails the create, and a refused `PartitionRemove` the delete. |
+| `storage_url` | none | The endpoint advertised for the storage service. If not set, clients use the server they connected to. |
+| `repository_url` | none | The endpoint advertised for the repository service. If not set, clients use the server they connected to. |
+| `revision_url` | none | The endpoint advertised for the revision service. If not set, clients use the server they connected to. |
+| `lock_url` | none | The endpoint advertised for the lock service. If not set, clients use the server they connected to. |
+| `notification_url` | none | The endpoint advertised for the notification service. If not set, clients use the server they connected to. |
 
 ```toml
 [environment.endpoint]
 auth_url = "ucs-auth://auth.example.com"
 user_url = "ucs-auth://directory.example.com"
 ```
+
+A client connected over `lores://` refuses to connect if the server advertises a `storage_url`, `repository_url`, `revision_url`, `lock_url`, or `notification_url` whose scheme doesn't authenticate the server, such as `lore://`. Give these endpoints a scheme that does, such as `lores://`.
 
 ### Local store disk space
 
@@ -133,6 +140,7 @@ At startup the server also reports where each local store lands, warning when th
 | `num_listeners` | `10` | Number of listener tasks. |
 | `transport_bits_per_second` | `1073741824` (`quic`), `10737418240` (`quic_internal`) | Transport bandwidth estimate in bits per second. |
 | `transport_rtt` | `100` | Expected round-trip time in milliseconds. |
+| `initial_cwnd_bytes` | none (`quic`), `1048576` (`quic_internal`) | Congestion window, in bytes, that each accepted connection starts with: how much the server sends before the peer's first acknowledgements arrive. The congestion controller may cap it at the send window derived from `transport_bits_per_second` and `transport_rtt`. When unset, `quic` uses the congestion controller's own default and `quic_internal` always uses `1048576`. At least `2400`. |
 | `handler_timeout_seconds` | `50` | Per-request handler timeout. Guards against handlers that hang indefinitely. |
 | `connection_message_limit` | none | Maximum in-flight messages per connection. When unset, the server falls back to `500` for the public endpoint and `50000` for the internal endpoint. |
 
@@ -171,7 +179,7 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 
 #### `presigned_url_hmac_key`
 
-This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment.
+This field is optional. When it's absent, the server starts with the presigned URL feature disabled and logs `Presigned URL feature disabled (presigned_url_hmac_key not configured)`. When it's set, the value must be valid hexadecimal that decodes to at least 32 bytes — generate one with `openssl rand -hex 32`. An invalid or too-short key stops the server from starting. Set this only for deployments that hand out presigned URLs, and use a fresh key per deployment. Vending a presigned URL needs the `presign` permission on the repository. Without `[server.auth]`, every caller holds it.
 
 #### Presigned URL content types
 
@@ -363,6 +371,15 @@ absent by default, and no RPC is forwarded until it is named under `enabled_rpcs
 per forwardable RPC, all `false` by default. Releases add to the set; an unknown
 key here is ignored, so a name that is not yet forwardable forwards nothing.
 
+`lock_query` forwards the lock service's `Query`. The peer answers it only if
+its own `[lock_store]` is at a mode other than `none`; otherwise it answers
+`UNIMPLEMENTED`, which the forwarding server relays to its client.
+
+`max_lock_response_bytes` under `[server.grpc_public_services.forwarded_requests]`
+bounds each forwarded lock response during decoding (default 64 MiB). Oversized
+responses fail before they are forwarded to the caller. This is independent of
+the public lock service's outbound encoding limit.
+
 `[server.grpc_public_services.forwarded_requests.client]` configures the channel to
 the peer. The defaults suit a long-lived connection that sits idle between
 forwards; tune them to the path the peer is actually reached over:
@@ -392,7 +409,7 @@ repository_get = true
 
 ### Authentication
 
-`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
+`[server.auth]` configures JWT verification for the gRPC API. When `[server.auth]` is defined, JWT verification is enabled. If it is absent, the services accept unauthenticated requests, and every caller holds `read`, `write`, `obliterate` and `presign` on every partition. Repository delete and branch protection, which otherwise need `owner` or `admin`, or `write` for the repository's creator, need only `write` there, since an unauthenticated caller has no identity to compare with the creator. If `[server.auth.jwk].endpoint` is set, it will be used as the JWKS endpoint. If not, the validation keys will be discovered from JWT issuer OIDC discovery document.
 
 When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandatory and the server refuses to start without them: A deployment that verifies tokens without pinning issuer would accept tokens from any issuer. And a deployment that doesn't pin the audience would accept tokens minted for any service.
 
@@ -404,6 +421,7 @@ When `[server.auth]` is present, `jwt_issuer` and `jwt_audience` are both mandat
 | `jwk` | none | The optional `[server.auth.jwk]` override sub-table below. |
 | `oidc` | none | The optional `[server.auth.oidc]` sub-table below, which configures the OIDC provider info shown to clients. |
 | `permission_claim` | none | Dotted path of the JWT claim carrying the caller's allowed actions, e.g. `realm_access.roles` (Keycloak) or `groups` (Dex). When using `GlobalGrantsAuthorizer` (Tier 1), this JWT claim defines where the user's global permissions are read from. When `resource_claim` is set and `ResourceGrantsAuthorizer` (Tier 2) is in use, it instead names the field inside each resource entry holding the per-partition actions, defaulting to `permission`. |
+| `implicit_actions` | `["write"]` | Actions every token holder gets under `GlobalGrantsAuthorizer` (Tier 1), added to those `permission_claim` carries and to `read`, which any token implies. Set `[]` to grant `write` through a role only, or, without `permission_claim`, to make the server read-only. Any of `read`, `write`, `owner`, `admin`, `migrate`, `push-protected`, `obliterate` and `presign` may be listed; any other name is a configuration error. The server refuses to start with it set beside `resource_claim` or `auth_url`, where it would do nothing. |
 | `resource_claim` | none | Dotted path of the JWT claim carrying per-repository resource grants. If this is set, enables the granular `ResourceGrantsAuthorizer` (Tier 2) authorizer. |
 | `resource_id_claim` | `resource_id` | The field inside each resource entry that names the resource, for providers whose entry shape cannot be changed. Keycloak's UMA `authorization.permissions` entries carry the resource name in `rsname`, for example: set `resource_claim = "authorization.permissions"`, `resource_id_claim = "rsname"` and `permission_claim = "scopes"` to read them. Tier 2 only. |
 | `resource_id_template` | `urc-{id}` | Template that renders a repository id into the corresponding resource name. `{id}` is replaced by the repository id. When verifying permissions with `ResourceGrantsAuthorizer` (Tier 2), uses this string to search for the matching resource entry in the JWT. |
@@ -594,6 +612,8 @@ Hooks fire at these points:
 - **`BranchDelete`** — before a branch is deleted.
 - **`RepositoryCreate`** — before a new repository is created.
 - **`Obliterate`** — before content is obliterated.
+
+A hook's pre-handler runs before the operation, and the operation waits for it. A pre-handler still running after 1 second, or after the timeout the hook sets for itself, is cancelled and the operation fails with `UNAVAILABLE`, so the client can retry. On the v1 `BranchPush`, `BranchCreate`, and `BranchDelete` RPCs, a pre-handler sees the branch name and whether the caller is a service account.
 
 A hook can veto an operation by returning an error, log or audit it, or trigger an external notification. The example below sketches a compliance hook that denies pushes to protected branch patterns and posts to a webhook on failure. It is illustrative — `deny_patterns`, `allowed_users`, and `webhook_url` are fields a *custom* compliance hook would define; the stock `loreserver` ships no such hook (see note below):
 

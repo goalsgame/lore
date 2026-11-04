@@ -1621,8 +1621,8 @@ async fn clone_materialize(
 /// Writes the files of `ctx.state` to the working tree, discovering them in one task and writing
 /// them in another.
 ///
-/// A failure to write a file is reported ahead of a failure in discovery. Discovery fails once
-/// writing stops taking files, so its error is then a result of the failure to write.
+/// File writes continue after an individual failure. The first write failure takes precedence
+/// over a discovery failure; structural metadata errors still stop discovery.
 #[lore_macro::test_pub]
 async fn clone_in_path(ctx: CloneContext) -> Result<(), CloneError> {
     let (file_tx, file_rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
@@ -1873,6 +1873,8 @@ pub async fn clone_execute(
     mut rx: mpsc::Receiver<CloneWorkItem>,
     ctx: CloneContext,
 ) -> Result<(), CloneError> {
+    // A missing fragment must not prevent later files from being attempted. Keep the
+    // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
     let mut tasks: JoinSet<Result<Option<(Hash, u64)>, CloneError>> = JoinSet::new();
     let repository = ctx.repository.clone();
@@ -1920,11 +1922,14 @@ pub async fn clone_execute(
             {
                 Ok(Some(entry)) => modified_times.push(entry),
                 Ok(None) => {}
-                Err(err) => failure = failure.or(Some(err)),
+                Err(err) => {
+                    lore_warn!(
+                        "Clone could not materialize content: {err}\n{}",
+                        err.trace()
+                    );
+                    failure = failure.or(Some(err));
+                }
             }
-        }
-        if failure.is_some() {
-            break;
         }
     }
 
@@ -1935,7 +1940,13 @@ pub async fn clone_execute(
         {
             Ok(Some(entry)) => modified_times.push(entry),
             Ok(None) => {}
-            Err(err) => failure = failure.or(Some(err)),
+            Err(err) => {
+                lore_warn!(
+                    "Clone could not materialize content: {err}\n{}",
+                    err.trace()
+                );
+                failure = failure.or(Some(err));
+            }
         }
     }
 
@@ -1961,6 +1972,8 @@ pub(crate) async fn clone_node(
     let repository = ctx.repository.clone();
     let state = ctx.state.clone();
 
+    // A missing fragment must not prevent later files from being attempted. Keep the
+    // first failure for the terminal result while reporting each failed attempt.
     let mut failure = None;
     let mut tasks = JoinSet::new();
 
@@ -2001,7 +2014,14 @@ pub(crate) async fn clone_node(
                     child_states,
                 )
                 .await;
-                failure = failure.or(result.err());
+                failure = failure.or(result
+                    .inspect_err(|err| {
+                        lore_warn!(
+                            "Clone could not materialize content: {err}\n{}",
+                            err.trace()
+                        );
+                    })
+                    .err());
             }
         }
 
@@ -2009,10 +2029,13 @@ pub(crate) async fn clone_node(
             failure = failure.or(result
                 .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
                 .and_then(|r| r)
+                .inspect_err(|err| {
+                    lore_warn!(
+                        "Clone could not materialize content: {err}\n{}",
+                        err.trace()
+                    );
+                })
                 .err());
-        }
-        if failure.is_some() {
-            break;
         }
     }
 
@@ -2020,6 +2043,12 @@ pub(crate) async fn clone_node(
         failure = failure.or(result
             .map_err(|e| CloneError::internal_with_context(e, "Recursion task failed"))
             .and_then(|r| r)
+            .inspect_err(|err| {
+                lore_warn!(
+                    "Clone could not materialize content: {err}\n{}",
+                    err.trace()
+                );
+            })
             .err());
     }
 

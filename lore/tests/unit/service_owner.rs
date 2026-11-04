@@ -500,12 +500,6 @@ async fn disconnected_reply_peer_stops_forwarding_after_the_first_native_write_f
 
     let request = Arc::new(StopRequest::new());
     let (owner, _guard, _cleanup) = run(&request);
-    for _ in 0..16 {
-        owner.state.push_log(
-            lore::interface::LoreLogLevel::Info,
-            "queued status message".repeat(100),
-        );
-    }
     let name = format!("owner-dead-reply-{}", std::process::id());
     let listener = network::UdsListener::new(&name).unwrap();
     let mut client =
@@ -515,9 +509,20 @@ async fn disconnected_reply_peer_stops_forwarding_after_the_first_native_write_f
         lore::remote::connection::ConnectionId(0),
         listener.accept().unwrap(),
     );
+    // A repository command emits completion/end/result replies without draining
+    // service logs. ServiceStatus could consume the write-failure diagnostic
+    // while its own reply is being forwarded on another task. The socket path
+    // cannot be a repository, so this command fails without contacting a server.
+    let repository = network::unix::uds_sock_path(&name);
     let command = message::MessageToServer {
-        globals: Default::default(),
-        command: lore::remote::command::LoreCommand::ServiceStatus(Default::default()),
+        globals: lore::interface::LoreGlobalArgs {
+            repository_path: lore::interface::LoreString::from(repository.to_str().unwrap()),
+            ..Default::default()
+        },
+        command: lore::remote::command::LoreCommand::BranchInfo(lore::branch::LoreBranchInfoArgs {
+            branch: lore::interface::LoreString::from("missing"),
+            link: Default::default(),
+        }),
         environment: Default::default(),
     };
     message::write_payload(&mut client, &message::encode_message(&command)).unwrap();

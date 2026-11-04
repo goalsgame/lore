@@ -165,7 +165,7 @@ pub struct WorkingStorage {
     limits: Limits,
     io: Arc<Semaphore>,
     jobs: Arc<IoJobs>,
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     #[cfg(unix)]
     directory_file: File,
     counter: Mutex<SessionCounter>,
@@ -307,11 +307,11 @@ impl WorkingStorage {
             }
         };
         private_metadata(&lock.metadata()?, false)?;
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match crate::file_lock::FileLock::try_lock(lock) {
+            Ok(lock) => lock,
             Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
+        };
         let recovery = root.join("recovery");
         let sessions = root.join("sessions");
         if created {

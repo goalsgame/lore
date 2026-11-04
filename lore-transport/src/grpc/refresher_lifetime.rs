@@ -106,6 +106,14 @@ impl Authentication for AuthenticationProbe {
     ) -> Result<AuthenticationToken, ProtocolError> {
         Err(unsupported())
     }
+    async fn revoke_refresh_token(
+        &self,
+        _url: &str,
+        _token: &str,
+        _correlation: &str,
+    ) -> Result<(), ProtocolError> {
+        Err(unsupported())
+    }
     async fn exchange_for_repository(
         &self,
         _url: &str,

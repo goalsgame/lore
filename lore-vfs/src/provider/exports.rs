@@ -29,7 +29,7 @@ struct Budget {
 }
 pub(super) struct Owner {
     path: PathBuf,
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     limits: Limits,
     budget: Mutex<Budget>,
     jobs: Arc<jobs::Jobs>,
@@ -67,7 +67,7 @@ impl Owner {
             }
             Err(error) => return Err(error.into()),
         };
-        lock.try_lock()
+        let lock = crate::file_lock::FileLock::try_lock(lock)
             .map_err(|_lock_error| FsError::internal("export owner is already locked"))?;
         // Unrecognized or abandoned copies are never silently deleted or omitted
         // from the disk budget. Use a dedicated empty export directory.

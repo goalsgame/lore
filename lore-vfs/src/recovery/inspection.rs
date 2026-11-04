@@ -25,7 +25,7 @@ use crate::capture_memory::CaptureMemory;
 
 pub(crate) struct RecoveryInspection {
     // Unlock while the pinned directory handle is still retained.
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     directory: File,
     limit: usize,
 }
@@ -45,11 +45,11 @@ impl RecoveryInspection {
         super::private_metadata(&directory.metadata()?, true)?;
         let lock = open_file(&directory, c"owner.lock")?;
         super::private_metadata(&lock.metadata()?, false)?;
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match crate::file_lock::FileLock::try_lock(lock) {
+            Ok(lock) => lock,
             Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
+        };
         Ok(Self {
             directory,
             limit: limits.max_checkpoint_bytes,

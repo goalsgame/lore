@@ -53,7 +53,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         repository_context.clone(),
         main,
         state_hash,
-        true,
+        crate::util::test_support::PUSH_ANY,
         true,
         false,
         DEFAULT_HISTORY_STEP_SIZE,
@@ -415,6 +415,13 @@ mod forwarded_request {
         ) -> Box<dyn lore_server::grpc::forwarded_requests::repository_service::ForwardedRepositoryServiceClient>
 {
             unreachable!("forwarded_repository_service should not be called in branch_create tests")
+        }
+
+        fn forwarded_lock_service(
+            &self,
+        ) -> Box<dyn lore_server::grpc::forwarded_requests::lock_service::ForwardedLockServiceClient>
+        {
+            unreachable!("forwarded_lock_service should not be called in branch_get tests")
         }
     }
 
