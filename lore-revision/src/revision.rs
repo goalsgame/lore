@@ -1289,14 +1289,21 @@ pub async fn tree(
 
 /// Finds the revision that last changed a node, from what the state the node is read from
 /// records: the state's own revision when its delta names the node, otherwise the last change
-/// its file metadata records on the first-parent line. A directory is recorded as changed in
-/// every revision that changes anything beneath it.
+/// its file metadata records. A directory is recorded as changed in every revision that changes
+/// anything beneath it.
+///
+/// File metadata holds a first-parent and a second-parent change. The first-parent change is the
+/// answer unless only the second-parent one is recorded, or only the second-parent revision holds
+/// the node with the content it has now, as for a node a merge of divergent history takes from
+/// its second parent after that parent changed it again.
 ///
 /// Reads one delta block per distinct state and one file metadata block per run of nodes in the
-/// same block, so resolving the entries of a listing never walks history.
+/// same block, plus one node per recorded revision where both changes are recorded, so resolving
+/// the entries of a listing never walks history.
 pub struct LastChangedResolver {
     repository: Arc<RepositoryContext>,
     states: HashMap<(RepositoryId, Hash), LastChangedState>,
+    history_states: HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
 }
 
 struct LastChangedState {
@@ -1312,6 +1319,7 @@ impl LastChangedResolver {
         Self {
             repository,
             states: HashMap::new(),
+            history_states: HashMap::new(),
         }
     }
 
@@ -1363,12 +1371,54 @@ impl LastChangedResolver {
             }
         };
         let history = *block.read().node(NodeFileMetadata::index(metadata_node));
-        Ok(if history.revision[0].is_zero() {
-            history.revision[1]
-        } else {
-            history.revision[0]
-        })
+        if history.revision[0].is_zero() || history.revision[1].is_zero() {
+            return Ok(if history.revision[0].is_zero() {
+                history.revision[1]
+            } else {
+                history.revision[0]
+            });
+        }
+
+        let current = entry
+            .state
+            .node(entry.repository.clone(), link.node)
+            .await?
+            .address
+            .hash;
+        let repository = entry.repository.clone();
+        for slot in 0..2 {
+            let held = node_hash_in(
+                &mut self.history_states,
+                &repository,
+                history.revision[slot],
+                history.node[slot],
+            )
+            .await;
+            if held == Some(current) {
+                return Ok(history.revision[slot]);
+            }
+        }
+        Ok(history.revision[0])
     }
+}
+
+/// The content hash of node `node_id` in `revision`, or `None` when the revision cannot be read
+/// or holds no such node.
+async fn node_hash_in(
+    states: &mut HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    node_id: NodeID,
+) -> Option<Hash> {
+    let state = match states.entry((repository.id, revision)) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(State::deserialize(repository.clone(), revision).await.ok())
+        }
+    }
+    .as_ref()?;
+    let node = state.node(repository.clone(), node_id).await.ok()?;
+    Some(node.address.hash)
 }
 
 /// What a revision specifier names on a branch.

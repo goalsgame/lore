@@ -97,7 +97,8 @@ async fn last_changed(repository: &Arc<RepositoryContext>, revision: Hash, path:
 
 /// A merge takes a modification and an addition from the merged branch. Both report the merge,
 /// in the merge itself and in a later revision that leaves them alone, while files the merge
-/// did not touch keep reporting their own change on the first-parent line.
+/// did not touch keep reporting their own change on the first-parent line, including one both
+/// branches changed that the merge kept as the first parent had it.
 #[tokio::test]
 async fn a_merge_reports_itself_for_what_it_changed_and_keeps_the_first_parent_change_otherwise() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
@@ -107,13 +108,20 @@ async fn a_merge_reports_itself_for_what_it_changed_and_keeps_the_first_parent_c
         let feature = branch_id();
 
         let state = State::new();
-        for name in ["a.txt", "keep.txt", "shared.txt"] {
+        for name in ["a.txt", "keep.txt", "shared.txt", "contested.txt"] {
             add(&state, repository.clone(), ROOT_NODE, file(name), name).await;
         }
         let base = commit(&repository, &state, Hash::default(), main).await;
 
         let state = revision_state(&repository, base).await;
         modify(&state, &repository, "shared.txt", NodeFlags::StagedModify).await;
+        modify(
+            &state,
+            &repository,
+            "contested.txt",
+            NodeFlags::StagedModify,
+        )
+        .await;
         add(
             &state,
             repository.clone(),
@@ -126,6 +134,13 @@ async fn a_merge_reports_itself_for_what_it_changed_and_keeps_the_first_parent_c
 
         let state = revision_state(&repository, base).await;
         modify(&state, &repository, "keep.txt", NodeFlags::StagedModify).await;
+        modify(
+            &state,
+            &repository,
+            "contested.txt",
+            NodeFlags::StagedModify,
+        )
+        .await;
         let main_tip = commit(&repository, &state, base, main).await;
 
         let state = revision_state(&repository, main_tip).await;
@@ -159,7 +174,15 @@ async fn a_merge_reports_itself_for_what_it_changed_and_keeps_the_first_parent_c
         modify(&state, &repository, "a.txt", NodeFlags::StagedModify).await;
         let after = commit(&repository, &state, merge, branch_id()).await;
 
+        assert_eq!(
+            history_at(&repository, merge, "contested.txt").await,
+            (main_tip, feature_tip),
+            "contested.txt records a change on both lines"
+        );
+
         for (revision, path, expected) in [
+            (merge, "contested.txt", main_tip),
+            (after, "contested.txt", main_tip),
             (merge, "shared.txt", merge),
             (merge, "new.txt", merge),
             (merge, "keep.txt", main_tip),
@@ -180,16 +203,39 @@ async fn a_merge_reports_itself_for_what_it_changed_and_keeps_the_first_parent_c
     .expect("Task failed");
 }
 
+/// The first-parent and second-parent history `revision` records for `path`, as revisions.
+async fn history_at(
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    path: &str,
+) -> (Hash, Hash) {
+    let state = revision_state(repository, revision).await;
+    let metadata_node = node_to_file_metadata(node_id_at(&state, repository, path).await);
+    let history = *state
+        .block_file_metadata(
+            repository.clone(),
+            NodeFileMetadataBlock::index(metadata_node),
+        )
+        .await
+        .expect("reading the file metadata block")
+        .read()
+        .node(NodeFileMetadata::index(metadata_node));
+    (history.revision[0], history.revision[1])
+}
+
 /// A merge of divergent history builds its tree from the second parent and takes the first
-/// parent's changes. A file only the second parent added is in no first-parent revision's delta,
-/// so it records no first-parent change and reports the second parent's, in the merge and in a
-/// later revision that leaves it alone.
+/// parent's changes, so files it leaves alone keep the second parent's own history. A file only
+/// the second parent's latest added records no first-parent change and reports the second
+/// parent's. A file the second parent added earlier and modified in its latest records the add
+/// on its first-parent line and the modification on the second, and reports the modification.
+/// Both hold in the merge and in a later revision that leaves the files alone.
 #[tokio::test]
-async fn a_file_with_no_first_parent_history_reports_its_second_parent_change() {
+async fn a_divergent_merge_reports_the_newest_second_parent_change() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
     lore_spawn!(LORE_CONTEXT.scope(execution, async move {
         let repository = in_memory::repository(immutable, mutable);
         let main = branch_id();
+        let local = branch_id();
 
         let state = State::new();
         add(
@@ -207,11 +253,23 @@ async fn a_file_with_no_first_parent_history_reports_its_second_parent_change() 
             &state,
             repository.clone(),
             ROOT_NODE,
+            file("edited.txt"),
+            "edited.txt",
+        )
+        .await;
+        let local_added = commit(&repository, &state, base, local).await;
+
+        let state = revision_state(&repository, local_added).await;
+        modify(&state, &repository, "edited.txt", NodeFlags::StagedModify).await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
             file("local.txt"),
             "local.txt",
         )
         .await;
-        let local_latest = commit(&repository, &state, base, branch_id()).await;
+        let local_latest = commit(&repository, &state, local_added, local).await;
 
         let state = revision_state(&repository, base).await;
         add(
@@ -248,27 +306,26 @@ async fn a_file_with_no_first_parent_history_reports_its_second_parent_change() 
         modify(&state, &repository, "base.txt", NodeFlags::StagedModify).await;
         let after = commit(&repository, &state, merge, branch_id()).await;
 
-        let after_state = revision_state(&repository, after).await;
-        let local_node = node_id_at(&after_state, &repository, "local.txt").await;
-        let metadata_node = node_to_file_metadata(local_node);
-        let history = *after_state
-            .block_file_metadata(
-                repository.clone(),
-                NodeFileMetadataBlock::index(metadata_node),
-            )
-            .await
-            .expect("reading the file metadata block")
-            .read()
-            .node(NodeFileMetadata::index(metadata_node));
-        assert!(
-            history.revision[0].is_zero(),
-            "local.txt records no first-parent change"
-        );
+        for revision in [merge, after] {
+            assert_eq!(
+                history_at(&repository, revision, "local.txt").await,
+                (Hash::default(), local_latest),
+                "local.txt history as of {revision}"
+            );
+            assert_eq!(
+                history_at(&repository, revision, "edited.txt").await,
+                (local_added, local_latest),
+                "edited.txt history as of {revision}"
+            );
+        }
 
         for (revision, path, expected) in [
             (merge, "local.txt", local_latest),
+            (merge, "edited.txt", local_latest),
             (merge, "remote.txt", merge),
+            (merge, "base.txt", base),
             (after, "local.txt", local_latest),
+            (after, "edited.txt", local_latest),
             (after, "remote.txt", merge),
             (after, "base.txt", after),
         ] {
