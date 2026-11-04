@@ -1294,8 +1294,8 @@ pub async fn tree(
 ///
 /// File metadata holds a first-parent and a second-parent change. The first-parent change is the
 /// answer unless only the second-parent one is recorded, or only the second-parent revision holds
-/// the node with the content it has now, as for a node a merge of divergent history takes from
-/// its second parent after that parent changed it again.
+/// the node as it is now, compared by [`entry_attributes`], as for a node a merge of divergent
+/// history takes from its second parent after that parent changed it again.
 ///
 /// Reads one delta block per distinct state and one file metadata block per run of nodes in the
 /// same block, plus one node per recorded revision where both changes are recorded, so resolving
@@ -1379,22 +1379,22 @@ impl LastChangedResolver {
             });
         }
 
-        let current = entry
-            .state
-            .node(entry.repository.clone(), link.node)
-            .await?
-            .address
-            .hash;
+        let current = entry_attributes(
+            &entry
+                .state
+                .node(entry.repository.clone(), link.node)
+                .await?,
+        );
         let repository = entry.repository.clone();
         for slot in 0..2 {
-            let held = node_hash_in(
+            let held = node_in(
                 &mut self.history_states,
                 &repository,
                 history.revision[slot],
                 history.node[slot],
             )
             .await;
-            if held == Some(current) {
+            if held.as_ref().map(entry_attributes) == Some(current) {
                 return Ok(history.revision[slot]);
             }
         }
@@ -1402,14 +1402,30 @@ impl LastChangedResolver {
     }
 }
 
-/// The content hash of node `node_id` in `revision`, or `None` when the revision cannot be read
-/// or holds no such node.
-async fn node_hash_in(
+/// The attributes of a node whose change a commit records as a change of the entry: its kind,
+/// name, mode, size and address, and for a link the node it targets. Staging and dirty
+/// tracking flags are left out.
+fn entry_attributes(node: &Node) -> (u16, u64, u16, u64, Address, NodeID) {
+    let kind = node.flags & (NodeFlags::File.bits() | NodeFlags::Link.bits());
+    let target = if node.is_link() { node.child } else { 0 };
+    (
+        kind,
+        node.name_hash,
+        node.mode,
+        node.size,
+        node.address,
+        target,
+    )
+}
+
+/// Node `node_id` of `revision`, or `None` when the revision cannot be read or holds no such
+/// node.
+async fn node_in(
     states: &mut HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
     repository: &Arc<RepositoryContext>,
     revision: Hash,
     node_id: NodeID,
-) -> Option<Hash> {
+) -> Option<Node> {
     let state = match states.entry((repository.id, revision)) {
         std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
         std::collections::hash_map::Entry::Vacant(vacant) => {
@@ -1417,8 +1433,7 @@ async fn node_hash_in(
         }
     }
     .as_ref()?;
-    let node = state.node(repository.clone(), node_id).await.ok()?;
-    Some(node.address.hash)
+    state.node(repository.clone(), node_id).await.ok()
 }
 
 /// What a revision specifier names on a branch.

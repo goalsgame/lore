@@ -227,8 +227,9 @@ async fn history_at(
 /// parent's changes, so files it leaves alone keep the second parent's own history. A file only
 /// the second parent's latest added records no first-parent change and reports the second
 /// parent's. A file the second parent added earlier and modified in its latest records the add
-/// on its first-parent line and the modification on the second, and reports the modification.
-/// Both hold in the merge and in a later revision that leaves the files alone.
+/// on its first-parent line and the modification on the second, and reports the modification,
+/// including one that changes only the file's mode. All hold in the merge and in a later revision
+/// that leaves the files alone.
 #[tokio::test]
 async fn a_divergent_merge_reports_the_newest_second_parent_change() {
     let (immutable, mutable, execution) = test_store_create().await.expect("creating the stores");
@@ -257,10 +258,42 @@ async fn a_divergent_merge_reports_the_newest_second_parent_change() {
             "edited.txt",
         )
         .await;
+        add(
+            &state,
+            repository.clone(),
+            ROOT_NODE,
+            file("chmod.txt"),
+            "chmod.txt",
+        )
+        .await;
         let local_added = commit(&repository, &state, base, local).await;
 
         let state = revision_state(&repository, local_added).await;
         modify(&state, &repository, "edited.txt", NodeFlags::StagedModify).await;
+        let chmod = node_id_at(&state, &repository, "chmod.txt").await;
+        let unchanged = state
+            .node(repository.clone(), chmod)
+            .await
+            .expect("reading the file");
+        state
+            .node_modify(
+                repository.clone(),
+                chmod,
+                0o755,
+                unchanged.size,
+                unchanged.address,
+            )
+            .await
+            .expect("changing the mode");
+        state
+            .node_mark_staged(
+                repository.clone(),
+                chmod,
+                NodeFlags::StagedModify,
+                NodeFlags::DirtyModify,
+            )
+            .await
+            .expect("staging the mode change");
         add(
             &state,
             repository.clone(),
@@ -317,15 +350,22 @@ async fn a_divergent_merge_reports_the_newest_second_parent_change() {
                 (local_added, local_latest),
                 "edited.txt history as of {revision}"
             );
+            assert_eq!(
+                history_at(&repository, revision, "chmod.txt").await,
+                (local_added, local_latest),
+                "chmod.txt history as of {revision}"
+            );
         }
 
         for (revision, path, expected) in [
             (merge, "local.txt", local_latest),
             (merge, "edited.txt", local_latest),
+            (merge, "chmod.txt", local_latest),
             (merge, "remote.txt", merge),
             (merge, "base.txt", base),
             (after, "local.txt", local_latest),
             (after, "edited.txt", local_latest),
+            (after, "chmod.txt", local_latest),
             (after, "remote.txt", merge),
             (after, "base.txt", after),
         ] {
