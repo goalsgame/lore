@@ -20,6 +20,7 @@ use lore_proto::lore::thin_client::v1::RevisionDiffRequest;
 use lore_proto::lore::thin_client::v1::RevisionDiffResponse;
 use lore_proto::lore::thin_client::v1::RevisionInfoRequest;
 use lore_proto::lore::thin_client::v1::RevisionInfoResponse;
+use lore_proto::lore::thin_client::v1::RevisionReference;
 use lore_proto::lore::thin_client::v1::RevisionTreeHeader;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
@@ -119,7 +120,12 @@ fn v1_thin_client_field_shapes() {
         size: _,
         mode: _,
         tracking: _,
+        last_changed: _,
     } = TreeNode::default();
+    let RevisionReference {
+        signature: _,
+        identifier: _,
+    } = RevisionReference::default();
 
     // Revision + nested Parent + Metadata
     let Revision {
@@ -179,6 +185,7 @@ fn v1_thin_client_field_shapes() {
         query: _,
         path_prefix: _,
         max_depth: _,
+        include_last_changed: _,
     } = RevisionTreeRequest::default();
     let _ = RevisionTreeQuery::Identifier(Default::default());
     let _ = RevisionTreeQuery::Signature(Default::default());

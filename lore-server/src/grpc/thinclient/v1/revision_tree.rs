@@ -1,5 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::collections::HashMap;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -11,7 +12,10 @@ use lore_proto::lore::thin_client::v1 as thin_client_v1;
 use lore_proto::lore::thin_client::v1::RevisionTreeRequest;
 use lore_proto::lore::thin_client::v1::RevisionTreeResponse;
 use lore_proto::lore::thin_client::v1::revision_tree_response::Payload;
+use lore_revision::lore::RepositoryId;
+use lore_revision::node::NodeLink;
 use lore_revision::repository::RepositoryContext;
+use lore_revision::revision::LastChangedResolver;
 use lore_revision::revision::tree;
 use lore_revision::util::path::RelativePath;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
@@ -26,6 +30,7 @@ use tracing::Instrument;
 use tracing::debug;
 use tracing::warn;
 
+use super::helpers::identifier_for_signature;
 use super::helpers::node_flags_to_node_type;
 use super::helpers::resolve_to_identifier;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
@@ -45,9 +50,10 @@ type RevisionTreeStream =
 /// Server-streams a `RevisionTreeHeader` first (echoing the resolved
 /// revision identifier + signature), then one `TreeNode` per entry at
 /// or under the optional `path_prefix`, bounded by `max_depth` when
-/// set. The header is always emitted before the first node — failures
-/// during resolution surface as a non-OK `Status` from the unary part
-/// of the call, before the stream begins.
+/// set. With `include_last_changed`, each node also carries the revision
+/// that last changed it. The header is always emitted before the first
+/// node — failures during resolution surface as a non-OK `Status` from
+/// the unary part of the call, before the stream begins.
 #[tracing::instrument(name = "RevisionTree::v1::handle", skip_all)]
 pub async fn handler(
     request: Request<RevisionTreeRequest>,
@@ -75,6 +81,7 @@ pub async fn handler(
         _ => RelativePath::new(),
     };
     let max_depth = req.max_depth.map_or(usize::MAX, |d| d as usize);
+    let include_last_changed = req.include_last_changed.unwrap_or(false);
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
@@ -105,7 +112,17 @@ pub async fn handler(
 
             lore_spawn!(
                 async move {
-                    stream_tree(repository, signature, path, max_depth, can_read, header, tx).await;
+                    stream_tree(
+                        repository,
+                        signature,
+                        path,
+                        max_depth,
+                        include_last_changed,
+                        can_read,
+                        header,
+                        tx,
+                    )
+                    .await;
                 }
                 .in_current_span()
             );
@@ -122,6 +139,7 @@ async fn stream_tree(
     signature: Hash,
     path: RelativePath,
     max_depth: usize,
+    include_last_changed: bool,
     can_read: lore_revision::state::CanReadRepository,
     header: thin_client_v1::RevisionTreeHeader,
     tx: mpsc::Sender<Result<RevisionTreeResponse, Status>>,
@@ -159,8 +177,13 @@ async fn stream_tree(
         }
     };
 
+    let mut last_changed = include_last_changed.then(|| LastChanged::new(repository.clone()));
     let mut emitted: u64 = 0;
     for tree_path in result.paths {
+        let last_changed = match last_changed.as_mut() {
+            Some(last_changed) => last_changed.reference(&tree_path.link).await,
+            None => None,
+        };
         let node = thin_client_v1::TreeNode {
             path: tree_path.path.to_string(),
             node_type: node_flags_to_node_type(tree_path.flags) as i32,
@@ -168,6 +191,7 @@ async fn stream_tree(
             size: tree_path.size,
             mode: tree_path.mode,
             tracking: tree_path.tracking,
+            last_changed,
         };
         if tx
             .send(Ok(RevisionTreeResponse {
@@ -183,4 +207,54 @@ async fn stream_tree(
     }
 
     debug!(emitted, "RevisionTree complete");
+}
+
+/// Resolves `TreeNode.last_changed` for the entries of one walk, resolving
+/// each distinct revision's identifier once.
+struct LastChanged {
+    repository: Arc<RepositoryContext>,
+    resolver: LastChangedResolver,
+    identifiers: HashMap<(RepositoryId, Hash), Option<model_v1::RevisionIdentifier>>,
+}
+
+impl LastChanged {
+    fn new(repository: Arc<RepositoryContext>) -> Self {
+        Self {
+            resolver: LastChangedResolver::new(repository.clone()),
+            repository,
+            identifiers: HashMap::new(),
+        }
+    }
+
+    /// The revision that last changed the node `link` names, or `None` when
+    /// its state records no change of it or it cannot be read.
+    async fn reference(&mut self, link: &NodeLink) -> Option<thin_client_v1::RevisionReference> {
+        let revision = match self.resolver.resolve(link).await {
+            Ok(revision) if !revision.is_zero() => revision,
+            Ok(_) => return None,
+            Err(err) => {
+                warn!(
+                    {REPOSITORY_ID} = %link.repository, {REVISION} = %link.revision, ?err,
+                    "Failed to resolve the last change of a tree node",
+                );
+                return None;
+            }
+        };
+
+        let key = (link.repository, revision);
+        if !self.identifiers.contains_key(&key) {
+            let repository = if link.repository == self.repository.id {
+                self.repository.clone()
+            } else {
+                self.repository.to_link_context(link.repository).await
+            };
+            let identifier = identifier_for_signature(&repository, revision).await.ok();
+            self.identifiers.insert(key, identifier);
+        }
+
+        Some(thin_client_v1::RevisionReference {
+            signature: revision.into(),
+            identifier: self.identifiers[&key].clone(),
+        })
+    }
 }

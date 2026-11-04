@@ -130,6 +130,16 @@ pub struct TreeNode {
     /// and non-link entries.
     #[prost(bool, tag = "6")]
     pub tracking: bool,
+    /// Revision that last changed this entry, as of the revision walked: the
+    /// newest revision on its first-parent line that changed the file, or for a
+    /// DIRECTORY anything beneath it. An entry a merge changed reports the
+    /// merge revision; one a merge of divergent history takes unchanged from its
+    /// second parent reports the newest change on the second parent's line. For
+    /// an entry inside a linked repository, the
+    /// revision belongs to that repository. Set only when the request sets
+    /// `include_last_changed` and the revision records the change.
+    #[prost(message, optional, tag = "7")]
+    pub last_changed: ::core::option::Option<RevisionReference>,
 }
 impl ::prost::Name for TreeNode {
     const NAME: &'static str = "TreeNode";
@@ -139,6 +149,27 @@ impl ::prost::Name for TreeNode {
     }
     fn type_url() -> ::prost::alloc::string::String {
         "/lore.thin_client.v1.TreeNode".into()
+    }
+}
+/// A revision named by its content signature and its resolved (branch, number).
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct RevisionReference {
+    /// Content signature of the revision.
+    #[prost(bytes = "bytes", tag = "1")]
+    pub signature: ::prost::bytes::Bytes,
+    /// Resolved (branch, number) of the revision. Unset when it cannot be
+    /// resolved.
+    #[prost(message, optional, tag = "2")]
+    pub identifier: ::core::option::Option<crate::lore::model::v1::RevisionIdentifier>,
+}
+impl ::prost::Name for RevisionReference {
+    const NAME: &'static str = "RevisionReference";
+    const PACKAGE: &'static str = "lore.thin_client.v1";
+    fn full_name() -> ::prost::alloc::string::String {
+        "lore.thin_client.v1.RevisionReference".into()
+    }
+    fn type_url() -> ::prost::alloc::string::String {
+        "/lore.thin_client.v1.RevisionReference".into()
     }
 }
 /// Self-describing revision record. Carries the resolved RevisionIdentifier
@@ -719,6 +750,11 @@ pub struct RevisionTreeRequest {
     /// children plus grandchildren; etc. 0 or unset means unbounded.
     #[prost(uint32, optional, tag = "4")]
     pub max_depth: ::core::option::Option<u32>,
+    /// If true, each TreeNode carries `last_changed`. Costs one delta block
+    /// read per revision walked and one file metadata block read per run of
+    /// entries sharing a block; history is never walked.
+    #[prost(bool, optional, tag = "5")]
+    pub include_last_changed: ::core::option::Option<bool>,
     /// Revision specifier.
     #[prost(oneof = "revision_tree_request::Query", tags = "1, 2")]
     pub query: ::core::option::Option<revision_tree_request::Query>,

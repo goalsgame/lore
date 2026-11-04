@@ -10,6 +10,8 @@ pub mod restore;
 pub mod revert;
 pub mod sync;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,10 +43,14 @@ use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
 use crate::node::Node;
+use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::NodeLink;
+use crate::node::node_to_file_metadata;
 use crate::repository::RepositoryContext;
 use crate::state;
 use crate::state::State;
@@ -1279,6 +1285,172 @@ pub async fn tree(
     let state = State::deserialize(repository.clone(), revision).await?;
     let paths = gather_tree_paths(state, repository, path, max_depth, can_read).await?;
     Ok(TreeResult { paths })
+}
+
+/// Finds the revision that last changed a node, from what the state the node is read from
+/// records: the state's own revision when its delta names the node, otherwise the last change
+/// its file metadata records. A directory is recorded as changed in every revision that changes
+/// anything beneath it.
+///
+/// File metadata holds a first-parent and a second-parent change. The first-parent change is the
+/// answer unless only the second-parent one is recorded, or only the second-parent revision holds
+/// the node as it is now, compared by [`EntryAttributes`] and its path, as for a node a merge of divergent
+/// history takes from its second parent after that parent changed it again.
+///
+/// Reads one delta block per distinct state and one file metadata block per run of nodes in the
+/// same block. Where both changes are recorded, it also reads the node and its path in each
+/// recorded revision, once per distinct revision and node. Resolving the entries of a listing
+/// never walks history.
+pub struct LastChangedResolver {
+    repository: Arc<RepositoryContext>,
+    states: HashMap<(RepositoryId, Hash), LastChangedState>,
+    history_states: HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
+    history_entries: HashMap<(RepositoryId, Hash, NodeID), Option<(EntryAttributes, String)>>,
+}
+
+struct LastChangedState {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    delta: HashSet<NodeID>,
+    block: Option<(usize, Arc<NodeFileMetadataBlock>)>,
+}
+
+impl LastChangedResolver {
+    /// A resolver for nodes of states read through `repository` or a repository it links to.
+    pub fn new(repository: Arc<RepositoryContext>) -> Self {
+        Self {
+            repository,
+            states: HashMap::new(),
+            history_states: HashMap::new(),
+            history_entries: HashMap::new(),
+        }
+    }
+
+    /// The revision of `link.repository` that last changed node `link.node` as of revision
+    /// `link.revision`, or the zero hash when that state records no change of it.
+    pub async fn resolve(&mut self, link: &NodeLink) -> Result<Hash, StateError> {
+        let key = (link.repository, link.revision);
+        let entry = match self.states.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let repository = if link.repository == self.repository.id {
+                    self.repository.clone()
+                } else {
+                    self.repository.to_link_context(link.repository).await
+                };
+                let state = State::deserialize(repository.clone(), link.revision).await?;
+                let delta = state
+                    .delta_block(repository.clone())
+                    .await?
+                    .to_aligned::<NodeDelta>()
+                    .as_type_slice::<NodeDelta>()
+                    .iter()
+                    .map(|delta| delta.node)
+                    .collect();
+                vacant.insert(LastChangedState {
+                    repository,
+                    state,
+                    delta,
+                    block: None,
+                })
+            }
+        };
+
+        if entry.delta.contains(&link.node) {
+            return Ok(link.revision);
+        }
+
+        let metadata_node = node_to_file_metadata(link.node);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let block = match &entry.block {
+            Some((index, block)) if *index == block_index => block.clone(),
+            _ => {
+                let block = entry
+                    .state
+                    .block_file_metadata(entry.repository.clone(), block_index)
+                    .await?;
+                entry.block = Some((block_index, block.clone()));
+                block
+            }
+        };
+        let history = *block.read().node(NodeFileMetadata::index(metadata_node));
+        if history.revision[0].is_zero() || history.revision[1].is_zero() {
+            return Ok(if history.revision[0].is_zero() {
+                history.revision[1]
+            } else {
+                history.revision[0]
+            });
+        }
+
+        let current = Some((
+            entry_attributes(
+                &entry
+                    .state
+                    .node(entry.repository.clone(), link.node)
+                    .await?,
+            ),
+            entry
+                .state
+                .node_path(entry.repository.clone(), link.node)
+                .await?,
+        ));
+        let repository = entry.repository.clone();
+        for slot in 0..2 {
+            let key = (repository.id, history.revision[slot], history.node[slot]);
+            if !self.history_entries.contains_key(&key) {
+                let held = entry_in(
+                    &mut self.history_states,
+                    &repository,
+                    history.revision[slot],
+                    history.node[slot],
+                )
+                .await;
+                self.history_entries.insert(key, held);
+            }
+            if self.history_entries[&key] == current {
+                return Ok(history.revision[slot]);
+            }
+        }
+        Ok(history.revision[0])
+    }
+}
+
+/// The attributes of a node whose change a commit records as a change of the entry: its kind,
+/// case-insensitive name hash, mode, size and address, and for a link the node it targets.
+/// Staging and dirty tracking flags are left out.
+type EntryAttributes = (u16, u64, u16, u64, Address, NodeID);
+
+fn entry_attributes(node: &Node) -> EntryAttributes {
+    let kind = node.flags & (NodeFlags::File.bits() | NodeFlags::Link.bits());
+    let target = if node.is_link() { node.child } else { 0 };
+    (
+        kind,
+        node.name_hash,
+        node.mode,
+        node.size,
+        node.address,
+        target,
+    )
+}
+
+/// The attributes and path of node `node_id` of `revision`, or `None` when the revision cannot
+/// be read or holds no such node.
+async fn entry_in(
+    states: &mut HashMap<(RepositoryId, Hash), Option<Arc<State>>>,
+    repository: &Arc<RepositoryContext>,
+    revision: Hash,
+    node_id: NodeID,
+) -> Option<(EntryAttributes, String)> {
+    let state = match states.entry((repository.id, revision)) {
+        std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(State::deserialize(repository.clone(), revision).await.ok())
+        }
+    }
+    .as_ref()?;
+    let node = state.node(repository.clone(), node_id).await.ok()?;
+    let path = state.node_path(repository.clone(), node_id).await.ok()?;
+    Some((entry_attributes(&node), path))
 }
 
 /// What a revision specifier names on a branch.

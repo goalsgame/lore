@@ -5126,6 +5126,8 @@ pub struct TreePath {
     /// True when a link node tracks its parent's branch; false for pinned
     /// links and all non-link nodes.
     pub tracking: bool,
+    /// The node, with the repository and revision of the state it was read from.
+    pub link: NodeLink,
 }
 
 pub type CanReadRepository = Arc<dyn Fn(RepositoryId) -> bool + Send + Sync>;
@@ -5309,6 +5311,11 @@ async fn gather_tree_paths_node(
         size: node.size,
         mode: node.mode as u64,
         tracking,
+        link: NodeLink {
+            node: node_id,
+            repository: repository.id,
+            revision: state.revision(),
+        },
     });
 
     let depth_remaining = max_depth == 0 || depth + 1 < max_depth;

@@ -124,6 +124,10 @@ message RevisionTreeRequest {
   // emits only direct children of the prefix root; 2 emits direct
   // children plus grandchildren; etc. 0 or unset means unbounded.
   optional uint32 max_depth = 4;
+  // If true, each TreeNode carries `last_changed`. Costs one delta block
+  // read per revision walked and one file metadata block read per run of
+  // entries sharing a block; history is never walked.
+  optional bool include_last_changed = 5;
 }
 
 // Header for a RevisionTree stream. Echoes the resolved revision so
