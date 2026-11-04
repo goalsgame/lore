@@ -435,6 +435,74 @@ mod authorized_session {
         assert!(matches!(err, MessageHandleError::FragmentNotFound));
     }
 
+    #[tokio::test]
+    async fn expired_sessions_reject_reads_and_writes_even_with_cached_grants() {
+        let service = authenticated_service().await;
+        let repository = random::<lore_revision::lore::RepositoryId>();
+        let resource = format!("urc-{repository}");
+        let live = start_session(
+            &service,
+            repository,
+            &signed_token(&[&resource], &["write"]),
+        )
+        .await
+        .unwrap();
+        let (grants, expired_token) = {
+            let session = service.session_map.get(live).unwrap();
+            let verified = session.token.as_ref().unwrap();
+            let mut claims = verified.claims.clone();
+            claims.expires = 0;
+            (
+                session.grants.clone(),
+                Arc::new(
+                    lore_server::authnz::repository_authorizer::VerifiedTokenOwned {
+                        raw: verified.raw.clone(),
+                        claims,
+                    },
+                ),
+            )
+        };
+        // Seed the state of a previously authenticated session whose clock has
+        // passed exp, without a wall-clock sleep or JWT-validation leeway.
+        for grants in [grants, None] {
+            let (expired, _) = service
+                .session_map
+                .start(
+                    repository,
+                    "expired".into(),
+                    "test-user".into(),
+                    grants,
+                    Some(expired_token.clone()),
+                )
+                .unwrap();
+            for command in [
+                copy_command(expired, repository),
+                ParsedStorageRequestV4::StorageCommand {
+                    session_id: expired,
+                    opcode: Command::Query as u8,
+                    payload: Bytes::from(vec![0u8; 48]),
+                },
+            ] {
+                let error = service
+                    .run_request_handler(AttributeMap::default().into(), command)
+                    .await
+                    .expect_err("expired sessions must never reach storage");
+                assert!(
+                    matches!(error, MessageHandleError::AuthorizationFailure(message)
+                    if message.contains("expired"))
+                );
+            }
+        }
+        let error = service
+            .run_request_handler(
+                AttributeMap::default().into(),
+                copy_command(live, repository),
+            )
+            .await
+            .expect_err("the live session still reaches the missing fragment");
+        assert!(matches!(error, MessageHandleError::FragmentNotFound));
+    }
+
     /// Any grant on the session's partition permits a read command.
     #[tokio::test]
     async fn any_grant_on_the_session_permits_a_read_command() {

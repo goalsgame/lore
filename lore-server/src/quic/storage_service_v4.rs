@@ -284,6 +284,10 @@ impl QuicService for StorageServiceV4 {
                     .get(session_id)
                     .ok_or(MessageHandleError::NotConnected)?;
 
+                if let Some(token) = session.token.as_ref() {
+                    crate::quic::storage_service::reject_expired_token(&token.claims)?;
+                }
+
                 let repository = session.repository;
                 let correlation_id = session.correlation_id.clone();
                 let user_id = session.user_id.clone();

@@ -507,6 +507,10 @@ fn reject_expired_connection(context: &Arc<AttributeMap>) -> Result<(), MessageH
         // `Connect` already decided; expiry is not this function's to invent.
         return Ok(());
     };
+    reject_expired_token(&token)
+}
+
+pub(crate) fn reject_expired_token(token: &AuthorizationToken) -> Result<(), MessageHandleError> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |since| since.as_secs());
