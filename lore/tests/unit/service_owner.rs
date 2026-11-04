@@ -519,7 +519,10 @@ async fn disconnected_reply_peer_stops_forwarding_after_the_first_native_write_f
             repository_path: lore::interface::LoreString::from(repository.to_str().unwrap()),
             ..Default::default()
         },
-        command: lore::remote::command::LoreCommand::BranchInfo(Default::default()),
+        command: lore::remote::command::LoreCommand::BranchInfo(lore::branch::LoreBranchInfoArgs {
+            branch: lore::interface::LoreString::from("missing"),
+            link: Default::default(),
+        }),
         environment: Default::default(),
     };
     message::write_payload(&mut client, &message::encode_message(&command)).unwrap();
