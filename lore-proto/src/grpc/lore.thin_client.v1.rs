@@ -132,8 +132,10 @@ pub struct TreeNode {
     pub tracking: bool,
     /// Revision that last changed this entry, as of the revision walked: the
     /// newest revision on its first-parent line that changed the file, or for a
-    /// DIRECTORY anything beneath it. A change merged in from another branch
-    /// reports the merge revision. For an entry inside a linked repository, the
+    /// DIRECTORY anything beneath it. An entry a merge changed reports the
+    /// merge revision; one with no first-parent history, as a merge of divergent
+    /// history takes unchanged from its second parent, reports the change on the
+    /// second parent's line. For an entry inside a linked repository, the
     /// revision belongs to that repository. Set only when the request sets
     /// `include_last_changed` and the revision records the change.
     #[prost(message, optional, tag = "7")]

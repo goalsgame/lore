@@ -1741,3 +1741,106 @@ async fn last_changed_is_omitted_unless_requested() {
     }))
     .await;
 }
+
+/// Walks a host repository whose tree links another repository, each with
+/// its own branch and history. The mount reports the host revision that
+/// added it; entries beneath it report the linked repository's revisions,
+/// identified on the linked branch.
+#[tokio::test]
+async fn include_last_changed_reports_linked_entries_in_the_linked_repository() {
+    let host = random::<RepositoryId>();
+    let linked = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let linked_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            linked,
+        ));
+        let linked_branch = BranchId::from(uuid::Uuid::now_v7());
+        let state = Arc::new(state::State::new());
+        let inner = stage_add(
+            &state,
+            &linked_context,
+            ROOT_NODE,
+            "inner",
+            NodeFlags::NoFlags,
+        )
+        .await;
+        stage_add(&state, &linked_context, inner, "a.txt", NodeFlags::File).await;
+        stage_add(&state, &linked_context, inner, "b.txt", NodeFlags::File).await;
+        let linked1 = commit_on(&linked_context, &state, Hash::default(), linked_branch).await;
+        let state = state::State::deserialize(linked_context.clone(), linked1)
+            .await
+            .expect("state");
+        stage_modify(&state, &linked_context, "inner/a.txt").await;
+        let linked2 = commit_on(&linked_context, &state, linked1, linked_branch).await;
+
+        let host_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            host,
+        ));
+        let host_branch = BranchId::from(uuid::Uuid::now_v7());
+        let state = Arc::new(state::State::new());
+        stage_add(
+            &state,
+            &host_context,
+            ROOT_NODE,
+            "host.txt",
+            NodeFlags::File,
+        )
+        .await;
+        let host1 = commit_on(&host_context, &state, Hash::default(), host_branch).await;
+
+        let state = state::State::deserialize(host_context.clone(), host1)
+            .await
+            .expect("state");
+        let mount = Node {
+            flags: NodeFlags::Link.bits(),
+            child: ROOT_NODE,
+            address: lore_base::types::Address {
+                hash: linked2,
+                context: linked.into(),
+            },
+            name_hash: hash_string("mount"),
+            ..Default::default()
+        };
+        let mount_id = state
+            .node_add(host_context.clone(), ROOT_NODE, mount, "mount")
+            .await
+            .expect("node_add mount");
+        state
+            .node_mark_staged(
+                host_context.clone(),
+                mount_id,
+                NodeFlags::StagedAdd,
+                NodeFlags::DirtyAdd,
+            )
+            .await
+            .expect("stage mount");
+        let host2 = commit_on(&host_context, &state, host1, host_branch).await;
+
+        let state = state::State::deserialize(host_context.clone(), host2)
+            .await
+            .expect("state");
+        stage_modify(&state, &host_context, "host.txt").await;
+        let host3 = commit_on(&host_context, &state, host2, host_branch).await;
+
+        let actual = last_changed_by_path(host, host3, immutable_store, mutable_store).await;
+        let expected: std::collections::BTreeMap<_, _> = [
+            ("host.txt", Some((host3, host_branch, 3))),
+            ("mount", Some((host2, host_branch, 2))),
+            ("mount/inner", Some((linked2, linked_branch, 2))),
+            ("mount/inner/a.txt", Some((linked2, linked_branch, 2))),
+            ("mount/inner/b.txt", Some((linked1, linked_branch, 1))),
+        ]
+        .into_iter()
+        .map(|(path, last)| (path.to_string(), last))
+        .collect();
+        assert_eq!(actual, expected);
+    }))
+    .await;
+}
