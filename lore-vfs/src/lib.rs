@@ -13,6 +13,7 @@ pub mod checkpoint_owner;
 pub mod core;
 pub mod digest;
 pub mod digest_index;
+mod file_lock;
 pub mod linux_working;
 pub mod namespace;
 pub mod overlay;

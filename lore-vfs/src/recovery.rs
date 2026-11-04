@@ -81,11 +81,11 @@ impl From<std::io::Error> for Error {
     }
 }
 
-/// Retains a process-scoped exclusive advisory lock until dropped. Lock-file
+/// Retains an exclusive advisory lock until dropped. Lock-file
 /// presence does not indicate a live owner; the OS releases ownership on exit.
 pub struct Recovery {
     directory: PathBuf,
-    _lock: File,
+    _lock: crate::file_lock::FileLock,
     directory_file: File,
     limits: Limits,
     uncertain: bool,
@@ -216,11 +216,11 @@ impl Recovery {
                 Err(error) => return Err(error.into()),
             }
         };
-        match lock.try_lock() {
-            Ok(()) => {}
+        let lock = match crate::file_lock::FileLock::try_lock(lock) {
+            Ok(lock) => lock,
             Err(std::fs::TryLockError::WouldBlock) => return Err(Error::Busy),
             Err(std::fs::TryLockError::Error(error)) => return Err(error.into()),
-        }
+        };
         transition_admission::check(&directory)?;
         let recovery = Self {
             directory,
