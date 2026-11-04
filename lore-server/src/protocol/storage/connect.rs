@@ -65,6 +65,8 @@ impl Message for Connect {
         jwt_verifier: Arc<Option<JwtVerifier>>,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     ) -> Result<LoreResponse, MessageHandleError> {
+        let _authorization = context.storage_authorization.write().await;
+
         // Make sure a correlation ID exists
         if context.get::<CorrelationId>().is_none() {
             warn!("Connection is missing correlation ID");

@@ -545,6 +545,13 @@ impl QuicService for StorageService {
         context: Arc<AttributeMap>,
         request: Self::ParsedRequestType,
     ) -> Result<Vec<Bytes>, Self::RequestHandlerError> {
+        let authorization = context.storage_authorization.clone();
+        let _authorization = if matches!(request, ParsedStorageRequest::Connect(_)) {
+            // Connect takes the write guard itself, including direct callers.
+            None
+        } else {
+            Some(authorization.read().await)
+        };
         if !matches!(request, ParsedStorageRequest::Connect(_)) {
             reject_expired_connection(&context)?;
         }

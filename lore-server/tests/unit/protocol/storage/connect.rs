@@ -336,6 +336,105 @@ mod authorized_connect {
         );
     }
 
+    struct PausedEnumeration {
+        calls: std::sync::atomic::AtomicUsize,
+        release: tokio::sync::Notify,
+    }
+
+    #[async_trait]
+    impl RepositoryAuthorizer for PausedEnumeration {
+        async fn check_repository_access(
+            &self,
+            token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
+            repository: RepositoryId,
+            action: Action,
+        ) -> Result<(), tonic::Status> {
+            SelectiveEnumeration
+                .check_repository_access(token, repository, action)
+                .await
+        }
+
+        async fn granted_actions(
+            &self,
+            token: Option<&lore_server::authnz::repository_authorizer::VerifiedToken<'_>>,
+            repository: RepositoryId,
+        ) -> Result<Option<lore_server::authnz::repository_authorizer::Grants>, tonic::Status>
+        {
+            if self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                self.release.notified().await;
+            }
+            SelectiveEnumeration
+                .granted_actions(token, repository)
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrent_reconnects_and_dispatch_keep_one_authorization_identity() {
+        use lore_server::quic::QuicService;
+        use lore_server::quic::storage_service::ParsedStorageRequest;
+        use lore_server::quic::storage_service::StorageService;
+
+        let repository = random::<RepositoryId>();
+        let context = Arc::new(AttributeMap::default());
+        let authorizer = Arc::new(PausedEnumeration {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            release: tokio::sync::Notify::new(),
+        });
+        let writer = Connect {
+            repository,
+            auth_token: Some(signed_token(&format!("urc-{repository}"), &["write"])),
+        };
+        let reader = Connect {
+            repository,
+            auth_token: Some(signed_token(&format!("urc-{repository}"), &["read"])),
+        };
+        let first = writer.handle_auth(context.clone(), verifier(), authorizer.clone());
+        let second = reader.handle_auth(context.clone(), verifier(), authorizer.clone());
+        tokio::pin!(first, second);
+        let wait = Duration::from_millis(20);
+        assert!(tokio::time::timeout(wait, &mut first).await.is_err());
+        assert_eq!(
+            authorizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(tokio::time::timeout(wait, &mut second).await.is_err());
+        assert_eq!(
+            authorizer.calls.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let (immutable, mutable, _execution) = crate::store::test_support::test_store_create()
+            .await
+            .unwrap();
+        let service = StorageService::new(
+            verifier(),
+            authorizer.clone(),
+            immutable.clone(),
+            immutable,
+            mutable,
+        );
+        let command = ParsedStorageRequest::Copy(
+            lore_server::protocol::storage::copy::Copy::parse(bytes::Bytes::from(vec![0u8; 64]))
+                .unwrap(),
+        );
+        let dispatch = service.run_request_handler(context.clone(), command);
+        tokio::pin!(dispatch);
+        assert!(tokio::time::timeout(wait, &mut dispatch).await.is_err());
+        authorizer.release.notify_one();
+        first.await.unwrap();
+        second.await.unwrap();
+        assert!(matches!(
+            dispatch.await,
+            Err(MessageHandleError::AuthorizationFailure(_))
+        ));
+        assert!(context.get::<PartitionGrants>().is_none());
+        assert_eq!(
+            context.get::<RawToken>().unwrap().0.as_str(),
+            reader.auth_token.as_deref().unwrap()
+        );
+    }
+
     #[tokio::test]
     async fn ungranted_connect_is_refused() {
         let message = Connect {
