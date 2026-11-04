@@ -60,6 +60,23 @@ fn connected(repository: RepositoryId, actions: &[&str]) -> Arc<AttributeMap> {
     context.into()
 }
 
+#[tokio::test]
+async fn expired_writer_is_rejected_before_dispatch() {
+    let service = service().await;
+    let repository = random::<RepositoryId>();
+    let context = connected(repository, &["write"]);
+    let mut token = context
+        .get::<AuthorizationToken>()
+        .unwrap()
+        .as_ref()
+        .clone();
+    token.expires = 0;
+    context.insert(token);
+    assert!(refused(
+        &service.run_request_handler(context, copy(repository)).await
+    ));
+}
+
 fn query() -> ParsedStorageRequest {
     ParsedStorageRequest::Query(Query::parse(Bytes::from(vec![0u8; 48])).unwrap())
 }
