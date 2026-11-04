@@ -139,6 +139,22 @@ message TreeNode {
   // True when a link entry tracks its parent's branch; false for pinned links
   // and non-link entries.
   bool tracking = 6;
+  // Revision that last changed this entry, as of the revision walked: the
+  // newest revision on its first-parent line that changed the file, or for a
+  // DIRECTORY anything beneath it. A change merged in from another branch
+  // reports the merge revision. For an entry inside a linked repository, the
+  // revision belongs to that repository. Set only when the request sets
+  // `include_last_changed` and the revision records the change.
+  RevisionReference last_changed = 7;
+}
+
+// A revision named by its content signature and its resolved (branch, number).
+message RevisionReference {
+  // Content signature of the revision.
+  bytes signature = 1;
+  // Resolved (branch, number) of the revision. Unset when it cannot be
+  // resolved.
+  lore.model.v1.RevisionIdentifier identifier = 2;
 }
 
 // Self-describing revision record. Carries the resolved RevisionIdentifier

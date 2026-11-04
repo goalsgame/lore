@@ -10,6 +10,8 @@ pub mod restore;
 pub mod revert;
 pub mod sync;
 
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -41,10 +43,14 @@ use crate::lore_warn;
 use crate::metadata;
 use crate::metadata::Metadata;
 use crate::node::Node;
+use crate::node::NodeDelta;
 use crate::node::NodeFileMetadata;
 use crate::node::NodeFileMetadataBlock;
 use crate::node::NodeFlags;
+use crate::node::NodeID;
 use crate::node::NodeIDExt;
+use crate::node::NodeLink;
+use crate::node::node_to_file_metadata;
 use crate::repository::RepositoryContext;
 use crate::state;
 use crate::state::State;
@@ -1279,6 +1285,90 @@ pub async fn tree(
     let state = State::deserialize(repository.clone(), revision).await?;
     let paths = gather_tree_paths(state, repository, path, max_depth, can_read).await?;
     Ok(TreeResult { paths })
+}
+
+/// Finds the revision that last changed a node, from what the state the node is read from
+/// records: the state's own revision when its delta names the node, otherwise the last change
+/// its file metadata records on the first-parent line. A directory is recorded as changed in
+/// every revision that changes anything beneath it.
+///
+/// Reads one delta block per distinct state and one file metadata block per run of nodes in the
+/// same block, so resolving the entries of a listing never walks history.
+pub struct LastChangedResolver {
+    repository: Arc<RepositoryContext>,
+    states: HashMap<(RepositoryId, Hash), LastChangedState>,
+}
+
+struct LastChangedState {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    delta: HashSet<NodeID>,
+    block: Option<(usize, Arc<NodeFileMetadataBlock>)>,
+}
+
+impl LastChangedResolver {
+    /// A resolver for nodes of states read through `repository` or a repository it links to.
+    pub fn new(repository: Arc<RepositoryContext>) -> Self {
+        Self {
+            repository,
+            states: HashMap::new(),
+        }
+    }
+
+    /// The revision of `link.repository` that last changed node `link.node` as of revision
+    /// `link.revision`, or the zero hash when that state records no change of it.
+    pub async fn resolve(&mut self, link: &NodeLink) -> Result<Hash, StateError> {
+        let key = (link.repository, link.revision);
+        let entry = match self.states.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(vacant) => {
+                let repository = if link.repository == self.repository.id {
+                    self.repository.clone()
+                } else {
+                    self.repository.to_link_context(link.repository).await
+                };
+                let state = State::deserialize(repository.clone(), link.revision).await?;
+                let delta = state
+                    .delta_block(repository.clone())
+                    .await?
+                    .to_aligned::<NodeDelta>()
+                    .as_type_slice::<NodeDelta>()
+                    .iter()
+                    .map(|delta| delta.node)
+                    .collect();
+                vacant.insert(LastChangedState {
+                    repository,
+                    state,
+                    delta,
+                    block: None,
+                })
+            }
+        };
+
+        if entry.delta.contains(&link.node) {
+            return Ok(link.revision);
+        }
+
+        let metadata_node = node_to_file_metadata(link.node);
+        let block_index = NodeFileMetadataBlock::index(metadata_node);
+        let block = match &entry.block {
+            Some((index, block)) if *index == block_index => block.clone(),
+            _ => {
+                let block = entry
+                    .state
+                    .block_file_metadata(entry.repository.clone(), block_index)
+                    .await?;
+                entry.block = Some((block_index, block.clone()));
+                block
+            }
+        };
+        let history = *block.read().node(NodeFileMetadata::index(metadata_node));
+        Ok(if history.revision[0].is_zero() {
+            history.revision[1]
+        } else {
+            history.revision[0]
+        })
+    }
 }
 
 /// What a revision specifier names on a branch.

@@ -65,6 +65,7 @@ fn make_request(
         query: Some(query),
         path_prefix,
         max_depth,
+        include_last_changed: None,
     });
     request.metadata_mut().insert_bin(
         REPOSITORY_ID_KEY,
@@ -350,6 +351,7 @@ async fn unset_query_returns_invalid_argument() {
             query: None,
             path_prefix: None,
             max_depth: None,
+            include_last_changed: None,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -1464,6 +1466,278 @@ async fn path_prefix_into_unauthorized_link_returns_not_found() {
         ));
         let err = items[1].as_ref().expect_err("expected error item");
         assert_eq!(err.code(), tonic::Code::NotFound);
+    }))
+    .await;
+}
+
+/// Stages `node` as `name` under `parent` for addition, marking its ancestors.
+async fn stage_add(
+    state: &state::State,
+    repository: &Arc<RepositoryContext>,
+    parent: lore_revision::node::NodeID,
+    name: &str,
+    flags: NodeFlags,
+) -> lore_revision::node::NodeID {
+    let node = Node {
+        flags: flags.bits(),
+        mode: if flags == NodeFlags::File {
+            0o644
+        } else {
+            0o755
+        },
+        address: lore_base::types::Address {
+            hash: Hash::from_u64(0x5a),
+            context: lore_base::types::Context::from(uuid::Uuid::now_v7()),
+        },
+        name_hash: hash_string(name),
+        ..Default::default()
+    };
+    let node_id = state
+        .node_add(repository.clone(), parent, node, name)
+        .await
+        .expect("node_add");
+    state
+        .node_mark_staged(
+            repository.clone(),
+            node_id,
+            NodeFlags::StagedAdd,
+            NodeFlags::DirtyAdd,
+        )
+        .await
+        .expect("stage add");
+    node_id
+}
+
+/// Stages a content change to the file at `path`, marking its ancestors.
+async fn stage_modify(state: &state::State, repository: &Arc<RepositoryContext>, path: &str) {
+    let node_id = state
+        .find_node_link(repository.clone(), path)
+        .await
+        .expect("find node")
+        .node;
+    let address = lore_base::types::Address {
+        hash: Hash::from(random::<[u8; 32]>()),
+        context: lore_base::types::Context::default(),
+    };
+    state
+        .node_modify(repository.clone(), node_id, 0o644, 11, address)
+        .await
+        .expect("node_modify");
+    state
+        .node_mark_staged(
+            repository.clone(),
+            node_id,
+            NodeFlags::StagedModify,
+            NodeFlags::DirtyModify,
+        )
+        .await
+        .expect("stage modify");
+}
+
+async fn commit_on(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<state::State>,
+    current: Hash,
+    branch_id: BranchId,
+) -> Hash {
+    let mut metadata = Metadata::new();
+    metadata.set_branch(branch_id).expect("set branch");
+    lore_revision::commit::commit_in_memory_revision(
+        repository.clone(),
+        &get_write_token(),
+        state.clone(),
+        metadata,
+        current,
+        branch_id,
+    )
+    .await
+    .expect("commit")
+}
+
+/// Walks `signature` with `include_last_changed` and returns each entry's
+/// path with the signature and number of the revision that last changed it.
+async fn last_changed_by_path(
+    repository: RepositoryId,
+    signature: Hash,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+) -> std::collections::BTreeMap<String, Option<(Hash, BranchId, u64)>> {
+    let mut request = make_request(repository, Query::Signature(signature.into()), None, None);
+    request.get_mut().include_last_changed = Some(true);
+    let response = handler(
+        request,
+        immutable_store,
+        mutable_store,
+        allow_all(),
+        DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+    )
+    .await
+    .expect("handler ok");
+    collect(response)
+        .await
+        .into_iter()
+        .filter_map(|item| match item.expect("stream item").payload {
+            Some(Payload::Node(node)) => Some((
+                node.path,
+                node.last_changed.map(|last_changed| {
+                    let identifier = last_changed.identifier.expect("identifier resolved");
+                    (
+                        Hash::from(last_changed.signature.as_ref()),
+                        BranchId::from(identifier.branch_id.as_ref()),
+                        identifier.number,
+                    )
+                }),
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Commits a tree, then edits parts of it in later revisions, and checks that
+/// every entry reports the newest revision that changed it — for a directory,
+/// the newest change anywhere beneath it — both when that change is the
+/// revision walked and when it is an earlier one.
+#[tokio::test]
+async fn include_last_changed_reports_the_newest_change_of_each_entry() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+
+        let state = Arc::new(state::State::new());
+        stage_add(&state, &context, ROOT_NODE, "a.txt", NodeFlags::File).await;
+        stage_add(&state, &context, ROOT_NODE, "b.txt", NodeFlags::File).await;
+        let dir = stage_add(&state, &context, ROOT_NODE, "dir", NodeFlags::NoFlags).await;
+        stage_add(&state, &context, dir, "x.txt", NodeFlags::File).await;
+        stage_add(&state, &context, dir, "y.txt", NodeFlags::File).await;
+        let deep = stage_add(&state, &context, ROOT_NODE, "deep", NodeFlags::NoFlags).await;
+        let sub = stage_add(&state, &context, deep, "sub", NodeFlags::NoFlags).await;
+        stage_add(&state, &context, sub, "w.txt", NodeFlags::File).await;
+        let rev1 = commit_on(&context, &state, Hash::default(), branch_id).await;
+
+        let state = state::State::deserialize(context.clone(), rev1)
+            .await
+            .expect("state");
+        stage_modify(&state, &context, "a.txt").await;
+        stage_modify(&state, &context, "dir/x.txt").await;
+        let rev2 = commit_on(&context, &state, rev1, branch_id).await;
+
+        let state = state::State::deserialize(context.clone(), rev2)
+            .await
+            .expect("state");
+        stage_modify(&state, &context, "b.txt").await;
+        stage_modify(&state, &context, "deep/sub/w.txt").await;
+        let rev3 = commit_on(&context, &state, rev2, branch_id).await;
+
+        let state = state::State::deserialize(context.clone(), rev3)
+            .await
+            .expect("state");
+        stage_modify(&state, &context, "a.txt").await;
+        let rev4 = commit_on(&context, &state, rev3, branch_id).await;
+
+        let at = |signature: Hash, number: u64| Some((signature, branch_id, number));
+
+        let expected_at_rev3 = [
+            ("a.txt", at(rev2, 2)),
+            ("b.txt", at(rev3, 3)),
+            ("deep", at(rev3, 3)),
+            ("deep/sub", at(rev3, 3)),
+            ("deep/sub/w.txt", at(rev3, 3)),
+            ("dir", at(rev2, 2)),
+            ("dir/x.txt", at(rev2, 2)),
+            ("dir/y.txt", at(rev1, 1)),
+        ];
+        let actual = last_changed_by_path(
+            repository,
+            rev3,
+            immutable_store.clone(),
+            mutable_store.clone(),
+        )
+        .await;
+        assert_eq!(
+            actual,
+            expected_at_rev3
+                .iter()
+                .map(|(path, last)| (path.to_string(), *last))
+                .collect(),
+            "at revision 3"
+        );
+
+        let expected_at_rev4 = [
+            ("a.txt", at(rev4, 4)),
+            ("b.txt", at(rev3, 3)),
+            ("deep", at(rev3, 3)),
+            ("deep/sub", at(rev3, 3)),
+            ("deep/sub/w.txt", at(rev3, 3)),
+            ("dir", at(rev2, 2)),
+            ("dir/x.txt", at(rev2, 2)),
+            ("dir/y.txt", at(rev1, 1)),
+        ];
+        let actual = last_changed_by_path(
+            repository,
+            rev4,
+            immutable_store.clone(),
+            mutable_store.clone(),
+        )
+        .await;
+        assert_eq!(
+            actual,
+            expected_at_rev4
+                .iter()
+                .map(|(path, last)| (path.to_string(), *last))
+                .collect(),
+            "at revision 4"
+        );
+    }))
+    .await;
+}
+
+/// Without `include_last_changed`, no entry carries `last_changed`.
+#[tokio::test]
+async fn last_changed_is_omitted_unless_requested() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let branch_id = BranchId::from(uuid::Uuid::now_v7());
+        let state = Arc::new(state::State::new());
+        stage_add(&state, &context, ROOT_NODE, "a.txt", NodeFlags::File).await;
+        let rev1 = commit_on(&context, &state, Hash::default(), branch_id).await;
+
+        let response = handler(
+            make_request(repository, Query::Signature(rev1.into()), None, None),
+            immutable_store,
+            mutable_store,
+            allow_all(),
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("handler ok");
+        let nodes: Vec<_> = collect(response)
+            .await
+            .into_iter()
+            .filter_map(|item| match item.expect("stream item").payload {
+                Some(Payload::Node(node)) => Some(node),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].last_changed, None);
     }))
     .await;
 }
