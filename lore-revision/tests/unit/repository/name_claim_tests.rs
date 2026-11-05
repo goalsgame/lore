@@ -242,7 +242,7 @@ async fn a_failure_after_an_overlapping_success_keeps_the_name_mapped() {
     let survivor = repository::create_with_claimed_name(survivor_context, "a", async move {
         repository::metadata_store_hash(stored, Hash::from_context(Context::from([7u8; 16])))
             .await
-            .map_err(|_| "storing metadata failed")
+            .map_err(|err| err.to_string())
     })
     .await
     .unwrap();
