@@ -4301,6 +4301,59 @@ pub async fn store_name_to_id(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
+/// Claims `name` for `id` in one compare-and-swap, so concurrent creates of one name cannot both
+/// succeed. Returns `None` when `id` holds the name afterwards, whether it was free, released or
+/// already held by `id`, and the repository holding it otherwise.
+pub async fn claim_name(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<Option<RepositoryId>, RepositoryError> {
+    let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    let claimed = Hash::from_context(id.into());
+    let previous = handle
+        .compare_and_swap(
+            RepositoryId::default(),
+            key,
+            Hash::default(),
+            claimed,
+            key_type,
+        )
+        .await
+        .forward::<RepositoryError>("Failed to claim repository name")?;
+    if previous.is_zero() || previous == claimed {
+        return Ok(None);
+    }
+    Ok(Some(RepositoryId::from(previous.to_context())))
+}
+
+/// Gives up a claim [`claim_name`] made for `id`, leaving the name alone when another repository
+/// holds it.
+pub async fn release_name(
+    repository: Arc<RepositoryContext>,
+    name: impl AsRef<str>,
+    id: RepositoryId,
+) -> Result<(), RepositoryError> {
+    let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
+    let handle = repository
+        .try_write_mutable_store()
+        .ok_or_else(|| RepositoryError::from(WriteRequired))?;
+    handle
+        .compare_and_swap(
+            RepositoryId::default(),
+            key,
+            Hash::from_context(id.into()),
+            Hash::default(),
+            key_type,
+        )
+        .await
+        .forward::<RepositoryError>("Failed to release repository name")?;
+    Ok(())
+}
+
 pub async fn delete_name_to_id(
     repository: Arc<RepositoryContext>,
     name: impl AsRef<str>,
