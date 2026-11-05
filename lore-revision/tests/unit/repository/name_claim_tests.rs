@@ -5,6 +5,7 @@
 use std::sync::Arc;
 
 use lore_base::types::Context;
+use lore_base::types::Hash;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
 use lore_revision::repository::ClaimedCreate;
@@ -210,6 +211,47 @@ async fn an_overlapping_failed_attempt_does_not_leave_the_name_unmapped() {
     assert!(matches!(
         survivor.await.unwrap().unwrap(),
         ClaimedCreate::Ran(Ok(()))
+    ));
+    assert_eq!(holder_of(&stores, "a").await, Some(id));
+}
+
+/// The same overlap finishing the other way round: the survivor completes first, then the attempt
+/// that inserted the claim fails. The name must stay mapped to the created repository.
+#[tokio::test]
+async fn a_failure_after_an_overlapping_success_keeps_the_name_mapped() {
+    use tokio::sync::oneshot;
+
+    let stores = stores().await;
+    let id = repository_id(1);
+
+    let (inserter_started, inserter_running) = oneshot::channel::<()>();
+    let (fail_inserter, inserter_fails) = oneshot::channel::<()>();
+    let inserter = tokio::spawn(repository::create_with_claimed_name(
+        server_context(&stores, id),
+        "a",
+        async move {
+            inserter_started.send(()).unwrap();
+            inserter_fails.await.unwrap();
+            Err::<(), &str>("failed")
+        },
+    ));
+    inserter_running.await.unwrap();
+
+    let survivor_context = server_context(&stores, id);
+    let stored = survivor_context.clone();
+    let survivor = repository::create_with_claimed_name(survivor_context, "a", async move {
+        repository::metadata_store_hash(stored, Hash::from_context(Context::from([7u8; 16])))
+            .await
+            .map_err(|_| "storing metadata failed")
+    })
+    .await
+    .unwrap();
+    assert!(matches!(survivor, ClaimedCreate::Ran(Ok(()))));
+
+    fail_inserter.send(()).unwrap();
+    assert!(matches!(
+        inserter.await.unwrap().unwrap(),
+        ClaimedCreate::Ran(Err("failed"))
     ));
     assert_eq!(holder_of(&stores, "a").await, Some(id));
 }

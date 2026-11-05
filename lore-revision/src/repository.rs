@@ -4353,8 +4353,9 @@ pub enum ClaimedCreate<T, E> {
 }
 
 /// Runs `create` holding `name` for `repository`. Only the attempt that inserted the claim
-/// releases it when `create` fails, and a successful `create` claims the name again, so an
-/// overlapping attempt for the same ID that fails cannot leave the name unmapped.
+/// releases it when `create` fails, and claims it back when another attempt for the same ID has
+/// stored the repository by then; a successful `create` claims the name again. Either way an
+/// overlapping attempt for the same ID that fails cannot leave a created repository unmapped.
 pub async fn create_with_claimed_name<T, E>(
     repository: Arc<RepositoryContext>,
     name: &str,
@@ -4376,6 +4377,12 @@ pub async fn create_with_claimed_name<T, E>(
         Err(_) if inserted => {
             if let Err(err) = release_name(repository.clone(), name, id).await {
                 lore_warn!("Releasing repository name {name} after a failed create failed: {err}");
+            } else if metadata_hash(repository.clone())
+                .await
+                .is_ok_and(|hash| !hash.is_zero())
+                && let Err(err) = claim_name(repository.clone(), name, id).await
+            {
+                lore_warn!("Restoring repository name {name} for a completed create failed: {err}");
             }
         }
         Err(_) => {}
