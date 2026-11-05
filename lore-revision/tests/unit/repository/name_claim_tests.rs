@@ -57,7 +57,7 @@ async fn concurrent_claims_of_one_name_have_one_winner() {
         match result {
             Ok(NameClaim::Claimed) => {}
             Ok(NameClaim::HeldBy(holder)) => {
-                assert_eq!(*holder, winners[0], "losers are told who holds it")
+                assert_eq!(*holder, winners[0], "losers are told who holds it");
             }
             Ok(NameClaim::AlreadyHeld) => panic!("no claimant held the name before"),
             Err(err) => panic!("claim failed: {err}"),
