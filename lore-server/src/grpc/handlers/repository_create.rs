@@ -252,7 +252,7 @@ async fn repository_create(
     let created = repository::create_with_claimed_name(
         repository.clone(),
         name,
-        create_claimed(
+        Box::pin(create_claimed(
             repository.clone(),
             name,
             description,
@@ -262,7 +262,7 @@ async fn repository_create(
             created,
             registry,
             authorization,
-        ),
+        )),
     )
     .await
     .filter_slow_down()?
