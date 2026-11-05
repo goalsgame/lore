@@ -4301,14 +4301,24 @@ pub async fn store_name_to_id(
         .forward::<RepositoryError>("Failed to store repository metadata")
 }
 
-/// Claims `name` for `id` in one compare-and-swap, so concurrent creates of one name cannot both
-/// succeed. Returns `None` when `id` holds the name afterwards, whether it was free, released or
-/// already held by `id`, and the repository holding it otherwise.
+/// What [`claim_name`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NameClaim {
+    /// The name was free or released, and now maps to the claiming repository.
+    Claimed,
+    /// The name already mapped to the claiming repository.
+    AlreadyHeld,
+    /// Another repository holds the name.
+    HeldBy(RepositoryId),
+}
+
+/// Claims `name` for `id` in one compare-and-swap, so concurrent creates of one name with
+/// different IDs cannot both succeed.
 pub async fn claim_name(
     repository: Arc<RepositoryContext>,
     name: impl AsRef<str>,
     id: RepositoryId,
-) -> Result<Option<RepositoryId>, RepositoryError> {
+) -> Result<NameClaim, RepositoryError> {
     let (key, key_type) = mutable_name_key(repository.salt(), ID, name.as_ref());
     let handle = repository
         .try_write_mutable_store()
@@ -4324,10 +4334,53 @@ pub async fn claim_name(
         )
         .await
         .forward::<RepositoryError>("Failed to claim repository name")?;
-    if previous.is_zero() || previous == claimed {
-        return Ok(None);
+    Ok(if previous.is_zero() {
+        NameClaim::Claimed
+    } else if previous == claimed {
+        NameClaim::AlreadyHeld
+    } else {
+        NameClaim::HeldBy(RepositoryId::from(previous.to_context()))
+    })
+}
+
+/// The outcome of [`create_with_claimed_name`].
+#[derive(Debug)]
+pub enum ClaimedCreate<T, E> {
+    /// The name was claimed for the repository and `create` ran with this result.
+    Ran(Result<T, E>),
+    /// Another repository holds the name, before `create` ran or by the time it finished.
+    HeldBy(RepositoryId),
+}
+
+/// Runs `create` holding `name` for `repository`. Only the attempt that inserted the claim
+/// releases it when `create` fails, and a successful `create` claims the name again, so an
+/// overlapping attempt for the same ID that fails cannot leave the name unmapped.
+pub async fn create_with_claimed_name<T, E>(
+    repository: Arc<RepositoryContext>,
+    name: &str,
+    create: impl Future<Output = Result<T, E>>,
+) -> Result<ClaimedCreate<T, E>, RepositoryError> {
+    let id = repository.id;
+    let inserted = match claim_name(repository.clone(), name, id).await? {
+        NameClaim::Claimed => true,
+        NameClaim::AlreadyHeld => false,
+        NameClaim::HeldBy(holder) => return Ok(ClaimedCreate::HeldBy(holder)),
+    };
+    let result = create.await;
+    match &result {
+        Ok(_) => {
+            if let NameClaim::HeldBy(holder) = claim_name(repository.clone(), name, id).await? {
+                return Ok(ClaimedCreate::HeldBy(holder));
+            }
+        }
+        Err(_) if inserted => {
+            if let Err(err) = release_name(repository.clone(), name, id).await {
+                lore_warn!("Releasing repository name {name} after a failed create failed: {err}");
+            }
+        }
+        Err(_) => {}
     }
-    Ok(Some(RepositoryId::from(previous.to_context())))
+    Ok(ClaimedCreate::Ran(result))
 }
 
 /// Gives up a claim [`claim_name`] made for `id`, leaving the name alone when another repository

@@ -7,6 +7,8 @@ use std::sync::Arc;
 use lore_base::types::Context;
 use lore_revision::lore::RepositoryId;
 use lore_revision::repository;
+use lore_revision::repository::ClaimedCreate;
+use lore_revision::repository::NameClaim;
 use lore_revision::repository::RepositoryContext;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
@@ -47,14 +49,17 @@ async fn concurrent_claims_of_one_name_have_one_winner() {
     let winners: Vec<RepositoryId> = ids
         .iter()
         .zip(&results)
-        .filter(|(_, result)| matches!(result, Ok(None)))
+        .filter(|(_, result)| matches!(result, Ok(NameClaim::Claimed)))
         .map(|(id, _)| *id)
         .collect();
     assert_eq!(winners.len(), 1, "exactly one create may claim the name");
     for result in &results {
         match result {
-            Ok(None) => {}
-            Ok(Some(holder)) => assert_eq!(*holder, winners[0], "losers are told who holds it"),
+            Ok(NameClaim::Claimed) => {}
+            Ok(NameClaim::HeldBy(holder)) => {
+                assert_eq!(*holder, winners[0], "losers are told who holds it")
+            }
+            Ok(NameClaim::AlreadyHeld) => panic!("no claimant held the name before"),
             Err(err) => panic!("claim failed: {err}"),
         }
     }
@@ -73,11 +78,11 @@ async fn a_repository_can_claim_its_own_name_again() {
         repository::claim_name(context.clone(), "a", id)
             .await
             .unwrap(),
-        None
+        NameClaim::Claimed
     );
     assert_eq!(
         repository::claim_name(context, "a", id).await.unwrap(),
-        None
+        NameClaim::AlreadyHeld
     );
 }
 
@@ -89,7 +94,7 @@ async fn a_released_name_can_be_claimed_by_another_repository() {
         repository::claim_name(server_context(&stores, first), "a", first)
             .await
             .unwrap(),
-        None
+        NameClaim::Claimed
     );
     repository::release_name(server_context(&stores, first), "a", first)
         .await
@@ -98,7 +103,7 @@ async fn a_released_name_can_be_claimed_by_another_repository() {
         repository::claim_name(server_context(&stores, second), "a", second)
             .await
             .unwrap(),
-        None
+        NameClaim::Claimed
     );
 }
 
@@ -116,6 +121,95 @@ async fn releasing_does_not_take_a_name_another_repository_holds() {
         repository::claim_name(server_context(&stores, other), "a", other)
             .await
             .unwrap(),
-        Some(holder)
+        NameClaim::HeldBy(holder)
     );
+}
+
+async fn holder_of(
+    stores: &(Arc<dyn ImmutableStore>, Arc<dyn MutableStore>),
+    name: &str,
+) -> Option<RepositoryId> {
+    repository::id_from_name(server_context(stores, repository_id(99)), name)
+        .await
+        .ok()
+        .filter(|id| *id != RepositoryId::default())
+}
+
+#[tokio::test]
+async fn a_failed_create_releases_the_name_it_claimed() {
+    let stores = stores().await;
+    let id = repository_id(1);
+    let outcome = repository::create_with_claimed_name(server_context(&stores, id), "a", async {
+        Err::<(), &str>("failed")
+    })
+    .await
+    .unwrap();
+    assert!(matches!(outcome, ClaimedCreate::Ran(Err("failed"))));
+    assert_eq!(holder_of(&stores, "a").await, None);
+}
+
+#[tokio::test]
+async fn a_create_never_runs_under_a_name_another_repository_holds() {
+    let stores = stores().await;
+    let (holder, other) = (repository_id(1), repository_id(2));
+    repository::claim_name(server_context(&stores, holder), "a", holder)
+        .await
+        .unwrap();
+    let outcome =
+        repository::create_with_claimed_name(server_context(&stores, other), "a", async {
+            panic!("the create ran under a name another repository holds");
+            #[allow(unreachable_code)]
+            Ok::<(), ()>(())
+        })
+        .await
+        .unwrap();
+    assert!(matches!(outcome, ClaimedCreate::HeldBy(id) if id == holder));
+}
+
+/// Two overlapping attempts for one ID: the one that inserted the claim fails while the other is
+/// still running. The survivor must end with the name mapped to its repository.
+#[tokio::test]
+async fn an_overlapping_failed_attempt_does_not_leave_the_name_unmapped() {
+    use tokio::sync::oneshot;
+
+    let stores = stores().await;
+    let id = repository_id(1);
+
+    let (inserter_started, inserter_running) = oneshot::channel::<()>();
+    let (fail_inserter, inserter_fails) = oneshot::channel::<()>();
+    let inserter = tokio::spawn(repository::create_with_claimed_name(
+        server_context(&stores, id),
+        "a",
+        async move {
+            inserter_started.send(()).unwrap();
+            inserter_fails.await.unwrap();
+            Err::<(), &str>("failed")
+        },
+    ));
+    inserter_running.await.unwrap();
+
+    let (survivor_started, survivor_running) = oneshot::channel::<()>();
+    let (finish_survivor, survivor_finishes) = oneshot::channel::<()>();
+    let survivor = tokio::spawn(repository::create_with_claimed_name(
+        server_context(&stores, id),
+        "a",
+        async move {
+            survivor_started.send(()).unwrap();
+            survivor_finishes.await.unwrap();
+            Ok::<(), &str>(())
+        },
+    ));
+    survivor_running.await.unwrap();
+
+    fail_inserter.send(()).unwrap();
+    assert!(matches!(
+        inserter.await.unwrap().unwrap(),
+        ClaimedCreate::Ran(Err("failed"))
+    ));
+    finish_survivor.send(()).unwrap();
+    assert!(matches!(
+        survivor.await.unwrap().unwrap(),
+        ClaimedCreate::Ran(Ok(()))
+    ));
+    assert_eq!(holder_of(&stores, "a").await, Some(id));
 }

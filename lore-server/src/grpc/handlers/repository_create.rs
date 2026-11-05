@@ -249,42 +249,38 @@ async fn repository_create(
         };
     }
 
-    if let Some(holder) = repository::claim_name(repository.clone(), name, repository.id)
-        .await
-        .filter_slow_down()?
-        .warn_map_err(|err| {
-            Status::internal(format!("Failed to claim repository name {name}: {err}"))
-        })?
-    {
-        return Err(Status::already_exists(format!(
-            "Repository {} already exist with id {} which does not match {}",
-            name, holder, repository.id
-        )));
-    }
-
-    let result = create_claimed(
+    let created = repository::create_with_claimed_name(
         repository.clone(),
         name,
-        description,
-        default_branch_id,
-        default_branch_name,
-        creator,
-        created,
-        registry,
-        authorization,
+        create_claimed(
+            repository.clone(),
+            name,
+            description,
+            default_branch_id,
+            default_branch_name,
+            creator,
+            created,
+            registry,
+            authorization,
+        ),
     )
-    .await;
-    match &result {
-        Ok(_) => info!("Created repository {} with ID {}", name, repository.id),
-        Err(_) => {
-            if let Err(err) =
-                repository::release_name(repository.clone(), name, repository.id).await
-            {
-                warn!("Releasing repository name {name} after a failed create failed: {err}");
+    .await
+    .filter_slow_down()?
+    .warn_map_err(|err| {
+        Status::internal(format!("Failed to claim repository name {name}: {err}"))
+    })?;
+    match created {
+        repository::ClaimedCreate::Ran(result) => {
+            if result.is_ok() {
+                info!("Created repository {} with ID {}", name, repository.id);
             }
+            result
         }
+        repository::ClaimedCreate::HeldBy(holder) => Err(Status::already_exists(format!(
+            "Repository {} already exist with id {} which does not match {}",
+            name, holder, repository.id
+        ))),
     }
-    result
 }
 
 /// The part of a create that runs once `name` is claimed for `repository`.
