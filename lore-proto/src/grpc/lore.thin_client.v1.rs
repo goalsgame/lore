@@ -606,7 +606,7 @@ impl ::prost::Name for RevisionInfoResponse {
     }
 }
 /// Request to diff two revisions. Server picks the diff mode (2-way vs
-/// 3-way) from revision metadata; callers do not declare it.
+/// 3-way) from revision metadata unless `two_way` is set.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RevisionDiffRequest {
     /// When true and the server picks 3-way mode, auto-resolved
@@ -614,6 +614,12 @@ pub struct RevisionDiffRequest {
     /// ignored in 2-way mode.
     #[prost(bool, tag = "5")]
     pub autoresolve: bool,
+    /// When true, always compare the two revisions' trees directly
+    /// (2-way), regardless of their branches. The header's `_base` fields
+    /// stay unset and `autoresolve` is ignored. Default false lets the
+    /// server pick the mode.
+    #[prost(bool, tag = "6")]
+    pub two_way: bool,
     /// "From" side specifier.
     #[prost(oneof = "revision_diff_request::QueryFrom", tags = "1, 2")]
     pub query_from: ::core::option::Option<revision_diff_request::QueryFrom>,

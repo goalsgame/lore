@@ -161,6 +161,7 @@ fn v1_thin_client_field_shapes() {
         query_from: _,
         query_to: _,
         autoresolve: _,
+        two_way: _,
     } = RevisionDiffRequest::default();
     let _ = RevisionDiffQueryFrom::IdentifierFrom(Default::default());
     let _ = RevisionDiffQueryFrom::SignatureFrom(Default::default());

@@ -53,6 +53,7 @@ fn make_request(
         query_from: Some(from),
         query_to: Some(to),
         autoresolve,
+        two_way: false,
     });
     request.metadata_mut().insert_bin(
         REPOSITORY_ID_KEY,
@@ -167,6 +168,7 @@ async fn unset_query_from_returns_invalid_argument() {
             query_from: None,
             query_to: Some(QueryTo::SignatureTo(Hash::default().into())),
             autoresolve: false,
+            two_way: false,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -712,6 +714,7 @@ async fn unset_query_to_returns_invalid_argument() {
             query_from: Some(QueryFrom::SignatureFrom(Hash::default().into())),
             query_to: None,
             autoresolve: false,
+            two_way: false,
         });
         request.metadata_mut().insert_bin(
             REPOSITORY_ID_KEY,
@@ -908,6 +911,187 @@ async fn three_way_clean_merge_has_base_but_no_conflicts() {
                 .iter()
                 .all(|item| !matches!(item.payload, Some(Payload::Conflict(_)))),
             "expected zero conflicts for disjoint changes",
+        );
+    }))
+    .await;
+}
+
+/// `main` gains `shared.txt` then `extra.txt`; `feature` branches off
+/// `main`'s first revision and adds the same `shared.txt`. Returns
+/// `(feature_rev, main_rev2)`: merging `feature_rev` into `main_rev2`
+/// brings nothing, while their trees differ by `extra.txt`.
+async fn source_subsumed_by_target(repository: &Arc<RepositoryContext>) -> (Hash, Hash) {
+    let main = create_branch(repository, "main", vec![]).await;
+    let main_rev1 = push_revision(
+        repository,
+        main,
+        Hash::default(),
+        1,
+        &[("base.txt", b"base".as_slice())],
+    )
+    .await;
+    let feature = create_branch(
+        repository,
+        "feature",
+        vec![BranchPoint {
+            branch: main,
+            revision: main_rev1,
+        }],
+    )
+    .await;
+    let feature_rev = push_revision(
+        repository,
+        feature,
+        main_rev1,
+        1,
+        &[
+            ("base.txt", b"base".as_slice()),
+            ("shared.txt", b"shared".as_slice()),
+        ],
+    )
+    .await;
+    let main_rev2 = push_revision(
+        repository,
+        main,
+        main_rev1,
+        2,
+        &[
+            ("base.txt", b"base".as_slice()),
+            ("shared.txt", b"shared".as_slice()),
+            ("extra.txt", b"extra".as_slice()),
+        ],
+    )
+    .await;
+    (feature_rev, main_rev2)
+}
+
+async fn diff_items(
+    repository: RepositoryId,
+    immutable_store: Arc<dyn lore_storage::ImmutableStore>,
+    mutable_store: Arc<dyn lore_storage::MutableStore>,
+    from: Hash,
+    to: Hash,
+    two_way: bool,
+) -> Vec<RevisionDiffResponse> {
+    let mut request = make_request(
+        repository,
+        QueryFrom::SignatureFrom(from.into()),
+        QueryTo::SignatureTo(to.into()),
+        false,
+    );
+    request.get_mut().two_way = two_way;
+    let response = handler(
+        request,
+        immutable_store,
+        mutable_store,
+        allow_all(),
+        RevisionDiffConfig::default(),
+        DEFAULT_HISTORY_STEP_SIZE,
+        RevisionListAcceleration::default(),
+    )
+    .await
+    .expect("handler ok");
+    collect(response)
+        .await
+        .into_iter()
+        .map(|r| r.expect("stream item"))
+        .collect()
+}
+
+/// Sorted `(path, action)` of every file change in the stream.
+fn file_changes(items: &[RevisionDiffResponse]) -> Vec<(String, i32)> {
+    let mut changes: Vec<(String, i32)> = items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            Some(Payload::Change(change))
+                if change.node_type == thin_client_v1::NodeType::File as i32 =>
+            {
+                Some((change.path.clone(), change.action))
+            }
+            _ => None,
+        })
+        .collect();
+    changes.sort();
+    changes
+}
+
+#[tokio::test]
+async fn cross_branch_diff_defaults_to_three_way() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (feature_rev, main_rev2) = source_subsumed_by_target(&repository_context).await;
+
+        let items = diff_items(
+            repository,
+            immutable_store,
+            mutable_store,
+            feature_rev,
+            main_rev2,
+            false,
+        )
+        .await;
+        let header = match &items[0].payload {
+            Some(Payload::Header(h)) => h,
+            other => panic!("expected header, got {other:?}"),
+        };
+        assert!(header.identifier_base.is_some());
+        assert!(header.signature_base.is_some());
+        assert!(
+            file_changes(&items).is_empty(),
+            "3-way diff of a source already contained in the target should be empty",
+        );
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn two_way_request_compares_trees_across_branches() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (feature_rev, main_rev2) = source_subsumed_by_target(&repository_context).await;
+
+        let items = diff_items(
+            repository,
+            immutable_store,
+            mutable_store,
+            feature_rev,
+            main_rev2,
+            true,
+        )
+        .await;
+        let header = match &items[0].payload {
+            Some(Payload::Header(h)) => h,
+            other => panic!("expected header, got {other:?}"),
+        };
+        assert_eq!(header.signature_from, bytes::Bytes::from(feature_rev));
+        assert_eq!(header.signature_to, bytes::Bytes::from(main_rev2));
+        assert!(header.identifier_base.is_none());
+        assert!(header.signature_base.is_none());
+        assert!(
+            items[1..]
+                .iter()
+                .all(|item| !matches!(item.payload, Some(Payload::Conflict(_)))),
+            "2-way diff must not emit conflicts",
+        );
+        assert_eq!(
+            file_changes(&items),
+            vec![("extra.txt".to_string(), thin_client_v1::Action::Add as i32)],
         );
     }))
     .await;
