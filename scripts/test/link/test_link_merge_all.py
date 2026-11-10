@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 
 import pytest
-from error_types import ImproperArgumentsError
+from error_types import ImproperArgumentsError, LocalChanges
 from link_helpers import (
     link_pin,
     make_parent_with_link,
@@ -154,6 +154,90 @@ def test_link_merge_all(new_lore_repo):
     assert "local branch in sync with remote" in status.lower(), (
         f"Working tree should be clean after merge commit - Got:\n{status}"
     )
+
+
+def _diverge_linked_build_file(
+    new_lore_repo, link_path: str, source_path: str = "/"
+) -> tuple:
+    """Parent and linked repository each holding a `BUILD.bazel` of their own, with
+    `feature-branch` changing the linked one and `main` changing another linked file,
+    so the link merge is a three-way one. Returns (parent, link_repo) on `main`."""
+    prefix = "" if source_path == "/" else f"{source_path}/"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {
+            f"{prefix}BUILD.bazel": "linked build file, base\n",
+            f"{prefix}other.txt": "linked other file, base\n",
+        },
+        {
+            "BUILD.bazel": "parent build file, which is longer than the linked one\n",
+        },
+        source_path=source_path,
+    )
+
+    urc.branch_create("feature-branch")
+    with urc.open_file(f"{link_path}/BUILD.bazel", "w+") as f:
+        f.writelines(["linked build file, changed on feature-branch\n"])
+    urc.stage(scan=True)
+    urc.commit("Change the linked build file")
+    urc.push()
+
+    urc.branch_switch("main")
+    with urc.open_file(f"{link_path}/other.txt", "w+") as f:
+        f.writelines(["linked other file, changed on main\n"])
+    urc.stage(scan=True)
+    urc.commit("Change another linked file")
+    urc.push()
+
+    return urc, link_repo
+
+
+@pytest.mark.smoke
+def test_link_merge_all_checks_a_linked_file_at_the_mount(new_lore_repo):
+    """A linked file is checked for local changes at the mount, not at the path the linked
+    repository spells it by.
+
+    The parent holds a `BUILD.bazel` of its own at the path the linked repository's
+    `BUILD.bazel` has below its root. Checking the incoming linked file against the parent's
+    would report it as locally changed and refuse the merge.
+    """
+    link_path = "linked/repo"
+    urc, _link_repo = _diverge_linked_build_file(new_lore_repo, link_path)
+
+    urc.branch_merge_start("feature-branch", message="Merge the linked build file")
+
+    with urc.open_file(f"{link_path}/BUILD.bazel", "r") as f:
+        assert f.read() == "linked build file, changed on feature-branch\n"
+    with urc.open_file(f"{link_path}/other.txt", "r") as f:
+        assert f.read() == "linked other file, changed on main\n"
+    with urc.open_file("BUILD.bazel", "r") as f:
+        assert f.read() == "parent build file, which is longer than the linked one\n", (
+            "The parent's own file must be left alone"
+        )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_refuses_a_local_change_in_a_link_exposing_a_subtree(
+    new_lore_repo,
+):
+    """A local change to a linked file the merge replaces refuses the merge, found at the
+    mount of a link exposing a subtree of the linked repository."""
+    link_path = "linked/repo"
+    urc, _link_repo = _diverge_linked_build_file(
+        new_lore_repo, link_path, source_path="content"
+    )
+
+    with urc.open_file(f"{link_path}/BUILD.bazel", "w+") as f:
+        f.writelines(["linked build file, changed locally\n"])
+
+    with pytest.raises(LocalChanges):
+        urc.branch_merge_start("feature-branch", message="Merge over a local change")
+
+    with urc.open_file(f"{link_path}/BUILD.bazel", "r") as f:
+        assert f.read() == "linked build file, changed locally\n", (
+            "The local change must survive the refused merge"
+        )
 
 
 @pytest.mark.smoke
