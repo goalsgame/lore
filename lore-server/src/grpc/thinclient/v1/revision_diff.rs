@@ -98,7 +98,8 @@ impl Default for RevisionDiffConfig {
 /// then `DiffChange` items, then — in 3-way mode only — `DiffConflict`
 /// items.
 ///
-/// Mode selection is server-side from revision metadata:
+/// A request with `two_way` set is always diffed 2-way. Otherwise mode
+/// selection is server-side from revision metadata:
 /// * **2-way** when both revisions live on the same branch, or when
 ///   one is the branch point of the other's branch.
 /// * **3-way** otherwise. The common ancestor is found via the
@@ -135,6 +136,7 @@ pub async fn handler(
         ));
     };
     let autoresolve = req.autoresolve;
+    let force_two_way = req.two_way;
 
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(
@@ -172,6 +174,7 @@ pub async fn handler(
                         to_sig,
                         to_id,
                         autoresolve,
+                        force_two_way,
                         config,
                         tx,
                     )
@@ -194,6 +197,7 @@ async fn stream_diff(
     to_sig: Hash,
     to_id: model_v1::RevisionIdentifier,
     autoresolve: bool,
+    force_two_way: bool,
     config: RevisionDiffConfig,
     tx: mpsc::Sender<Result<RevisionDiffResponse, Status>>,
 ) {
@@ -217,7 +221,15 @@ async fn stream_diff(
     // 2-way mode kicks in when the two revisions share a branch OR when
     // one is the branch point of the other's branch — in both cases
     // there is no divergence to merge.
-    let two_way = if from_branch == to_branch {
+    let two_way = if force_two_way {
+        debug!(
+            {REPOSITORY_ID} = %repository.id,
+            from_branch = %from_branch,
+            to_branch = %to_branch,
+            "RevisionDiff: requested → 2-way",
+        );
+        true
+    } else if from_branch == to_branch {
         debug!(
             {REPOSITORY_ID} = %repository.id,
             {BRANCH_ID} = %from_branch,
