@@ -43,7 +43,7 @@ message RevisionInfoResponse {
 }
 
 // Request to diff two revisions. Server picks the diff mode (2-way vs
-// 3-way) from revision metadata; callers do not declare it.
+// 3-way) from revision metadata unless `two_way` is set.
 message RevisionDiffRequest {
   // "From" side specifier.
   oneof query_from {
@@ -63,6 +63,11 @@ message RevisionDiffRequest {
   // DiffChange entries are flagged via `automerged = true`. Silently
   // ignored in 2-way mode.
   bool autoresolve = 5;
+  // When true, always compare the two revisions' trees directly
+  // (2-way), regardless of their branches. The header's `_base` fields
+  // stay unset and `autoresolve` is ignored. Default false lets the
+  // server pick the mode.
+  bool two_way = 6;
 }
 
 // Header for a RevisionDiff stream. Echoes the resolved revisions so
