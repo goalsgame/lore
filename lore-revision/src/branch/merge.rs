@@ -2032,7 +2032,8 @@ struct MountedDiff {
 
 /// A linked repository's `changes` and the incoming side of its `conflicts`, spelled from `mount`
 /// with the tree the current revision holds there. A change the link does not expose is left out,
-/// as nothing on disk holds it.
+/// as nothing on disk holds it, and so is one in a repository linked from it, which its own link's
+/// pin update checks at its own mount.
 async fn mount_diff(
     repository: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
@@ -2065,12 +2066,16 @@ async fn mount_diff(
         }),
         ..Default::default()
     };
-    for change in changes {
+    let own = |change: &NodeChange| change.to.mapping.repository.id == repository.id;
+    for change in changes.iter().filter(|change| own(change)) {
         mounted
             .changes
             .extend(mount_conflict_change(change, mount.path, &source_path).await);
     }
-    for (_, change_to) in conflicts {
+    for (change_from, change_to) in conflicts {
+        if !own(change_from) || !own(change_to) {
+            continue;
+        }
         mounted
             .conflicts
             .extend(mount_conflict_change(change_to, mount.path, &source_path).await);
