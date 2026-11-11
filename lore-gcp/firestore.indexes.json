@@ -19,8 +19,8 @@
     "  Declared explicitly rather than relying on Firestore's automatic-index support for",
     "  multi-equality queries. Corresponds to",
     "  [plugins.gcp].firestore_fragment_associations_collection.",
-    "- locks (hash, repository), (owner, repository), (owner, repository_branch),",
-    "  (repository_branch, description): lore_gcp::store::lock_store's query_locks answers",
+    "- locks (hash, repository), (owner_digest, repository), (owner_digest, repository_branch),",
+    "  (repository_branch, description_digest): lore_gcp::store::lock_store's query_locks answers",
     "  LockQuery::HashRepository, OwnerRepository, OwnerRepositoryBranch and",
     "  RepositoryBranchDescription with an equality filter on each pair. Corresponds to",
     "  [plugins.gcp.lock_store].firestore_lock_store_collection.",
@@ -57,7 +57,7 @@
       "collectionGroup": "locks",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "owner", "order": "ASCENDING" },
+        { "fieldPath": "owner_digest", "order": "ASCENDING" },
         { "fieldPath": "repository", "order": "ASCENDING" }
       ]
     },
@@ -65,7 +65,7 @@
       "collectionGroup": "locks",
       "queryScope": "COLLECTION",
       "fields": [
-        { "fieldPath": "owner", "order": "ASCENDING" },
+        { "fieldPath": "owner_digest", "order": "ASCENDING" },
         { "fieldPath": "repository_branch", "order": "ASCENDING" }
       ]
     },
@@ -74,7 +74,7 @@
       "queryScope": "COLLECTION",
       "fields": [
         { "fieldPath": "repository_branch", "order": "ASCENDING" },
-        { "fieldPath": "description", "order": "ASCENDING" }
+        { "fieldPath": "description_digest", "order": "ASCENDING" }
       ]
     }
   ],

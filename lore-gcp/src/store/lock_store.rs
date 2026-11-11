@@ -8,17 +8,21 @@
 //!
 //! ```text
 //! {collection}/{repository_hex}_{branch_hex}_{hash_hex}
-//!     => { repository, branch, repository_branch, hash, description, owner, locked_at }
+//!     => { repository, branch, repository_branch, hash, description, description_digest,
+//!          owner, owner_digest, locked_at }
 //! ```
 //!
 //! `repository`, `branch` and `hash` are lowercase hex; `repository_branch` is the two hex strings
-//! concatenated, so a query on one branch is a single equality filter. `locked_at` is milliseconds
-//! since the Unix epoch.
+//! concatenated, so a query on one branch is a single equality filter. `owner_digest` and
+//! `description_digest` are the hex BLAKE3 digests of `owner` and `description`, which have no
+//! length limit while Firestore indexes only the first 1,500 bytes of a string. `locked_at` is
+//! milliseconds since the Unix epoch.
 //!
 //! [`LockQuery::HashRepositoryBranch`] reads one document by id. Every other query is an equality
-//! filter on one or two of `hash`, `owner`, `repository`, `repository_branch` and `description`;
-//! the composite indexes the two-field ones need are listed in this crate's
-//! `firestore.indexes.json`.
+//! filter on one or two of `hash`, `owner_digest`, `repository`, `repository_branch` and
+//! `description_digest`; the composite indexes the two-field ones need are listed in this crate's
+//! `firestore.indexes.json`. A query on a digest keeps only the documents whose original string
+//! matches.
 //!
 //! # Atomicity
 //!
@@ -89,7 +93,9 @@ struct LockEntry {
     repository_branch: String,
     hash: String,
     description: String,
+    description_digest: String,
     owner: String,
+    owner_digest: String,
     locked_at: i64,
 }
 
@@ -103,7 +109,9 @@ impl LockEntry {
             branch,
             hash: hex::encode(resource.hash.data()),
             description: resource.description.clone(),
+            description_digest: digest(&resource.description),
             owner: owner.to_string(),
+            owner_digest: digest(owner),
             locked_at: i64::try_from(locked_at).unwrap_or(i64::MAX),
         }
     }
@@ -125,6 +133,10 @@ impl LockEntry {
             locked_at: u64::try_from(self.locked_at).unwrap_or_default(),
         })
     }
+}
+
+fn digest(value: &str) -> String {
+    blake3::hash(value.as_bytes()).to_hex().to_string()
 }
 
 fn doc_id(repository: RepositoryId, resource: &LockResource) -> String {
@@ -158,6 +170,20 @@ fn to_lock_error(error: GcpError) -> LockError {
         }
     }
     LockError::internal_with_context(error, "Firestore lock store operation failed")
+}
+
+/// Classifies an error inside a transaction: one Firestore marks retryable runs the transaction
+/// again, any other ends it.
+fn backoff(error: GcpError) -> BackoffError<GcpError> {
+    match &error {
+        GcpError::Firestore(inner) if crate::clients::is_firestore_retryable(inner) => {
+            BackoffError::Transient {
+                err: error,
+                retry_after: None,
+            }
+        }
+        _ => BackoffError::Permanent(error),
+    }
 }
 
 /// Whether a commit failed one of its write preconditions.
@@ -271,7 +297,7 @@ impl FirestoreLockStore {
                     let ids: Vec<String> = wanted.keys().cloned().collect();
                     let held = read_entries(&db, &collection, &ids)
                         .await
-                        .map_err(BackoffError::Permanent)?;
+                        .map_err(backoff)?;
 
                     let mut acquired = Vec::with_capacity(wanted.len());
                     for (id, entry) in wanted.iter() {
@@ -291,7 +317,7 @@ impl FirestoreLockStore {
                             .object(*entry)
                             .add_to_transaction(transaction)
                             .map_err(GcpError::firestore)
-                            .map_err(BackoffError::Permanent)?;
+                            .map_err(backoff)?;
                     }
 
                     Ok(Acquire::Acquired(
@@ -322,7 +348,7 @@ impl FirestoreLockStore {
                 async move {
                     let held = read_entries(&db, &collection, &ids)
                         .await
-                        .map_err(BackoffError::Permanent)?;
+                        .map_err(backoff)?;
 
                     if validate_user {
                         if held.values().any(|entry| entry.owner != *owner) {
@@ -341,7 +367,7 @@ impl FirestoreLockStore {
                             .document_id(id.as_str())
                             .add_to_transaction(transaction)
                             .map_err(GcpError::firestore)
-                            .map_err(BackoffError::Permanent)?;
+                            .map_err(backoff)?;
                     }
 
                     Ok(Release::Released)
@@ -423,6 +449,8 @@ impl LockStore for FirestoreLockStore {
     #[tracing::instrument(name = "FirestoreLockStore::query_locks", skip_all)]
     async fn query_locks(&self, query: LockQuery) -> Result<Vec<LockData>, LockError> {
         let hex_of = |repository: RepositoryId| hex::encode(repository.data());
+        let mut owner_is = None;
+        let mut description_is = None;
         let clauses = match query {
             LockQuery::HashRepositoryBranch(hash, repository, branch) => {
                 let id = doc_id(
@@ -449,22 +477,39 @@ impl LockStore for FirestoreLockStore {
                 ("hash", hex::encode(hash.data())),
                 ("repository", hex_of(repository)),
             ],
-            LockQuery::Owner(owner) => vec![("owner", owner)],
-            LockQuery::OwnerRepository(owner, repository) => {
-                vec![("owner", owner), ("repository", hex_of(repository))]
+            LockQuery::Owner(owner) => {
+                let clauses = vec![("owner_digest", digest(&owner))];
+                owner_is = Some(owner);
+                clauses
             }
-            LockQuery::OwnerRepositoryBranch(owner, repository, branch) => vec![
-                ("owner", owner),
-                ("repository_branch", repository_branch(repository, branch)),
-            ],
+            LockQuery::OwnerRepository(owner, repository) => {
+                let clauses = vec![
+                    ("owner_digest", digest(&owner)),
+                    ("repository", hex_of(repository)),
+                ];
+                owner_is = Some(owner);
+                clauses
+            }
+            LockQuery::OwnerRepositoryBranch(owner, repository, branch) => {
+                let clauses = vec![
+                    ("owner_digest", digest(&owner)),
+                    ("repository_branch", repository_branch(repository, branch)),
+                ];
+                owner_is = Some(owner);
+                clauses
+            }
             LockQuery::Repository(repository) => vec![("repository", hex_of(repository))],
             LockQuery::RepositoryBranch(repository, branch) => {
                 vec![("repository_branch", repository_branch(repository, branch))]
             }
-            LockQuery::RepositoryBranchDescription(repository, branch, description) => vec![
-                ("repository_branch", repository_branch(repository, branch)),
-                ("description", description),
-            ],
+            LockQuery::RepositoryBranchDescription(repository, branch, description) => {
+                let clauses = vec![
+                    ("repository_branch", repository_branch(repository, branch)),
+                    ("description_digest", digest(&description)),
+                ];
+                description_is = Some(description);
+                clauses
+            }
         };
 
         let entries = self
@@ -472,6 +517,12 @@ impl LockStore for FirestoreLockStore {
             .await?;
         entries
             .iter()
+            .filter(|entry| owner_is.as_ref().is_none_or(|owner| entry.owner == *owner))
+            .filter(|entry| {
+                description_is
+                    .as_ref()
+                    .is_none_or(|description| entry.description == *description)
+            })
             .map(|entry| entry.to_lock_data().map_err(to_lock_error))
             .collect()
     }
@@ -1009,6 +1060,63 @@ mod emulator_tests {
                 .unwrap()
             ),
             HashSet::from([b])
+        );
+    }
+
+    #[tokio::test]
+    async fn owners_and_descriptions_longer_than_firestore_indexes_are_queried_exactly() {
+        let store = emulator_store().await;
+        let repository = rand::random::<RepositoryId>();
+        let branch = rand::random::<BranchId>();
+        let long = "x".repeat(2_000);
+        let owner = format!("{long}-owner");
+        let near_owner = format!("{long}-other");
+        let one = random_resource(branch, &format!("{long}/one"));
+        let two = random_resource(branch, &format!("{long}/two"));
+
+        store
+            .lock_resources(&owner, repository, std::slice::from_ref(&one))
+            .await
+            .unwrap();
+        store
+            .lock_resources(&near_owner, repository, std::slice::from_ref(&two))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            held(
+                &store
+                    .query_locks(LockQuery::Owner(owner.clone()))
+                    .await
+                    .unwrap()
+            ),
+            HashSet::from([one.clone()])
+        );
+        assert_eq!(
+            held(
+                &store
+                    .query_locks(LockQuery::OwnerRepositoryBranch(
+                        owner.clone(),
+                        repository,
+                        branch
+                    ))
+                    .await
+                    .unwrap()
+            ),
+            HashSet::from([one.clone()])
+        );
+        assert_eq!(
+            held(
+                &store
+                    .query_locks(LockQuery::RepositoryBranchDescription(
+                        repository,
+                        branch,
+                        two.description.clone()
+                    ))
+                    .await
+                    .unwrap()
+            ),
+            HashSet::from([two])
         );
     }
 
