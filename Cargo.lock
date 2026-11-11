@@ -3352,6 +3352,7 @@ dependencies = [
  "google-cloud-gax",
  "google-cloud-pubsub",
  "google-cloud-storage",
+ "google-cloud-wkt",
  "hex",
  "jsonwebtoken 10.4.0",
  "lore-base",

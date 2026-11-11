@@ -31,6 +31,12 @@ pub enum GcpError {
     /// return.
     #[error("GCP client construction failed: {0:?}")]
     ClientBuild(Box<google_cloud_gax::client_builder::Error>),
+    /// A failure returned by a `google-cloud-pubsub` client.
+    #[error("Pub/Sub operation failed: {0:?}")]
+    PubSub(Box<google_cloud_pubsub::Error>),
+    /// A setting holds a value the backend cannot represent.
+    #[error("invalid configuration: {0}")]
+    Config(String),
 }
 
 impl GcpError {
@@ -44,6 +50,10 @@ impl GcpError {
 
     pub fn client_build(error: google_cloud_gax::client_builder::Error) -> Self {
         Self::ClientBuild(Box::new(error))
+    }
+
+    pub fn pubsub(error: google_cloud_pubsub::Error) -> Self {
+        Self::PubSub(Box::new(error))
     }
 }
 

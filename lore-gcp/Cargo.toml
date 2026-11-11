@@ -26,6 +26,7 @@ google-cloud-gax = { version = "1.14", default-features = false }
 # whatever crypto provider the process already installed (ring).
 google-cloud-storage = { version = "1.18.0", default-features = false }
 google-cloud-pubsub = { version = "1.6.0", default-features = false }
+google-cloud-wkt = { version = "1.10", default-features = false }
 hex = { workspace = true }
 # gcloud-sdk (firestore's transport) depends on jsonwebtoken 10 with no crypto feature selected,
 # so it mints self-signed JWTs (used for Application Default Credentials with a service account

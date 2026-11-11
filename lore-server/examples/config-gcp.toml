@@ -51,9 +51,23 @@ mode = "gcp"
 # the gRPC Subscribe RPC works alongside the topic rather than being replaced
 # by it.
 #
-# What this does not cover: the sender contributes no receiver, so obliterate
-# propagation between server instances does not happen. That is correct for a
-# single instance and not for any other.
+# Several server instances: set pubsub_receive = true, and each instance also
+# delivers the events every other instance publishes to its own Subscribe
+# clients. Each message carries an origin attribute naming the instance that
+# published it, so an instance skips its own. Each instance reads through a
+# subscription of its own: by default it creates
+# {pubsub_subscription_prefix}-{origin} at startup, with an expiration policy
+# and a short message retention, and deletes it at shutdown. That needs
+# pubsub.topics.attachSubscription on the topic (in roles/pubsub.subscriber)
+# and pubsub.subscriptions.create, .consume and .delete in pubsub_project
+# (roles/pubsub.editor, or a custom role). Failing to delete is
+# logged and ignored; the expiration policy removes the subscription once it
+# has gone unused for pubsub_subscription_ttl_seconds. Alternatively, set
+# pubsub_subscription to a subscription created for this instance alone:
+# Pub/Sub hands each message to one reader of a subscription, so instances
+# sharing one would each miss the others' events.
+#
+# What this does not cover: obliterate propagation between server instances.
 #[notification]
 #mode = "gcp"
 #
@@ -65,6 +79,11 @@ mode = "gcp"
 #   firestore_project = "..."
 #   pubsub_project = "my-project"
 #   pubsub_topic = "lore-events"
+#   pubsub_receive = false                       # default
+#   pubsub_subscription = "lore-events-a"        # default unset: one is created
+#   pubsub_subscription_prefix = "lore-server"   # default
+#   pubsub_subscription_ttl_seconds = 86400      # default; Pub/Sub's minimum
+#   pubsub_message_retention_seconds = 600       # default; Pub/Sub's minimum
 
 # ---------------------------------------------------------------------
 # GCP Plugin Configuration
