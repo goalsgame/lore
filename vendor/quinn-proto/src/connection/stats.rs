@@ -178,7 +178,7 @@ pub struct ConnectionStats {
     /// Data on reset streams is not counted.
     ///
     /// LORE: not upstream. Re-apply this field, `StreamsState::unacked_send_bytes`,
-    /// `SendBuffer::unacked_len` and the line in `Connection::stats` that fills it when
+    /// `SendBuffer::unacked_bytes` and the line in `Connection::stats` that fills it when
     /// re-vendoring.
     pub unacked_stream_bytes: u64,
 }

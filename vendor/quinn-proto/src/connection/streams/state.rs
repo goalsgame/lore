@@ -405,7 +405,7 @@ impl StreamsState {
         self.send
             .values()
             .flatten()
-            .map(|stream| stream.pending.unacked_len())
+            .map(|stream| stream.pending.unacked_bytes())
             .sum()
     }
 
