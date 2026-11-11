@@ -482,7 +482,7 @@ Lore Server keeps three stores: an immutable store for content-addressed fragmen
 | --- | --- | --- |
 | `[immutable_store]` | `local` | `local`, `composite`, `replicated`, `remote`, or a plugin name such as `aws`. |
 | `[mutable_store]` | `local` | `local`, `remote`, or a plugin name such as `aws`. |
-| `[lock_store]` | `local` | `local`, `none`, or a plugin name such as `aws` (DynamoDB). |
+| `[lock_store]` | `local` | `local`, `none`, or a plugin name such as `aws` (DynamoDB) or `gcp` (Firestore). |
 
 `lock_store.mode = "none"` builds no lock store, so `LockService` does not register. The mode exists because `default.toml` sets `[lock_store]` and a layered configuration cannot remove a key a lower layer supplied.
 
