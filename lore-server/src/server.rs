@@ -1719,6 +1719,7 @@ async fn configure_notification(
     plugins: &HashMap<String, toml::Value>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     authorization_timeout: Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
     let mode = notification_settings
         .as_ref()
@@ -1747,6 +1748,8 @@ async fn configure_notification(
             let context = NotificationPluginContext {
                 environment: environment.clone(),
                 immutable_store: immutable_store.cloned(),
+                local: Some(local.clone()),
+                shutdown: Some(shutdown),
             };
 
             let output = registry
@@ -2268,6 +2271,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.plugins,
             repository_authorizer.clone(),
             notification_authorization_timeout,
+            shutdown_tx.subscribe(),
         )
         .await?;
 

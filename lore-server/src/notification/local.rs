@@ -54,6 +54,21 @@ impl NotificationSender {
         }
     }
 
+    /// Broadcast `event` unchanged to its repository's subscribers, if it has any.
+    ///
+    /// For an event published elsewhere: its id and time are kept. An event whose
+    /// `repository` is not a repository id is dropped.
+    pub fn deliver(&self, event: notification::Event) {
+        let Ok(repository) = <[u8; size_of::<Context>()]>::try_from(event.repository.as_ref())
+        else {
+            return;
+        };
+        let repository = RepositoryId::from(Context::from(repository));
+        if let Some(sender) = self.sender.get(&repository) {
+            let _ = sender.send(event);
+        }
+    }
+
     fn send_event(&self, repository: RepositoryId, event: notification::event::Event) {
         if let Some(sender) = self.sender.get(&repository) {
             let _ = sender.send(notification::Event {

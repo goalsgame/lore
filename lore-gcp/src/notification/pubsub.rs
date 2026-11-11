@@ -7,7 +7,7 @@
 //! `lore_server::notification::local` broadcasts in process, so one decoder serves
 //! both backends. Each message also carries attributes — `event_type`, `repository`
 //! and, where the event names one, `branch` — so a subscription can filter without
-//! decoding the payload.
+//! decoding the payload, and `origin`, which identifies the sender that published it.
 //!
 //! This adds a destination rather than replacing one: the server fans each event
 //! out to the in-process sender as well, so the gRPC Subscribe RPC keeps working
@@ -49,6 +49,9 @@ use uuid::Uuid;
 
 use crate::gcp_error::GcpError;
 
+/// The attribute naming the sender that published a message.
+pub const ORIGIN_ATTRIBUTE: &str = "origin";
+
 /// Configuration for the Pub/Sub notification sender.
 #[derive(Clone, Debug)]
 pub struct PubSubSettings {
@@ -73,6 +76,7 @@ impl PubSubSettings {
 pub struct PubSubNotificationSender {
     publisher: Publisher,
     outcomes: OutcomeGate,
+    origin: String,
 }
 
 /// Bounds how many publish outcomes are being awaited at once.
@@ -168,7 +172,22 @@ impl PubSubNotificationSender {
         Ok(Self {
             publisher,
             outcomes: OutcomeGate::new(settings.outcome_concurrency_limit),
+            origin: Uuid::new_v4().simple().to_string(),
         })
+    }
+
+    /// The `origin` attribute this sender sets on every message, unique to the sender.
+    pub fn origin(&self) -> &str {
+        &self.origin
+    }
+
+    #[cfg(all(test, feature = "integration_tests"))]
+    pub(crate) fn with_publisher(publisher: Publisher, outcome_concurrency_limit: usize) -> Self {
+        Self {
+            publisher,
+            outcomes: OutcomeGate::new(outcome_concurrency_limit),
+            origin: Uuid::new_v4().simple().to_string(),
+        }
     }
 
     /// Publishes whose outcome went unobserved because the gate was full.
@@ -200,6 +219,7 @@ impl PubSubNotificationSender {
         let mut attributes = vec![
             ("event_type", event_type.to_string()),
             ("repository", repository_hex.clone()),
+            (ORIGIN_ATTRIBUTE, self.origin.clone()),
         ];
         if let Some(branch) = branch {
             attributes.push(("branch", branch));
@@ -604,6 +624,7 @@ mod emulator_tests {
         PubSubNotificationSender {
             publisher,
             outcomes: OutcomeGate::new(64),
+            origin: uuid::Uuid::new_v4().simple().to_string(),
         }
     }
 

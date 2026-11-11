@@ -219,6 +219,11 @@ pub struct NotificationPluginContext {
     /// Optional reference to the local immutable store.
     /// Some notification plugins need this for event processing (e.g., obliterate propagation).
     pub immutable_store: Option<Arc<dyn ImmutableStore>>,
+    /// The in-process sender that serves the gRPC Subscribe RPC. A receiver hands it the
+    /// events other server instances publish.
+    pub local: Option<Arc<crate::notification::local::NotificationSender>>,
+    /// Becomes `true` when the server starts shutting down. A receiver stops when it does.
+    pub shutdown: Option<tokio::sync::watch::Receiver<bool>>,
 }
 
 /// Output from creating a notification plugin instance.

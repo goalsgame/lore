@@ -1147,6 +1147,8 @@ async fn test_create_notification_success() {
     let context = NotificationPluginContext {
         environment: None,
         immutable_store: None,
+        local: None,
+        shutdown: None,
     };
     let result = registry
         .create_notification("test", &config, &context)
@@ -1164,6 +1166,8 @@ async fn test_create_notification_not_found() {
     let context = NotificationPluginContext {
         environment: None,
         immutable_store: None,
+        local: None,
+        shutdown: None,
     };
     let result = registry
         .create_notification("missing", &config, &context)
@@ -1186,6 +1190,8 @@ async fn test_create_notification_config_error() {
     let context = NotificationPluginContext {
         environment: None,
         immutable_store: None,
+        local: None,
+        shutdown: None,
     };
     let result = registry
         .create_notification("test", &config, &context)
@@ -1209,6 +1215,8 @@ async fn test_create_notification_init_error() {
     let context = NotificationPluginContext {
         environment: None,
         immutable_store: None,
+        local: None,
+        shutdown: None,
     };
     let result = registry
         .create_notification("test", &config, &context)
@@ -1300,6 +1308,8 @@ async fn test_notification_output_with_background_task_completes() {
     let context = NotificationPluginContext {
         environment: None,
         immutable_store: None,
+        local: None,
+        shutdown: None,
     };
     let output = registry
         .create_notification("test_with_task", &config, &context)
