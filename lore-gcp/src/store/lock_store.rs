@@ -1204,7 +1204,6 @@ mod emulator_tests {
                         matches!(refused, Err(LockError::LockNotOwned(_))),
                         "an unlock naming carol's lock is refused: {refused:?}"
                     );
-                    None
                 });
             }
             {
@@ -1219,7 +1218,6 @@ mod emulator_tests {
                             std::slice::from_ref(&resource),
                         )
                         .await;
-                    None
                 });
             }
             {
@@ -1235,19 +1233,16 @@ mod emulator_tests {
                         )
                         .await
                         .unwrap();
-                    store
+                    let locks = store
                         .lock_resources("bob", repository, std::slice::from_ref(&resource))
                         .await
-                        .ok()
-                        .map(|locks| locks.len())
+                        .expect("bob acquires the released lock");
+                    assert_eq!(locks.len(), 1, "bob's acquire returns the new lock");
                 });
             }
 
-            let mut bob_acquired = false;
             while let Some(task) = tasks.join_next().await {
-                if task.unwrap() == Some(1) {
-                    bob_acquired = true;
-                }
+                task.unwrap();
             }
 
             let stored = stores[0]
@@ -1265,15 +1260,11 @@ mod emulator_tests {
                 Some("carol"),
                 "round {round}: a refused unlock released nothing"
             );
-            if bob_acquired {
-                assert_eq!(
-                    owner_of(&contested).as_deref(),
-                    Some("bob"),
-                    "round {round}: alice's stale unlock removed bob's lock"
-                );
-            } else {
-                assert_ne!(owner_of(&contested).as_deref(), Some("bob"));
-            }
+            assert_eq!(
+                owner_of(&contested).as_deref(),
+                Some("bob"),
+                "round {round}: alice's stale unlock removed bob's lock"
+            );
         }
     }
 
