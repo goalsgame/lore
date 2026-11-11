@@ -1167,6 +1167,116 @@ mod emulator_tests {
         }
     }
 
+    /// A validated unlock by the old owner races a forced release and a new owner's acquire on
+    /// another server. The old owner's unlock never removes the new owner's lock, and a refused
+    /// multi-resource unlock releases nothing.
+    #[tokio::test]
+    async fn a_stale_unlock_never_releases_a_reacquired_lock() {
+        let collection = format!("locks_{}", uuid::Uuid::new_v4().simple());
+        let stores = [
+            Arc::new(store_on(&collection).await),
+            Arc::new(store_on(&collection).await),
+        ];
+        let repository = rand::random::<RepositoryId>();
+        let branch = rand::random::<BranchId>();
+
+        for round in 0..10 {
+            let contested = random_resource(branch, &format!("contested-{round}"));
+            let bystander = random_resource(branch, &format!("bystander-{round}"));
+            stores[0]
+                .lock_resources("alice", repository, std::slice::from_ref(&contested))
+                .await
+                .unwrap();
+            stores[0]
+                .lock_resources("carol", repository, std::slice::from_ref(&bystander))
+                .await
+                .unwrap();
+
+            let mut tasks = JoinSet::new();
+            {
+                let store = stores[0].clone();
+                let resources = vec![contested.clone(), bystander.clone()];
+                lore_base::lore_spawn!(tasks, async move {
+                    let refused = store
+                        .unlock_resources("alice", true, repository, &resources)
+                        .await;
+                    assert!(
+                        matches!(refused, Err(LockError::LockNotOwned(_))),
+                        "an unlock naming carol's lock is refused: {refused:?}"
+                    );
+                    None
+                });
+            }
+            {
+                let store = stores[0].clone();
+                let resource = contested.clone();
+                lore_base::lore_spawn!(tasks, async move {
+                    let _ = store
+                        .unlock_resources(
+                            "alice",
+                            true,
+                            repository,
+                            std::slice::from_ref(&resource),
+                        )
+                        .await;
+                    None
+                });
+            }
+            {
+                let store = stores[1].clone();
+                let resource = contested.clone();
+                lore_base::lore_spawn!(tasks, async move {
+                    store
+                        .unlock_resources(
+                            "admin",
+                            false,
+                            repository,
+                            std::slice::from_ref(&resource),
+                        )
+                        .await
+                        .unwrap();
+                    store
+                        .lock_resources("bob", repository, std::slice::from_ref(&resource))
+                        .await
+                        .ok()
+                        .map(|locks| locks.len())
+                });
+            }
+
+            let mut bob_acquired = false;
+            while let Some(task) = tasks.join_next().await {
+                if task.unwrap() == Some(1) {
+                    bob_acquired = true;
+                }
+            }
+
+            let stored = stores[0]
+                .check_locks_status(repository, &[contested.clone(), bystander.clone()])
+                .await
+                .unwrap();
+            let owner_of = |resource: &LockResource| {
+                stored
+                    .iter()
+                    .find(|lock| lock.resource == *resource)
+                    .map(|lock| lock.owner.clone())
+            };
+            assert_eq!(
+                owner_of(&bystander).as_deref(),
+                Some("carol"),
+                "round {round}: a refused unlock released nothing"
+            );
+            if bob_acquired {
+                assert_eq!(
+                    owner_of(&contested).as_deref(),
+                    Some("bob"),
+                    "round {round}: alice's stale unlock removed bob's lock"
+                );
+            } else {
+                assert_ne!(owner_of(&contested).as_deref(), Some("bob"));
+            }
+        }
+    }
+
     /// Overlapping multi-resource requests from two servers are all-or-nothing: no resource ends
     /// up held by an owner whose request was refused, and each resource has at most one owner.
     #[tokio::test]
