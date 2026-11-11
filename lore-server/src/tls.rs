@@ -194,9 +194,9 @@ pub fn grpc_server_tls_config(
 }
 
 /// Completes the TLS handshake for each connection `incoming` yields, without letting a slow
-/// handshake hold up the next accept. At most [`TLS_MAX_HANDSHAKES`] run at once, each for at most
-/// [`TLS_HANDSHAKE_TIMEOUT`]. Dropping the returned stream stops accepting and abandons the
-/// handshakes in progress.
+/// handshake hold up the next accept. At most [`TLS_MAX_HANDSHAKES`] connections are in handshake
+/// or waiting to be taken at once, and each handshake has [`TLS_HANDSHAKE_TIMEOUT`]. Dropping the
+/// returned stream stops accepting and abandons the handshakes in progress.
 pub fn tls_incoming<IO, E>(
     incoming: impl Stream<Item = Result<IO, E>> + Send + 'static,
     config: Arc<rustls::ServerConfig>,
@@ -237,10 +237,10 @@ where
                             () = accepted.closed() => return,
                             stream = handshake => stream,
                         };
-                        drop(permit);
                         match stream {
                             Ok(Ok(stream)) => {
                                 let _ = accepted.send(Ok(stream)).await;
+                                drop(permit);
                             }
                             Ok(Err(error)) => debug!("TLS handshake failed: {error}"),
                             Err(_elapsed) => debug!("TLS handshake timed out"),
@@ -256,7 +256,8 @@ where
 /// Handshaken connections waiting for the server to take them.
 const TLS_ACCEPT_BACKLOG: usize = 128;
 
-/// Handshakes a TLS listener runs at once; further connections wait to be accepted.
+/// Connections a TLS listener holds between accepting them and handing them to the server;
+/// further connections wait to be accepted.
 pub const TLS_MAX_HANDSHAKES: usize = 1024;
 
 /// Time a client has to complete the TLS handshake before its connection is dropped.
