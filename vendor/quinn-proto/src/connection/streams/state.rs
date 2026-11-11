@@ -398,6 +398,17 @@ impl StreamsState {
         }
     }
 
+    /// Bytes written to send streams and not yet acknowledged, sent or not
+    ///
+    /// LORE: not upstream. Re-apply with `ConnectionStats::unacked_stream_bytes` when re-vendoring.
+    pub(crate) fn unacked_send_bytes(&self) -> u64 {
+        self.send
+            .values()
+            .flatten()
+            .map(|stream| stream.pending.unacked_len())
+            .sum()
+    }
+
     /// Whether any stream data is queued, regardless of control frames
     pub(crate) fn can_send_stream_data(&self) -> bool {
         // Reset streams may linger in the pending stream list, but will never produce stream frames

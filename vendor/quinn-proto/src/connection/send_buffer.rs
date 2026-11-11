@@ -185,6 +185,13 @@ impl SendBuffer {
         self.offset
     }
 
+    /// Bytes written by the application and not yet acknowledged, sent or not
+    ///
+    /// LORE: not upstream. Re-apply with `ConnectionStats::unacked_stream_bytes` when re-vendoring.
+    pub(super) fn unacked_len(&self) -> u64 {
+        self.unacked_len as u64
+    }
+
     /// Whether all sent data has been acknowledged
     pub(super) fn is_fully_acked(&self) -> bool {
         self.unacked_len == 0

@@ -173,4 +173,12 @@ pub struct ConnectionStats {
     pub frame_rx: FrameStats,
     /// Statistics related to the current transmission path
     pub path: PathStats,
+    /// Bytes written to send streams that the peer has not yet acknowledged, sent or not.
+    ///
+    /// Data on reset streams is not counted.
+    ///
+    /// LORE: not upstream. Re-apply this field, `StreamsState::unacked_send_bytes`,
+    /// `SendBuffer::unacked_len` and the line in `Connection::stats` that fills it when
+    /// re-vendoring.
+    pub unacked_stream_bytes: u64,
 }
