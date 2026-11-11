@@ -52,6 +52,7 @@ async fn test_unavailable_store_server_is_not_healthy() {
         available: AtomicBool::new(false),
         interval_timeout: None,
         store_health_check: true,
+        draining: Arc::default(),
     };
     let test_shared_state = ServerState {
         immutable_store,
@@ -73,6 +74,77 @@ async fn test_unavailable_store_server_is_not_healthy() {
     assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
 }
 
+/// A draining server answers 503 whatever its store says, so a load balancer stops sending it
+/// new connections while it still serves the ones it has.
+#[tokio::test]
+async fn a_draining_server_is_not_healthy() {
+    let (immutable_store, mutable_store, _execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let test_health = ServerHealth::new_without_availability(immutable_store.clone());
+    let draining = test_health.draining.clone();
+    let test_shared_state = ServerState {
+        immutable_store,
+        mutable_store,
+        jwt_verifier: None,
+        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
+        max_file_size: 100,
+        presign_config: None,
+    };
+    let settings = LoreHttpServerSettings::test_default();
+    let app = create_router(test_shared_state, test_health, &settings);
+    let test_server = TestServer::new(app).unwrap();
+
+    assert_eq!(
+        test_server.get("/health_check").await.status_code(),
+        StatusCode::OK
+    );
+
+    draining.store(true, std::sync::atomic::Ordering::Relaxed);
+    let response = test_server.get("/health_check").await;
+    assert_eq!(response.status_code(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        response.text(),
+        lore_server::http::health_check::DRAINING_BODY
+    );
+}
+
+/// Draining is shared by reference from the settings the server is built with, so the shutdown
+/// sequence can flip it on a running server.
+#[tokio::test]
+async fn health_follows_the_draining_flag_in_the_settings() {
+    let (immutable_store, mutable_store, execution) = test_store_create().await.unwrap();
+    lore_base::runtime::LORE_CONTEXT
+        .scope(execution, async move {
+            for health_only in [false, true] {
+                let settings = LoreHttpServerSettings {
+                    health_only,
+                    ..LoreHttpServerSettings::test_default()
+                };
+                let draining = settings.draining.clone();
+                let app = lore_server::http::server::build_router(
+                    &settings,
+                    immutable_store.clone(),
+                    mutable_store.clone(),
+                    None,
+                    Arc::new(AllowAllRepositoryAuthorizer),
+                )
+                .unwrap();
+                let server = TestServer::new(app).unwrap();
+                assert_eq!(
+                    server.get("/health_check").await.status_code(),
+                    StatusCode::OK
+                );
+                draining.store(true, std::sync::atomic::Ordering::Relaxed);
+                assert_eq!(
+                    server.get("/health_check").await.status_code(),
+                    StatusCode::SERVICE_UNAVAILABLE
+                );
+            }
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn test_maintenance_mode_health_check_returns_ok() {
     // Simulate maintenance mode: no backing store, store_health_check disabled
@@ -81,6 +153,7 @@ async fn test_maintenance_mode_health_check_returns_ok() {
         available: AtomicBool::new(true),
         interval_timeout: None,
         store_health_check: false,
+        draining: Arc::default(),
     });
 
     let app = axum::Router::new().route(
@@ -104,6 +177,7 @@ async fn health_only_excludes_content_and_uses_cached_store_status() {
                 available: AtomicBool::new(available),
                 interval_timeout: None,
                 store_health_check: true,
+                draining: Arc::default(),
             };
             let app = lore_server::http::server::create_health_only_router(
                 health, &LoreHttpServerSettings::test_default(),

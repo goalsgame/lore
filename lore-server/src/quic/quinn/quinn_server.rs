@@ -20,6 +20,8 @@ use socket2::Domain;
 use socket2::Protocol;
 use socket2::Type;
 use tokio_metrics::TaskMonitor;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::debug;
 use tracing::info;
 use tracing::info_span;
@@ -40,8 +42,19 @@ use crate::util::cert_metrics::start_certificate_metrics;
 
 const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 
+/// How often a draining connection checks whether its last request has been answered.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Application close code and reason sent to peers when the server shuts down.
+const SHUTDOWN_CLOSE_CODE: u32 = 0;
+const SHUTDOWN_CLOSE_REASON: &[u8] = b"server shutting down";
+
 pub struct QuinnServer {
     endpoint: quinn::Endpoint,
+    /// Cancelled when the server starts draining: connections stop reading new requests.
+    draining: CancellationToken,
+    /// One task per accepted connection, each ending once its connection is closed.
+    connections: TaskTracker,
 }
 
 impl QuinnServer {
@@ -157,22 +170,61 @@ impl QuinnServer {
             )?
         };
 
-        run_loop(endpoint.clone(), settings)?;
+        let draining = CancellationToken::new();
+        let connections = TaskTracker::new();
+        run_loop(
+            endpoint.clone(),
+            settings,
+            draining.clone(),
+            connections.clone(),
+        )?;
 
-        Ok(Self { endpoint })
+        Ok(Self {
+            endpoint,
+            draining,
+            connections,
+        })
+    }
+
+    /// Stop accepting connections and close the open ones once they are idle.
+    ///
+    /// New handshakes are refused at once. Every open connection stops reading new requests,
+    /// answers the ones it has already read, and is then closed with application code 0, which
+    /// a client treats as a reason to reconnect. Connections still busy after `timeout` are
+    /// closed regardless, as [`QuinnServer::close`] does.
+    pub async fn shutdown(&self, timeout: Duration) {
+        self.endpoint.set_server_config(None);
+        self.draining.cancel();
+        self.connections.close();
+        if tokio::time::timeout(timeout, self.connections.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                remaining = self.connections.len(),
+                "QUIC connections still busy after {timeout:?}, closing them"
+            );
+        }
+        self.close().await;
     }
 
     /// Gracefully close all connections on this endpoint. Sends `CONNECTION_CLOSE`
     /// frames to all peers (causing accept loops to return `None`) and waits for
     /// the frames to be delivered.
     pub async fn close(&self) {
+        self.draining.cancel();
         self.endpoint
-            .close(VarInt::from_u32(0), b"server shutting down");
+            .close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
         self.endpoint.wait_idle().await;
     }
 }
 
-fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<()> {
+fn run_loop(
+    endpoint: quinn::Endpoint,
+    settings: QuinnConfig,
+    draining: CancellationToken,
+    connections: TaskTracker,
+) -> anyhow::Result<()> {
     let stream_handler_factory = Arc::new(settings.stream_handler_factory);
     let metrics_interval = settings.metrics_frequency;
 
@@ -212,6 +264,8 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
         let endpoint = endpoint.clone();
         let monitor = monitor.clone();
         let stream_handler_factory = stream_handler_factory.clone();
+        let draining = draining.clone();
+        let connections = connections.clone();
 
         lore_spawn_net!(
             LORE_CONTEXT.scope(
@@ -223,23 +277,27 @@ fn run_loop(endpoint: quinn::Endpoint, settings: QuinnConfig) -> anyhow::Result<
 
                         let monitor = monitor.clone();
                         let stream_handler_factory = stream_handler_factory.clone();
+                        let draining = draining.clone();
 
                         lore_spawn_net!(
-                            LORE_CONTEXT.scope(
-                                execution_context(),
-                                async move {
-                                    if let Err(error) = handle_conn(
-                                        connection,
-                                        monitor.clone(),
-                                        metrics_interval,
-                                        stream_handler_factory.clone(),
-                                    )
-                                    .await
-                                    {
-                                        warn!("Error handling connection: {error}");
+                            connections.track_future(
+                                LORE_CONTEXT.scope(
+                                    execution_context(),
+                                    async move {
+                                        if let Err(error) = handle_conn(
+                                            connection,
+                                            monitor.clone(),
+                                            metrics_interval,
+                                            stream_handler_factory.clone(),
+                                            draining,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Error handling connection: {error}");
+                                        }
                                     }
-                                }
-                                .in_current_span(),
+                                    .in_current_span(),
+                                )
                             )
                         );
                     }
@@ -276,6 +334,7 @@ async fn handle_conn(
     monitor: TaskMonitor,
     connection_metrics_interval: Duration,
     stream_handler_factory: Arc<Box<dyn StreamHandlerFactory>>,
+    draining: CancellationToken,
 ) -> anyhow::Result<()> {
     let connection = conn.await?;
 
@@ -317,10 +376,17 @@ async fn handle_conn(
     let connection_handler: Arc<Box<dyn StreamDataHandler>> =
         Arc::new(service_builder(context.clone()));
 
-    // Keeps accepting requests until the connection closes or errors
+    // Counts the streams still reading requests, not those only waiting to write responses.
+    let readers = TaskTracker::new();
+
+    // Keeps accepting requests until the connection closes or errors, or the server drains
     loop {
         trace!("Waiting for stream on connection id: {connection_id}");
-        let stream = connection.accept_bi().await;
+        let stream = tokio::select! {
+            biased;
+            () = draining.cancelled() => break,
+            stream = connection.accept_bi() => stream,
+        };
 
         let (send, mut recv) = match stream {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
@@ -349,10 +415,13 @@ async fn handle_conn(
             use tracing::instrument::Instrument;
 
             let handler = connection_handler.clone();
+            let draining = draining.clone();
+            let reader = readers.token();
+            let connection = connection.clone();
 
             async move {
                 // Get the request off the transport
-                match handler.handle_stream(&mut recv, send).await {
+                match handler.handle_stream(&mut recv, send, &draining).await {
                     Ok(_) => {
                         debug!("Successfully handled request for connection");
                     }
@@ -364,6 +433,11 @@ async fn handle_conn(
                         }
                     }
                 }
+                drop(reader);
+                // Held open: dropping it stops the peer's sends, failing requests a reconnect retries.
+                if draining.is_cancelled() {
+                    connection.closed().await;
+                }
             }
             .instrument(info_span!("handle_stream"))
         };
@@ -372,4 +446,13 @@ async fn handle_conn(
         // hands processing to core from inside the stream handler.
         lore_spawn_net!(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
     }
+
+    readers.close();
+    readers.wait().await;
+    while connection_handler.in_flight() > 0 {
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+    info!("Connection drained, closing");
+    connection.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
+    Ok(())
 }

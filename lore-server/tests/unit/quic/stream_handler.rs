@@ -197,7 +197,13 @@ enum MockBehaviour {
     Echo,
     /// Answer with more bytes than [`MOCK_MAX_CHUNK`] allows.
     Oversized,
+    /// Answer after [`SLOW_HANDLER_SLEEP`].
+    Slow,
 }
+
+/// How long [`MockBehaviour::Slow`] takes to answer: long enough to still be in flight when a
+/// test starts shutting the server down.
+const SLOW_HANDLER_SLEEP: Duration = Duration::from_secs(1);
 
 impl MockBehaviour {
     fn opcode(self) -> QuicOpCode {
@@ -205,6 +211,7 @@ impl MockBehaviour {
             MockBehaviour::Block => 1,
             MockBehaviour::Echo => 2,
             MockBehaviour::Oversized => 3,
+            MockBehaviour::Slow => 4,
         }
     }
 
@@ -213,6 +220,7 @@ impl MockBehaviour {
             MockBehaviour::Block,
             MockBehaviour::Echo,
             MockBehaviour::Oversized,
+            MockBehaviour::Slow,
         ]
         .into_iter()
         .find(|behaviour| behaviour.opcode() == opcode)
@@ -251,6 +259,10 @@ impl QuicService for MockService {
             }
             MockBehaviour::Echo => Ok(vec![Bytes::new()]),
             MockBehaviour::Oversized => Ok(vec![Bytes::from(vec![0xAB; MOCK_MAX_CHUNK + 1])]),
+            MockBehaviour::Slow => {
+                tokio::time::sleep(SLOW_HANDLER_SLEEP).await;
+                Ok(vec![Bytes::new()])
+            }
         }
     }
 
@@ -1532,6 +1544,112 @@ async fn test_v4_authorize_put_get_query_stop() {
         assert!(!resp.error, "Authorize stop session 2 failed: {resp:?}");
 
         send.finish().expect("Failed to finish stream");
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// Shutting down answers the requests a connection has already read, then closes it with the
+/// graceful application code, and refuses new connections meanwhile. It does not wait for the
+/// timeout when every connection drains before it.
+#[tokio::test]
+async fn shutdown_answers_requests_in_flight_then_closes_connections() {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut harness = serve_and_connect(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+        )
+        .await;
+        let (mut idle_send, _idle_recv) = harness.open_stream().await;
+        request(&mut idle_send, MockBehaviour::Echo, 1).await;
+
+        request(&mut harness.send, MockBehaviour::Slow, 2).await;
+        tokio::time::sleep(SLOW_HANDLER_SLEEP / 5).await;
+
+        let started = Instant::now();
+        let connection = harness.connection.clone();
+        let server_address = connection.remote_address();
+        let mut recv = harness.recv;
+        let endpoint = harness._endpoint.clone();
+        let (answered, (), closed, refused) = tokio::join!(
+            async move { response(&mut recv).await },
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+            connection.closed(),
+            async move {
+                tokio::time::sleep(SLOW_HANDLER_SLEEP / 20).await;
+                tokio::time::timeout(
+                    SLOW_HANDLER_SLEEP / 2,
+                    endpoint.connect(server_address, "localhost").unwrap(),
+                )
+                .await
+            },
+        );
+
+        assert!(
+            !matches!(refused, Ok(Ok(_))),
+            "a draining server accepts no new connection"
+        );
+        assert_eq!(answered.command_id, 2);
+        assert!(
+            !answered.error,
+            "the request in flight is answered: {answered:?}"
+        );
+        match closed {
+            ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, quinn::VarInt::from_u32(0));
+            }
+            other => panic!("expected a graceful application close, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < SHUTDOWN_TIMEOUT / 2,
+            "shutdown waited for its timeout although the connection drained"
+        );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// A connection still busy when the timeout elapses is closed regardless.
+#[tokio::test]
+async fn shutdown_closes_busy_connections_at_the_timeout() {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut harness = serve_and_connect(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+        )
+        .await;
+        request(&mut harness.send, MockBehaviour::Block, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+        )
+        .await
+        .expect("shutdown is bounded by its timeout");
+        let closed = tokio::time::timeout(Duration::from_secs(5), harness.connection.closed())
+            .await
+            .expect("the busy connection is closed");
+        assert!(
+            matches!(closed, ConnectionError::ApplicationClosed(_)),
+            "got {closed:?}"
+        );
     }))
     .await
     .expect("Test task failed");

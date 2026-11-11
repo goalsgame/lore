@@ -657,7 +657,13 @@ pub struct ServerSettings {
     // the internal-only QUIC server settings
     #[serde(default, deserialize_with = "deserialize_quic_internal")]
     pub quic_internal: Option<QuicSettings>,
-    /// Seconds to wait for existing connections to close gracefully after shutdown signal.
+    /// Seconds between a shutdown signal and the endpoints closing, during which
+    /// `/health_check` answers 503 and the server keeps accepting and serving.
+    /// Zero closes the endpoints at once.
+    #[serde(default)]
+    pub drain_seconds: u16,
+    /// Seconds to wait for existing connections to close gracefully once the
+    /// endpoints have stopped accepting new ones.
     #[serde(default = "default_connection_close_timeout")]
     pub connection_close_timeout_seconds: u16,
     /// Seconds to wait for async runtime to shut down after connections are closed.

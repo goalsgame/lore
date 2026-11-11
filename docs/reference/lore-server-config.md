@@ -86,7 +86,8 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
+| `server.drain_seconds` | `0` | Seconds after a shutdown signal during which `/health_check` answers `503` while every endpoint keeps accepting and serving, so a load balancer can move new connections elsewhere. A second signal ends the drain early. |
+| `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close once the endpoints stop accepting new ones. gRPC connections are sent `GOAWAY` and their requests finish; notification subscriptions end with `UNAVAILABLE`; QUIC connections stop reading new requests, finish those in flight and are then closed. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
 
 ### Advertised endpoints
