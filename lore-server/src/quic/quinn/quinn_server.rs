@@ -42,15 +42,9 @@ use crate::util::cert_metrics::start_certificate_metrics;
 
 const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 
-/// How often a draining connection checks whether its last request has been answered.
+/// How often a draining connection checks whether its last request has been answered, and
+/// whether the peer has acknowledged every answer.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Shortest period without stream data sent after which a draining connection counts as settled.
-/// Long enough to span several backed-off retransmission timeouts on a low-latency path.
-const MIN_SETTLE_QUIET: Duration = Duration::from_secs(1);
-
-/// Round trips without stream data sent after which a draining connection counts as settled.
-const SETTLE_QUIET_RTTS: u32 = 8;
 
 /// Application close code and reason sent to peers when the server shuts down.
 const SHUTDOWN_CLOSE_CODE: u32 = 0;
@@ -317,18 +311,19 @@ fn run_loop(
     Ok(())
 }
 
-/// Waits until the connection has sent no stream data, retransmissions included, for long
-/// enough that the peer has most likely acknowledged what was sent.
+/// Waits until the peer has acknowledged every byte written to the connection's streams, or the
+/// connection is closed.
 ///
 /// Streams are not finished to learn of delivery: a client reconnects on a finished stream.
-async fn wait_for_stream_data_to_settle(connection: &quinn::Connection) {
-    loop {
-        let sent = connection.stats().frame_tx.stream;
-        let quiet = (connection.rtt() * SETTLE_QUIET_RTTS).max(MIN_SETTLE_QUIET);
-        tokio::time::sleep(quiet).await;
-        if connection.stats().frame_tx.stream == sent {
-            return;
+async fn wait_for_stream_data_to_be_acknowledged(connection: &quinn::Connection) {
+    let acknowledged = async {
+        while connection.stats().unacked_stream_bytes > 0 {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
         }
+    };
+    tokio::select! {
+        () = acknowledged => {}
+        _ = connection.closed() => {}
     }
 }
 
@@ -480,7 +475,7 @@ async fn handle_conn(
     while connection_handler.in_flight() > 0 {
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
-    wait_for_stream_data_to_settle(&connection).await;
+    wait_for_stream_data_to_be_acknowledged(&connection).await;
     info!("Connection drained, closing");
     connection.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
     Ok(())

@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -124,6 +126,16 @@ async fn serve_and_connect(
     factory: Box<dyn StreamHandlerFactory>,
     protocol: &'static str,
 ) -> Harness {
+    serve_and_connect_through(factory, protocol, None).await
+}
+
+/// As [`serve_and_connect`], with the client connected through a [`relay`] when `blackout` is
+/// given.
+async fn serve_and_connect_through(
+    factory: Box<dyn StreamHandlerFactory>,
+    protocol: &'static str,
+    blackout: Option<Arc<AtomicBool>>,
+) -> Harness {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = socket.local_addr().expect("Failed socket setup");
     drop(socket);
@@ -154,8 +166,12 @@ async fn serve_and_connect(
     let mut endpoint = Endpoint::client(client_addr).expect("Failed to create client endpoint");
     endpoint.set_default_client_config(client_config);
 
+    let connect_addr = match blackout {
+        Some(blackout) => relay(server_addr, blackout).await,
+        None => server_addr,
+    };
     let connection = endpoint
-        .connect(server_addr, "localhost")
+        .connect(connect_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -171,6 +187,46 @@ async fn serve_and_connect(
         _server: server,
         _endpoint: endpoint,
     }
+}
+
+/// Forward datagrams between one client and `server`, dropping every datagram to the client
+/// while `blackout` is set. Returns the address the client connects to.
+async fn relay(server: SocketAddr, blackout: Arc<AtomicBool>) -> SocketAddr {
+    let client_side = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind relay");
+    let server_side = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind relay");
+    server_side
+        .connect(server)
+        .await
+        .expect("Failed to connect relay");
+    let address = client_side.local_addr().expect("Failed relay setup");
+
+    lore_spawn!(async move {
+        let mut client = None;
+        let mut from_client = vec![0u8; u16::MAX as usize];
+        let mut from_server = vec![0u8; u16::MAX as usize];
+        loop {
+            tokio::select! {
+                received = client_side.recv_from(&mut from_client) => {
+                    let Ok((len, peer)) = received else { return };
+                    client = Some(peer);
+                    let _ = server_side.send(&from_client[..len]).await;
+                }
+                received = server_side.recv(&mut from_server) => {
+                    let Ok(len) = received else { return };
+                    if let Some(peer) = client
+                        && !blackout.load(Ordering::Relaxed)
+                    {
+                        let _ = client_side.send_to(&from_server[..len], peer).await;
+                    }
+                }
+            }
+        }
+    });
+    address
 }
 
 const MOCK_PROTOCOL: &str = "mock-test/0.1";
@@ -1627,6 +1683,57 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
             started.elapsed() < SHUTDOWN_TIMEOUT / 2,
             "shutdown waited for its timeout although the connection drained"
         );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// A draining connection is not closed while an answer is unacknowledged, even when consecutive
+/// losses have backed its retransmission timeout off far beyond a round trip.
+#[tokio::test]
+async fn shutdown_delivers_an_answer_through_consecutive_losses() {
+    const BLACKOUT: Duration = Duration::from_secs(4);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let blackout = Arc::new(AtomicBool::new(false));
+        let mut harness = serve_and_connect_through(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+            Some(blackout.clone()),
+        )
+        .await;
+        request(&mut harness.send, MockBehaviour::Slow, 1).await;
+        tokio::time::sleep(SLOW_HANDLER_SLEEP / 5).await;
+        blackout.store(true, Ordering::Relaxed);
+
+        let connection = harness.connection.clone();
+        let mut recv = harness.recv;
+        let (answered, (), (), closed) = tokio::join!(
+            tokio::time::timeout(BLACKOUT * 4, response(&mut recv)),
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+            async {
+                tokio::time::sleep(BLACKOUT).await;
+                blackout.store(false, Ordering::Relaxed);
+            },
+            connection.closed(),
+        );
+
+        let answered = answered.expect("the answer arrives once datagrams flow again");
+        assert_eq!(answered.command_id, 1);
+        assert!(!answered.error, "got {answered:?}");
+        match closed {
+            ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, quinn::VarInt::from_u32(0));
+            }
+            other => panic!("expected a graceful application close, got {other:?}"),
+        }
     }))
     .await
     .expect("Test task failed");
