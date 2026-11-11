@@ -1,7 +1,6 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use lore_server::grpc::server::*;
-use tonic::transport::server::Server;
 
 /// Every service's table key paired with its settings block.
 fn all_service_blocks(
@@ -169,13 +168,9 @@ fn generate_test_certs() -> (
 fn build_server_tls_config_valid_cert_and_key_succeeds() {
     let (_ca_pem, cert_path, key_path, _dir) = generate_test_certs();
     let config = build_server_tls_config(cert_path, key_path, None)
-        .expect("build_server_tls_config should not fail for a matched cert+key");
+        .expect("build_server_tls_config should accept a matched cert+key");
 
-    // Applying to a server builder is what actually validates the cert+key pair —
-    // rustls rejects a mismatch here with KeyMismatch.
-    Server::builder()
-        .tls_config(config)
-        .expect("server builder should accept a matched cert+key");
+    assert_eq!(config.alpn_protocols, vec![b"h2".to_vec()]);
 }
 
 #[test]
@@ -184,34 +179,21 @@ fn build_server_tls_config_with_ca_cert_succeeds() {
     let ca_path = dir.path().join("ca.crt");
     std::fs::write(&ca_path, &ca_pem).unwrap();
 
-    let config = build_server_tls_config(cert_path, key_path, Some(ca_path))
-        .expect("build_server_tls_config should not fail for a matched cert+key with CA");
-
-    // Applying to a server builder validates both the cert+key pair and that
-    // the CA cert is valid PEM accepted by the TLS stack.
-    Server::builder()
-        .tls_config(config)
-        .expect("server builder should accept a matched cert+key with a valid CA cert");
+    build_server_tls_config(cert_path, key_path, Some(ca_path))
+        .expect("build_server_tls_config should accept a matched cert+key with a valid CA cert");
 }
 
 #[test]
-fn build_server_tls_config_mismatched_cert_and_key_is_rejected_by_server_builder() {
+fn build_server_tls_config_mismatched_cert_and_key_is_rejected() {
     // Generate two independent chains; their certs and keys are not interchangeable.
     let (_ca_a, cert_path_a, _key_a, _dir_a) = generate_test_certs();
     let (_ca_b, _cert_b, key_path_b, _dir_b) = generate_test_certs();
 
-    // build_server_tls_config itself succeeds — it only reads bytes.
-    let config = build_server_tls_config(cert_path_a, key_path_b, None)
-        .expect("build_server_tls_config should not fail reading files");
-
-    // The mismatch is caught when the config is applied to a server builder;
-    // rustls validates that the cert and key form a consistent pair at this point.
-    let result = Server::builder().tls_config(config);
-    assert!(
-        result.is_err(),
-        "expected Err when applying a mismatched cert+key to a server builder"
+    let err = format!(
+        "{:#}",
+        build_server_tls_config(cert_path_a, key_path_b, None)
+            .expect_err("a key that does not match its certificate must be rejected")
     );
-    let err = format!("{:?}", result.unwrap_err());
     assert!(
         err.contains("KeyMismatch") || err.contains("key"),
         "expected a key-mismatch error, got: {err}"
