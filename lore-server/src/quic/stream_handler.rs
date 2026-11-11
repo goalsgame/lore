@@ -503,7 +503,7 @@ where
     async fn handle_stream(
         &self,
         recv: &mut RecvStream,
-        send: SendStream,
+        send: Arc<Mutex<SendStream>>,
         stop: &CancellationToken,
     ) -> Result<(), StreamHandlerError> {
         debug!("Handling stream");
@@ -517,7 +517,6 @@ where
             Some(metrics_sender),
         );
 
-        let send = Arc::new(Mutex::new(send));
         let limiter = Arc::new(Semaphore::new(self.process_limit));
         // Kept across the loop so a chunk carrying several requests costs no allocation.
         let mut messages = Vec::new();

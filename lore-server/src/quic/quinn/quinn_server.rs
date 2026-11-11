@@ -376,8 +376,12 @@ async fn handle_conn(
     let connection_handler: Arc<Box<dyn StreamDataHandler>> =
         Arc::new(service_builder(context.clone()));
 
-    // Counts the streams still reading requests, not those only waiting to write responses.
+    // Streams still reading requests.
     let readers = TaskTracker::new();
+    // Streams whose responses may not yet have reached the peer.
+    let writers = TaskTracker::new();
+    // Cancelled once every request read from this connection has been answered.
+    let answered = CancellationToken::new();
 
     // Keeps accepting requests until the connection closes or errors, or the server drains
     loop {
@@ -416,12 +420,18 @@ async fn handle_conn(
 
             let handler = connection_handler.clone();
             let draining = draining.clone();
+            let answered = answered.clone();
             let reader = readers.token();
+            let writer = writers.token();
             let connection = connection.clone();
+            let send = Arc::new(tokio::sync::Mutex::new(send));
 
             async move {
                 // Get the request off the transport
-                match handler.handle_stream(&mut recv, send, &draining).await {
+                match handler
+                    .handle_stream(&mut recv, send.clone(), &draining)
+                    .await
+                {
                     Ok(_) => {
                         debug!("Successfully handled request for connection");
                     }
@@ -434,8 +444,18 @@ async fn handle_conn(
                     }
                 }
                 drop(reader);
-                // Held open: dropping it stops the peer's sends, failing requests a reconnect retries.
                 if draining.is_cancelled() {
+                    answered.cancelled().await;
+                    let delivered = {
+                        let mut send = send.lock().await;
+                        send.finish().ok().map(|()| send.stopped())
+                    };
+                    if let Some(delivered) = delivered {
+                        let _ = delivered.await;
+                    }
+                    drop(writer);
+                    // Held open: dropping it stops the peer's sends, failing requests a reconnect
+                    // retries.
                     connection.closed().await;
                 }
             }
@@ -452,6 +472,9 @@ async fn handle_conn(
     while connection_handler.in_flight() > 0 {
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
+    answered.cancel();
+    writers.close();
+    writers.wait().await;
     info!("Connection drained, closing");
     connection.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
     Ok(())

@@ -1550,8 +1550,9 @@ async fn test_v4_authorize_put_get_query_stop() {
 }
 
 /// Shutting down answers the requests a connection has already read, then closes it with the
-/// graceful application code, and refuses new connections meanwhile. It does not wait for the
-/// timeout when every connection drains before it.
+/// graceful application code, and refuses new connections meanwhile. No stream of the connection
+/// is finished before the last answer is sent, since a client reconnects on a finished stream.
+/// It does not wait for the timeout when every connection drains before it.
 #[tokio::test]
 async fn shutdown_answers_requests_in_flight_then_closes_connections() {
     const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1568,8 +1569,9 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
             MOCK_PROTOCOL,
         )
         .await;
-        let (mut idle_send, _idle_recv) = harness.open_stream().await;
+        let (mut idle_send, mut idle_recv) = harness.open_stream().await;
         request(&mut idle_send, MockBehaviour::Echo, 1).await;
+        assert_eq!(response(&mut idle_recv).await.command_id, 1);
 
         request(&mut harness.send, MockBehaviour::Slow, 2).await;
         tokio::time::sleep(SLOW_HANDLER_SLEEP / 5).await;
@@ -1579,8 +1581,16 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
         let server_address = connection.remote_address();
         let mut recv = harness.recv;
         let endpoint = harness._endpoint.clone();
-        let (answered, (), closed, refused) = tokio::join!(
-            async move { response(&mut recv).await },
+        let (answered, idle_finished, (), closed, refused) = tokio::join!(
+            async move { (response(&mut recv).await, Instant::now()) },
+            async move {
+                let end = idle_recv.read_chunk(usize::MAX, false).await;
+                assert!(
+                    matches!(end, Ok(None)),
+                    "the idle stream is finished: {end:?}"
+                );
+                Instant::now()
+            },
             harness._server.shutdown(SHUTDOWN_TIMEOUT),
             connection.closed(),
             async move {
@@ -1596,6 +1606,11 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
         assert!(
             !matches!(refused, Ok(Ok(_))),
             "a draining server accepts no new connection"
+        );
+        let (answered, answered_at) = answered;
+        assert!(
+            idle_finished >= answered_at,
+            "an idle stream was finished before the last answer"
         );
         assert_eq!(answered.command_id, 2);
         assert!(

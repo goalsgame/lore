@@ -15,6 +15,7 @@ use lore_transport::quic::QuicOpCode;
 use lore_transport::quic::command_header::COMMAND_HEADER_SIZE;
 use lore_transport::quic::command_header::CommandHeader;
 use thiserror::Error;
+use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::Span;
 
@@ -56,11 +57,11 @@ pub trait StreamDataHandler: Send + Sync + 'static {
     /// For handling data from stream-based streams (i.e. Quinn).
     ///
     /// Stops reading once `stop` is cancelled, without finishing `send`: requests already read
-    /// are still answered on it.
+    /// are still answered on it, and the caller finishes it once they have been.
     async fn handle_stream(
         &self,
         recv: &mut RecvStream,
-        send: SendStream,
+        send: Arc<Mutex<SendStream>>,
         stop: &CancellationToken,
     ) -> Result<(), StreamHandlerError>;
 
