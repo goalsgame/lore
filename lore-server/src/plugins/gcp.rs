@@ -5,10 +5,7 @@
 //! This module provides plugin factories for GCP-backed stores, mirroring `plugins/aws.rs`:
 //! - [`GcpImmutableStorePluginFactory`] - Creates GCS/Firestore-backed immutable stores
 //! - [`GcpMutableStorePluginFactory`] - Creates Firestore-backed mutable stores
-//!
-//! There is no `GcpLockStorePluginFactory`: a Firestore-backed lock store is explicitly out of
-//! scope for the `lore-gcp` crate today. A GCP deployment configures `lock_store.mode = "local"`
-//! instead.
+//! - [`GcpLockStorePluginFactory`] - Creates Firestore-backed lock stores
 //!
 //! # Configuration shape
 //!
@@ -27,6 +24,9 @@
 //!
 //! [plugins.gcp.mutable_store]
 //! # firestore_project inherited from [plugins.gcp] above
+//!
+//! [plugins.gcp.lock_store]
+//! # firestore_project inherited from [plugins.gcp] above
 //! ```
 
 use std::sync::Arc;
@@ -41,14 +41,18 @@ use lore_gcp::store::immutable_store::FirestoreImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcpImmutableStore;
 use lore_gcp::store::immutable_store::GcpImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcsStoreSettings;
+use lore_gcp::store::lock_store::FirestoreLockStore;
+use lore_gcp::store::lock_store::FirestoreLockStoreSettings;
 use lore_gcp::store::mutable_store::FirestoreMutableStore;
 use lore_gcp::store::mutable_store::FirestoreMutableStoreSettings;
+use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use serde::Deserialize;
 use tracing::info;
 
 use crate::plugins::ImmutableStorePluginFactory;
+use crate::plugins::LockStorePluginFactory;
 use crate::plugins::MutableStorePluginFactory;
 use crate::plugins::NotificationPlugin;
 use crate::plugins::NotificationPluginContext;
@@ -159,6 +163,33 @@ pub struct GcpMutableStorePluginConfig {
     /// [`FirestoreMutableStore`] for the same reason it is unused there.
     #[serde(default)]
     pub force_write: bool,
+}
+
+/// Configuration for the GCP lock store plugin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GcpLockStorePluginConfig {
+    /// GCP project holding the Firestore database.
+    pub firestore_project: String,
+
+    /// Firestore database id. `None` uses the default database, `"(default)"`.
+    #[serde(default)]
+    pub firestore_database: Option<String>,
+
+    /// Firestore collection name for lock documents.
+    #[serde(default = "default_lock_store_collection")]
+    pub firestore_lock_store_collection: String,
+
+    /// Slow operation threshold in milliseconds for Firestore operations.
+    #[serde(default = "default_firestore_slow_threshold")]
+    pub slow_operation_threshold_millis: u64,
+
+    /// Timeout in milliseconds for one lock operation, including transaction retries.
+    #[serde(default = "default_firestore_timeout")]
+    pub timeout_millis: u64,
+}
+
+fn default_lock_store_collection() -> String {
+    "locks".to_string()
 }
 
 fn default_fragment_state_collection() -> String {
@@ -409,6 +440,68 @@ impl MutableStorePluginFactory for GcpMutableStorePluginFactory {
     }
 }
 
+/// Plugin factory for creating GCP lock stores.
+///
+/// This factory creates [`FirestoreLockStore`] instances backed by Firestore.
+pub struct GcpLockStorePluginFactory;
+
+impl GcpLockStorePluginFactory {
+    fn parse(&self, config: &toml::Value) -> Result<GcpLockStorePluginConfig, PluginError> {
+        config.clone().try_into().map_err(|e| {
+            PluginError::from(PluginConfigError {
+                plugin_name: self.name().to_string(),
+                message: format!("Failed to deserialize GCP lock store config: {e}"),
+            })
+        })
+    }
+}
+
+impl LockStorePluginFactory for GcpLockStorePluginFactory {
+    fn name(&self) -> &'static str {
+        PLUGIN_NAME
+    }
+
+    fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
+        self.parse(config).map(|_| ())
+    }
+
+    fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
+        let plugin_name = self.name();
+        let plugin_config = self.parse(config)?;
+
+        info!(
+            plugin_name = plugin_name,
+            firestore_project = %plugin_config.firestore_project,
+            firestore_collection = %plugin_config.firestore_lock_store_collection,
+            "Creating GCP lock store: {plugin_config:?}"
+        );
+
+        #[allow(clippy::disallowed_methods)]
+        let db = tokio::task::block_in_place(|| {
+            runtime().block_on(clients::build_firestore_db(
+                &plugin_config.firestore_project,
+                plugin_config.firestore_database.as_deref(),
+            ))
+        })
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Firestore client: {e}"),
+            })
+        })?;
+
+        let settings = FirestoreLockStoreSettings {
+            firestore_project: plugin_config.firestore_project,
+            firestore_database: plugin_config.firestore_database,
+            firestore_lock_store_collection: plugin_config.firestore_lock_store_collection,
+            timeout_millis: plugin_config.timeout_millis,
+            slow_operation_threshold_millis: plugin_config.slow_operation_threshold_millis,
+        };
+
+        Ok(Arc::new(FirestoreLockStore::new(db, &settings)))
+    }
+}
+
 /// Configuration for the GCP notification plugin.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GcpNotificationPluginConfig {
@@ -515,6 +608,7 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
 pub fn register(registry: &mut PluginRegistry) {
     registry.register_immutable_store_plugin(Box::new(GcpImmutableStorePluginFactory));
     registry.register_mutable_store_plugin(Box::new(GcpMutableStorePluginFactory));
+    registry.register_lock_store_plugin(Box::new(GcpLockStorePluginFactory));
     registry.register_notification_plugin(Box::new(GcpNotificationPluginFactory));
 }
 
@@ -561,9 +655,11 @@ mod tests {
             "Expected 'gcp' in notification plugins, found: {notification_plugins:?}"
         );
 
-        // No lock store plugin: a Firestore-backed lock store is out of scope.
         let lock_plugins = registry.list_lock_store_plugins();
-        assert!(!lock_plugins.contains(&PLUGIN_NAME.to_string()));
+        assert!(
+            lock_plugins.contains(&PLUGIN_NAME.to_string()),
+            "Expected 'gcp' in lock store plugins, found: {lock_plugins:?}"
+        );
     }
 
     #[test]
@@ -802,6 +898,62 @@ mod tests {
         assert_eq!(plugin_config.slow_operation_threshold_millis, 2000);
         assert_eq!(plugin_config.timeout_millis, 30000);
         assert!(!plugin_config.force_write);
+    }
+
+    #[test]
+    fn test_lock_store_config_deserialization_with_defaults() {
+        let config: toml::Value = toml::from_str(r#"firestore_project = "my-project""#).unwrap();
+        let plugin_config: GcpLockStorePluginConfig = config.try_into().unwrap();
+
+        assert_eq!(plugin_config.firestore_project, "my-project");
+        assert!(plugin_config.firestore_database.is_none());
+        assert_eq!(plugin_config.firestore_lock_store_collection, "locks");
+        assert_eq!(plugin_config.slow_operation_threshold_millis, 2000);
+        assert_eq!(plugin_config.timeout_millis, 30000);
+    }
+
+    #[test]
+    fn test_lock_store_config_requires_firestore_project() {
+        let factory = GcpLockStorePluginFactory;
+        let err = factory
+            .validate_config(&toml::Value::Table(toml::map::Map::new()))
+            .expect_err("firestore_project must be configured");
+        assert_eq!(
+            err.as_plugin_config_error()
+                .expect("should be PluginConfigError")
+                .plugin_name,
+            PLUGIN_NAME
+        );
+    }
+
+    #[test]
+    fn test_lock_store_config_inherits_the_shared_firestore_settings() {
+        let plugins: std::collections::HashMap<String, toml::Value> = toml::from_str(
+            r#"
+            [gcp]
+            firestore_project = "my-gcp-project"
+            firestore_database = "my-db"
+
+            [gcp.mutable_store]
+            firestore_mutable_store_collection = "mutable_store"
+
+            [gcp.lock_store]
+            firestore_lock_store_collection = "file_locks"
+        "#,
+        )
+        .unwrap();
+
+        let resolved = crate::store::configuration::resolve_plugin_config_with_fallback(
+            &plugins,
+            PLUGIN_NAME,
+            "lock_store",
+        )
+        .expect("the lock store sub-table resolves");
+        let plugin_config: GcpLockStorePluginConfig = resolved.try_into().unwrap();
+
+        assert_eq!(plugin_config.firestore_project, "my-gcp-project");
+        assert_eq!(plugin_config.firestore_database.as_deref(), Some("my-db"));
+        assert_eq!(plugin_config.firestore_lock_store_collection, "file_locks");
     }
 
     #[test]

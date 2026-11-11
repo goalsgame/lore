@@ -149,7 +149,7 @@ fn hex_encode<const N: usize>(bytes: &[u8; N]) -> String {
     hex::encode(bytes)
 }
 
-fn parse_hash(value: &str) -> Result<Hash, GcpError> {
+pub(crate) fn parse_hash(value: &str) -> Result<Hash, GcpError> {
     let bytes = hex::decode(value)
         .map_err(|e| GcpError::Decode(format!("value {value:?} is not valid hex: {e}")))?;
     let bytes: [u8; 32] = bytes.try_into().map_err(|bytes: Vec<u8>| {

@@ -6,6 +6,7 @@ publish = false
 
 [dependencies]
 async-trait = { workspace = true }
+blake3 = { workspace = true }
 bytes = { workspace = true }
 # Pinned to 0.47.x rather than latest (0.53.0): 0.48.0 moved to gcloud-sdk 0.29, which moved to
 # reqwest ^0.13 — whose "rustls" feature bundle hardcodes the aws-lc-rs crypto provider with no
