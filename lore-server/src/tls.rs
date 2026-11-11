@@ -125,6 +125,11 @@ fn read_certified_key(cert_files: &[PathBuf], key_file: &Path) -> anyhow::Result
         if certs.is_empty() {
             anyhow::bail!("no certificate found in {}", cert_file.display());
         }
+        for cert in &certs {
+            x509_parser::parse_x509_certificate(cert.as_ref()).map_err(|error| {
+                anyhow::anyhow!("malformed certificate in {}: {error}", cert_file.display())
+            })?;
+        }
         chain.extend(certs);
     }
     let key = lore_transport::tls::load_private_key(key_file)
