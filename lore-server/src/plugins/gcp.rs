@@ -30,12 +30,15 @@
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_gcp::clients;
+use lore_gcp::notification::PubSubNotificationReceiver;
 use lore_gcp::notification::PubSubNotificationSender;
+use lore_gcp::notification::PubSubReceiverSettings;
 use lore_gcp::notification::PubSubSettings;
 use lore_gcp::store::immutable_store::FirestoreImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcpImmutableStore;
@@ -57,6 +60,7 @@ use crate::plugins::MutableStorePluginFactory;
 use crate::plugins::NotificationPlugin;
 use crate::plugins::NotificationPluginContext;
 use crate::plugins::NotificationPluginFactory;
+use crate::plugins::NotificationReceiver;
 use crate::plugins::PluginError;
 use crate::plugins::PluginRegistry;
 
@@ -520,16 +524,56 @@ pub struct GcpNotificationPluginConfig {
     /// the log line for its failure is dropped.
     #[serde(default = "default_pubsub_outcome_concurrency_limit")]
     pub pubsub_outcome_concurrency_limit: usize,
+
+    /// Deliver the events other server instances publish to this instance's
+    /// Subscribe RPC, read from a Pub/Sub subscription of its own.
+    #[serde(default)]
+    pub pubsub_receive: bool,
+
+    /// Subscription id of an existing subscription to read when receiving. Unset,
+    /// the instance creates `{pubsub_subscription_prefix}-{origin}` at startup and
+    /// deletes it at shutdown. A configured subscription must not be shared with
+    /// another instance: Pub/Sub delivers each message to only one reader of a
+    /// subscription.
+    #[serde(default)]
+    pub pubsub_subscription: Option<String>,
+
+    /// Prefix of the subscription id an instance creates.
+    #[serde(default = "default_pubsub_subscription_prefix")]
+    pub pubsub_subscription_prefix: String,
+
+    /// How long a created subscription may go unused before Pub/Sub deletes it.
+    /// Pub/Sub accepts 1 day at the least.
+    #[serde(default = "default_pubsub_subscription_ttl_seconds")]
+    pub pubsub_subscription_ttl_seconds: u64,
+
+    /// How long a created subscription retains unacknowledged messages. Pub/Sub
+    /// accepts 10 minutes at the least.
+    #[serde(default = "default_pubsub_message_retention_seconds")]
+    pub pubsub_message_retention_seconds: u64,
 }
 
 fn default_pubsub_outcome_concurrency_limit() -> usize {
     256
 }
 
+fn default_pubsub_subscription_prefix() -> String {
+    "lore-server".to_string()
+}
+
+fn default_pubsub_subscription_ttl_seconds() -> u64 {
+    86_400
+}
+
+fn default_pubsub_message_retention_seconds() -> u64 {
+    600
+}
+
 /// Plugin factory for creating the GCP notification sender.
 ///
-/// Publishes to Pub/Sub. It contributes no receivers, so obliterate propagation
-/// between server instances is not covered; see
+/// Publishes to Pub/Sub. With `pubsub_receive`, it also contributes a receiver
+/// that delivers the events other server instances publish to this instance's
+/// Subscribe RPC. Obliterate propagation between instances is not covered; see
 /// [`PubSubNotificationSender::obliterate`].
 pub struct GcpNotificationPluginFactory;
 
@@ -556,7 +600,7 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
     async fn create(
         &self,
         config: &toml::Value,
-        _context: &NotificationPluginContext,
+        context: &NotificationPluginContext,
     ) -> Result<NotificationPlugin, PluginError> {
         let plugin_name = self.name();
 
@@ -569,9 +613,9 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
             })?;
 
         let settings = PubSubSettings {
-            project: plugin_config.pubsub_project,
-            topic: plugin_config.pubsub_topic,
-            endpoint: plugin_config.pubsub_endpoint,
+            project: plugin_config.pubsub_project.clone(),
+            topic: plugin_config.pubsub_topic.clone(),
+            endpoint: plugin_config.pubsub_endpoint.clone(),
             outcome_concurrency_limit: plugin_config.pubsub_outcome_concurrency_limit,
         };
 
@@ -590,11 +634,71 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
                 })
             })?;
 
+        let mut receivers = Vec::new();
+        if plugin_config.pubsub_receive {
+            receivers.push(
+                create_receiver(plugin_name, &plugin_config, sender.origin(), context).await?,
+            );
+        }
+
         Ok(NotificationPlugin {
             sender: Arc::new(sender),
-            receivers: Vec::new(),
+            receivers,
         })
     }
+}
+
+/// Creates the receiver's subscription and returns the task that delivers from it
+/// to `context`'s in-process sender until `context`'s shutdown signal.
+async fn create_receiver(
+    plugin_name: &str,
+    plugin_config: &GcpNotificationPluginConfig,
+    origin: &str,
+    context: &NotificationPluginContext,
+) -> Result<NotificationReceiver, PluginError> {
+    let init_error = |message: String| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message,
+        })
+    };
+    let local = context
+        .local
+        .clone()
+        .ok_or_else(|| init_error("pubsub_receive needs the in-process sender".to_string()))?;
+    let mut shutdown = context
+        .shutdown
+        .clone()
+        .ok_or_else(|| init_error("pubsub_receive needs the shutdown signal".to_string()))?;
+
+    let settings = PubSubReceiverSettings {
+        project: plugin_config.pubsub_project.clone(),
+        topic: plugin_config.pubsub_topic.clone(),
+        endpoint: plugin_config.pubsub_endpoint.clone(),
+        subscription: plugin_config.pubsub_subscription.clone(),
+        subscription_prefix: plugin_config.pubsub_subscription_prefix.clone(),
+        subscription_ttl: Duration::from_secs(plugin_config.pubsub_subscription_ttl_seconds),
+        message_retention: Duration::from_secs(plugin_config.pubsub_message_retention_seconds),
+    };
+
+    let receiver = PubSubNotificationReceiver::new(&settings, origin)
+        .await
+        .map_err(|e| init_error(format!("Failed to create Pub/Sub receiver: {e}")))?;
+
+    info!(
+        plugin_name = plugin_name,
+        subscription = %receiver.subscription(),
+        "Receiving notification events from Pub/Sub"
+    );
+
+    Ok(Box::pin(async move {
+        receiver
+            .run(move |event| local.deliver(event), async move {
+                let _ = shutdown.wait_for(|&stopping| stopping).await;
+            })
+            .await;
+        Ok(())
+    }))
 }
 
 // =============================================================================
@@ -701,6 +805,36 @@ mod tests {
 
         assert!(plugin_config.pubsub_endpoint.is_none());
         assert_eq!(plugin_config.pubsub_outcome_concurrency_limit, 256);
+        assert!(!plugin_config.pubsub_receive, "receiving is opt-in");
+        assert!(plugin_config.pubsub_subscription.is_none());
+        assert_eq!(plugin_config.pubsub_subscription_prefix, "lore-server");
+        assert_eq!(plugin_config.pubsub_subscription_ttl_seconds, 86_400);
+        assert_eq!(plugin_config.pubsub_message_retention_seconds, 600);
+    }
+
+    #[test]
+    fn test_notification_receiver_config_deserialization() {
+        let config_str = r#"
+            pubsub_project = "my-project"
+            pubsub_topic = "lore-events"
+            pubsub_receive = true
+            pubsub_subscription = "lore-events-replica-0"
+            pubsub_subscription_prefix = "lore"
+            pubsub_subscription_ttl_seconds = 172800
+            pubsub_message_retention_seconds = 1200
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: GcpNotificationPluginConfig = config.try_into().unwrap();
+
+        assert!(plugin_config.pubsub_receive);
+        assert_eq!(
+            plugin_config.pubsub_subscription.as_deref(),
+            Some("lore-events-replica-0")
+        );
+        assert_eq!(plugin_config.pubsub_subscription_prefix, "lore");
+        assert_eq!(plugin_config.pubsub_subscription_ttl_seconds, 172_800);
+        assert_eq!(plugin_config.pubsub_message_retention_seconds, 1200);
     }
 
     /// `configure_notification` (`server.rs`) hands the plugin the whole
