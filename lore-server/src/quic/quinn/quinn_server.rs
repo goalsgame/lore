@@ -45,8 +45,12 @@ const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 /// How often a draining connection checks whether its last request has been answered.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
-/// Allowance for the peer's acknowledgement delay when waiting for stream data to settle.
-const SETTLE_ACK_DELAY: Duration = Duration::from_millis(50);
+/// Shortest period without stream data sent after which a draining connection counts as settled.
+/// Long enough to span several backed-off retransmission timeouts on a low-latency path.
+const MIN_SETTLE_QUIET: Duration = Duration::from_secs(1);
+
+/// Round trips without stream data sent after which a draining connection counts as settled.
+const SETTLE_QUIET_RTTS: u32 = 8;
 
 /// Application close code and reason sent to peers when the server shuts down.
 const SHUTDOWN_CLOSE_CODE: u32 = 0;
@@ -320,7 +324,7 @@ fn run_loop(
 async fn wait_for_stream_data_to_settle(connection: &quinn::Connection) {
     loop {
         let sent = connection.stats().frame_tx.stream;
-        let quiet = connection.rtt() * 4 + SETTLE_ACK_DELAY;
+        let quiet = (connection.rtt() * SETTLE_QUIET_RTTS).max(MIN_SETTLE_QUIET);
         tokio::time::sleep(quiet).await;
         if connection.stats().frame_tx.stream == sent {
             return;
