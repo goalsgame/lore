@@ -3342,6 +3342,7 @@ name = "lore-gcp"
 version = "0.12.1-nightly"
 dependencies = [
  "async-trait",
+ "blake3",
  "bytes",
  "chrono",
  "firestore",
