@@ -208,6 +208,7 @@ impl PubSubNotificationReceiver {
 
         loop {
             let mut stream = self.subscriber.subscribe(&self.subscription).build();
+            let mut recreate = false;
             loop {
                 tokio::select! {
                     () = &mut shutdown => {
@@ -231,15 +232,27 @@ impl PubSubNotificationReceiver {
                                 %error,
                                 "Pub/Sub notification subscription stream failed"
                             );
-                            if self.created
-                                && error.status().map(|status| status.code) == Some(Code::NotFound)
-                                && let Err(error) = self.create_subscription().await
-                            {
-                                warn!(%error, "Could not recreate the Pub/Sub notification subscription");
-                            }
+                            recreate = self.created
+                                && error.status().map(|status| status.code) == Some(Code::NotFound);
                             break;
                         }
                         None => break,
+                    }
+                }
+            }
+
+            drop(stream);
+
+            if recreate {
+                tokio::select! {
+                    () = &mut shutdown => {
+                        self.delete_subscription().await;
+                        return;
+                    }
+                    created = self.create_subscription() => {
+                        if let Err(error) = created {
+                            warn!(%error, "Could not recreate the Pub/Sub notification subscription");
+                        }
                     }
                 }
             }
