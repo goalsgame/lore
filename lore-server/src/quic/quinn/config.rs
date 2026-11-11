@@ -10,13 +10,13 @@ use std::time::Duration;
 use anyhow::anyhow;
 use lore_transport::quic::client::CongestionAlgorithm;
 use lore_transport::quic::client::STREAM_COUNT;
-use lore_transport::tls;
 use rustls::server::NoClientAuth;
 use rustls::server::danger::ClientCertVerifier;
 use tracing::info;
 
 use crate::quic::StreamHandlerFactory;
 use crate::quic::initial_cwnd::InitialCwndBytes;
+use crate::tls::ReloadableCertificate;
 
 pub struct QuinnConfig {
     // In observability, what is the label that distinguishes this Quinn
@@ -257,19 +257,24 @@ impl QuinnConfigBuilder {
     }
 }
 
-pub(crate) fn crypto_config(config: &QuinnConfig) -> anyhow::Result<rustls::ServerConfig> {
-    let mut certs = tls::load_certs(&config.cert_file)?;
-    if let Some(chain_path) = &config.cert_chain {
-        let chain_certs = tls::load_certs(chain_path)?;
-        certs.extend(chain_certs);
-    }
+/// The certificate a server presents: `cert_file` followed by `cert_chain`, re-read by
+/// [`crate::tls::reload_certificates`].
+pub(crate) fn server_certificate(
+    config: &QuinnConfig,
+) -> anyhow::Result<Arc<ReloadableCertificate>> {
+    let mut cert_files = vec![config.cert_file.clone()];
+    cert_files.extend(config.cert_chain.clone());
+    ReloadableCertificate::load(cert_files, config.pkey_file.clone())
+}
 
-    let private_key = tls::load_private_key(&config.pkey_file)?;
-
+pub(crate) fn crypto_config(
+    config: &QuinnConfig,
+    certificate: Arc<ReloadableCertificate>,
+) -> anyhow::Result<rustls::ServerConfig> {
     let mut server_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
             .with_client_cert_verifier(config.client_cert_verifier.clone())
-            .with_single_cert(certs, private_key)?;
+            .with_cert_resolver(certificate);
 
     server_config.alpn_protocols = config
         .alpns

@@ -332,6 +332,18 @@ async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -
     Ok(())
 }
 
+/// Reloads every TLS certificate the server presents from disk on each SIGHUP.
+///
+/// Installing the handler also stops SIGHUP from terminating the process.
+#[cfg(unix)]
+async fn reload_certificates_on_hangup(mut hangup: tokio::signal::unix::Signal) -> Result<()> {
+    while hangup.recv().await.is_some() {
+        info!("Received SIGHUP, reloading TLS certificates");
+        crate::tls::reload_certificates();
+    }
+    Ok(())
+}
+
 impl From<QuicSettings> for QuinnConfigBuilder {
     fn from(settings: QuicSettings) -> Self {
         let mut builder = QuinnConfigBuilder::default().num_listeners(settings.num_listeners);
@@ -2172,6 +2184,12 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
+
+    #[cfg(unix)]
+    {
+        let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        lore_spawn!(reload_certificates_on_hangup(hangup));
+    }
 
     // Spawn signal listener outside the endpoint JoinSet so the drain
     // timeout only starts after the signal fires.

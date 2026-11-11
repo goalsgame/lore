@@ -154,6 +154,10 @@ Each QUIC endpoint takes an optional `[server.quic.certificate]` (or `[server.qu
 | `pkey_file` | none | Path to the PEM-encoded private key. |
 | `cert_chain` | none | Path to PEM-encoded CA certificate(s) used to verify client certificates (and also appended to the chain the server presents). Required on any endpoint with `verify_client_certs = true`; the internal endpoint enforces this at startup. |
 
+#### Reloading certificates
+
+On `SIGHUP` the server re-reads `cert_file` and `pkey_file` (and, for QUIC, the `cert_chain` it presents) for every QUIC and gRPC endpoint, including the maintenance listeners. Handshakes after the reload present the new certificate; established connections keep the one they negotiated. A certificate or key that fails to read or parse, or a key that does not match its certificate, is logged and ignored, and the endpoint keeps presenting the previous certificate. The CA used to verify client certificates is read only at startup. The certificate expiry metric follows the certificate in use.
+
 ### HTTP endpoint
 
 `[server.http]` configures the HTTP endpoint that serves the health check and, when enabled, presigned URLs.
