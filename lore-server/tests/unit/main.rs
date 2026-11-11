@@ -24,6 +24,7 @@ mod server;
 mod settings;
 mod store;
 mod telemetry;
+mod tls;
 mod topology;
 mod util;
 

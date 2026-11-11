@@ -27,10 +27,8 @@ use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
 use serde::Deserialize;
 use tonic::service::Routes;
-use tonic::transport::Certificate;
-use tonic::transport::Identity;
-use tonic::transport::ServerTlsConfig;
 use tonic::transport::server::Server;
+use tonic::transport::server::TcpIncoming;
 use tower::Layer;
 use tower::ServiceBuilder;
 use tower::layer::util::Stack;
@@ -72,6 +70,8 @@ use crate::legacy::rpc::environment_service_server::EnvironmentServiceServer;
 use crate::legacy::rpc::repository_service_server::RepositoryServiceServer;
 use crate::legacy::rpc::revision_service_server::RevisionServiceServer;
 use crate::legacy::rpc::storage_service_server::StorageServiceServer;
+use crate::tls::ReloadableCertificate;
+use crate::tls::grpc_server_tls_config;
 use crate::util::core_hop::CoreHopLayer;
 
 // Why Tower, why?
@@ -256,28 +256,52 @@ impl Default for RevisionListAcceleration {
     }
 }
 
-/// Builds a [`ServerTlsConfig`] for a gRPC server endpoint.
+/// Builds the TLS configuration for a gRPC server endpoint.
 ///
-/// `cert_path` and `key_path` are the server's own certificate and private key.
-/// `cert_chain_path`, when supplied, is the CA certificate used to verify client
-/// certificates; client certificates are accepted but not required. Without it
-/// no client verification is configured.
+/// `cert_path` and `key_path` are the server's own certificate and private key,
+/// re-read by [`crate::tls::reload_certificates`]. `cert_chain_path`, when
+/// supplied, is the CA certificate used to verify client certificates; client
+/// certificates are accepted but not required. Without it no client
+/// verification is configured.
 #[lore_macro::test_pub]
 fn build_server_tls_config(
     cert_path: PathBuf,
     key_path: PathBuf,
     cert_chain_path: Option<PathBuf>,
-) -> Result<ServerTlsConfig> {
+) -> Result<Arc<rustls::ServerConfig>> {
     info!("Loading TLS certs - cert: {cert_path:?} key: {key_path:?}");
-    let identity = Identity::from_pem(std::fs::read(&cert_path)?, std::fs::read(&key_path)?);
-    let mut tls = ServerTlsConfig::new()
-        .identity(identity)
-        .client_auth_optional(true);
-    if let Some(chain_path) = cert_chain_path {
+    let certificate = ReloadableCertificate::load(vec![cert_path], key_path)?;
+    if let Some(chain_path) = &cert_chain_path {
         info!("Loading CA cert for client verification: {chain_path:?}");
-        tls = tls.client_ca_root(Certificate::from_pem(std::fs::read(chain_path)?));
     }
-    Ok(tls)
+    grpc_server_tls_config(certificate, cert_chain_path.as_deref(), false)
+}
+
+/// Serves `router` on the connections `incoming` yields until `signal`, completing TLS with `tls`
+/// when it is set.
+macro_rules! serve_with_tls {
+    ($router:expr, $incoming:expr, $tls:expr, $signal:expr) => {
+        match $tls {
+            Some(tls) => {
+                $router
+                    .serve_with_incoming_shutdown(crate::tls::tls_incoming($incoming, tls), $signal)
+                    .await
+            }
+            None => {
+                $router
+                    .serve_with_incoming_shutdown($incoming, $signal)
+                    .await
+            }
+        }
+    };
+}
+pub(crate) use serve_with_tls;
+
+/// Listens on `addr` with the socket options tonic's own `serve` applies by default.
+pub(crate) fn bind_incoming(addr: SocketAddr) -> Result<TcpIncoming> {
+    Ok(TcpIncoming::bind(addr)
+        .map_err(|error| anyhow!("Failed to bind {addr}: {error}"))?
+        .with_nodelay(Some(true)))
 }
 
 #[derive(Debug, Default)]
@@ -491,7 +515,7 @@ pub struct WantsAdminEndpoints {
     hook_dispatcher: Arc<HookDispatcher>,
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
-    tls_config: Option<ServerTlsConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl GrpcServerBuilder<WantsAdminEndpoints> {
@@ -534,7 +558,7 @@ pub struct WantsHttp2Config {
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
-    tls_config: Option<ServerTlsConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     admin_svc: LoreAdminService,
 }
 
@@ -597,7 +621,7 @@ pub struct MaybeJwtVerifier {
     notification_sender: Arc<dyn NotificationSender>,
     notification_service: Option<NotificationService>,
     hook_dispatcher: Arc<HookDispatcher>,
-    tls_config: Option<ServerTlsConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
     admin_svc: LoreAdminService,
     http2_keep_alive_interval: Option<Duration>,
     http2_keep_alive_timeout: Option<Duration>,
@@ -675,12 +699,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         let metrics_layer = tower::ServiceBuilder::new()
             .layer(GrpcMetricsLayer::new(self.0.user_agent_filter.clone()));
-        let mut server = Server::builder()
+        let server = Server::builder()
             .http2_keepalive_interval(self.0.http2_keep_alive_interval)
             .http2_keepalive_timeout(self.0.http2_keep_alive_timeout);
-        if let Some(tls_config) = self.0.tls_config {
-            server = server.tls_config(tls_config)?;
-        }
+        let tls_config = self.0.tls_config;
         let trace_layer_config = {
             let mut config = TraceLayerConfig::default();
             config.grpc_codes_as_success.push(GrpcCode::Unauthenticated);
@@ -888,12 +910,13 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             );
         }
 
-        Ok(GrpcServerBuilder(WantsAddress { router }))
+        Ok(GrpcServerBuilder(WantsAddress { router, tls_config }))
     }
 }
 
 pub struct WantsAddress {
     router: GrpcRouter,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl GrpcServerBuilder<WantsAddress> {
@@ -905,8 +928,12 @@ impl GrpcServerBuilder<WantsAddress> {
         addr: SocketAddr,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
-        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
-            .await??;
+        let WantsAddress { router, tls_config } = self.0;
+        lore_spawn_net!(async move {
+            let incoming = bind_incoming(addr)?;
+            serve_with_tls!(router, incoming, tls_config, signal).map_err(anyhow::Error::from)
+        })
+        .await??;
         Ok(())
     }
 
@@ -926,17 +953,12 @@ impl GrpcServerBuilder<WantsAddress> {
         listener: std::net::TcpListener,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
+        let WantsAddress { router, tls_config } = self.0;
         lore_spawn_net!(async move {
             listener.set_nonblocking(true)?;
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            self.0
-                .router
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    signal,
-                )
-                .await
-                .map_err(anyhow::Error::from)
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            serve_with_tls!(router, incoming, tls_config, signal).map_err(anyhow::Error::from)
         })
         .await??;
         Ok(())
@@ -958,19 +980,22 @@ pub async fn serve_maintenance(
     let environment_v1_svc = LoreEnvironmentV1Service::maintenance(environment);
 
     let mut server = Server::builder();
-    match (cert_path, key_path) {
+    let tls_config = match (cert_path, key_path) {
         (Some(cert_path), Some(key_path)) => {
             info!("Loading maintenance TLS certs - cert: {cert_path:?} key: {key_path:?}");
-            let tls_config = build_server_tls_config(cert_path, key_path, cert_chain_path)?;
-            server = server.tls_config(tls_config)?;
+            Some(build_server_tls_config(
+                cert_path,
+                key_path,
+                cert_chain_path,
+            )?)
         }
-        (None, None) => {}
+        (None, None) => None,
         _ => {
             return Err(anyhow!(
                 "Maintenance TLS is partially configured: cert_file and pkey_file must both be set or both be absent"
             ));
         }
-    }
+    };
 
     // Served from net like the other listeners. No `CoreHopLayer`: both handlers
     // only return UNAVAILABLE, so there is nothing to keep off net.
@@ -979,7 +1004,11 @@ pub async fn serve_maintenance(
         .add_service(environment_v1_server::EnvironmentServiceServer::new(
             environment_v1_svc,
         ));
-    lore_spawn_net!(async move { router.serve_with_shutdown(addr, signal).await }).await??;
+    lore_spawn_net!(async move {
+        let incoming = bind_incoming(addr)?;
+        serve_with_tls!(router, incoming, tls_config, signal).map_err(anyhow::Error::from)
+    })
+    .await??;
 
     Ok(())
 }

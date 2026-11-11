@@ -33,10 +33,10 @@ use crate::quic::StreamHandlerFactory;
 use crate::quic::initial_cwnd::InitialCwndBytes;
 use crate::quic::quinn::config::QuinnConfig;
 use crate::quic::quinn::config::crypto_config;
+use crate::quic::quinn::config::server_certificate;
 use crate::quic::quinn::metrics::track_connection_stats;
 use crate::telemetry::OtelTokioTaskMetrics;
-use crate::util::cert_metrics::parse_certificate_info;
-use crate::util::cert_metrics::start_certificate_metrics;
+use crate::util::cert_metrics::start_served_certificate_metrics;
 
 const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 
@@ -53,30 +53,16 @@ impl QuinnServer {
         let _guard = span.enter();
         info!("Initializing quinn quic server from {settings:?}");
 
-        // Initialize certificate expiry metrics
-        let cert_path = settings
-            .cert_chain
-            .clone()
-            .unwrap_or(settings.cert_file.clone());
-        if let Some(cert_info) = parse_certificate_info(&cert_path) {
-            info!(
-                cert_path = %cert_info.cert_path.display(),
-                subject = %cert_info.subject,
-                serial = %cert_info.serial,
-                expiry_timestamp = cert_info.expiry_timestamp,
-                "Parsed certificate for expiry metrics"
-            );
-            start_certificate_metrics(cert_info, settings.metrics_frequency);
-        } else {
-            warn!(
-                cert_path = %cert_path.display(),
-                "Could not parse certificate for expiry metrics, skipping"
-            );
-        }
+        let certificate = server_certificate(&settings)?;
+        start_served_certificate_metrics(
+            certificate.clone(),
+            settings.cert_file.clone(),
+            settings.metrics_frequency,
+        );
 
         let endpoint_config = EndpointConfig::default();
         let mut server_config = ServerConfig::with_crypto(Arc::new(QuicServerConfig::try_from(
-            crypto_config(&settings)?,
+            crypto_config(&settings, certificate)?,
         )?));
 
         if let Some(transport_config) = Arc::get_mut(&mut server_config.transport) {
