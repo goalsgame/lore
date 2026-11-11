@@ -1,6 +1,6 @@
 {
   "//": [
-    "Composite indexes required by lore-gcp's Firestore-backed mutable and immutable stores.",
+    "Composite indexes required by lore-gcp's Firestore-backed mutable, immutable and lock stores.",
     "Deploy with `gcloud firestore indexes composite create --database=<db>` (one call per",
     "entry below, translating the JSON fields), via Terraform `google_firestore_index`",
     "resources, or `firebase deploy --only firestore:indexes` if this file is adopted into a",
@@ -19,6 +19,11 @@
     "  Declared explicitly rather than relying on Firestore's automatic-index support for",
     "  multi-equality queries. Corresponds to",
     "  [plugins.gcp].firestore_fragment_associations_collection.",
+    "- locks (hash, repository), (owner_digest, repository), (owner_digest, repository_branch),",
+    "  (repository_branch, description_digest): lore_gcp::store::lock_store's query_locks answers",
+    "  LockQuery::HashRepository, OwnerRepository, OwnerRepositoryBranch and",
+    "  RepositoryBranchDescription with an equality filter on each pair. Corresponds to",
+    "  [plugins.gcp.lock_store].firestore_lock_store_collection.",
     "",
     "Single-field indexes (equality or range on one field alone) are automatic in Firestore",
     "and are not listed here."
@@ -38,6 +43,38 @@
       "fields": [
         { "fieldPath": "hash", "order": "ASCENDING" },
         { "fieldPath": "partition", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "locks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "hash", "order": "ASCENDING" },
+        { "fieldPath": "repository", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "locks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "owner_digest", "order": "ASCENDING" },
+        { "fieldPath": "repository", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "locks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "owner_digest", "order": "ASCENDING" },
+        { "fieldPath": "repository_branch", "order": "ASCENDING" }
+      ]
+    },
+    {
+      "collectionGroup": "locks",
+      "queryScope": "COLLECTION",
+      "fields": [
+        { "fieldPath": "repository_branch", "order": "ASCENDING" },
+        { "fieldPath": "description_digest", "order": "ASCENDING" }
       ]
     }
   ],

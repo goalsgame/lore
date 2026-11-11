@@ -5,10 +5,7 @@
 //! This module provides plugin factories for GCP-backed stores, mirroring `plugins/aws.rs`:
 //! - [`GcpImmutableStorePluginFactory`] - Creates GCS/Firestore-backed immutable stores
 //! - [`GcpMutableStorePluginFactory`] - Creates Firestore-backed mutable stores
-//!
-//! There is no `GcpLockStorePluginFactory`: a Firestore-backed lock store is explicitly out of
-//! scope for the `lore-gcp` crate today. A GCP deployment configures `lock_store.mode = "local"`
-//! instead.
+//! - [`GcpLockStorePluginFactory`] - Creates Firestore-backed lock stores
 //!
 //! # Configuration shape
 //!
@@ -27,32 +24,43 @@
 //!
 //! [plugins.gcp.mutable_store]
 //! # firestore_project inherited from [plugins.gcp] above
+//!
+//! [plugins.gcp.lock_store]
+//! # firestore_project inherited from [plugins.gcp] above
 //! ```
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use lore_base::error::PluginConfigError;
 use lore_base::error::PluginInitError;
 use lore_base::runtime::runtime;
 use lore_gcp::clients;
+use lore_gcp::notification::PubSubNotificationReceiver;
 use lore_gcp::notification::PubSubNotificationSender;
+use lore_gcp::notification::PubSubReceiverSettings;
 use lore_gcp::notification::PubSubSettings;
 use lore_gcp::store::immutable_store::FirestoreImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcpImmutableStore;
 use lore_gcp::store::immutable_store::GcpImmutableStoreSettings;
 use lore_gcp::store::immutable_store::GcsStoreSettings;
+use lore_gcp::store::lock_store::FirestoreLockStore;
+use lore_gcp::store::lock_store::FirestoreLockStoreSettings;
 use lore_gcp::store::mutable_store::FirestoreMutableStore;
 use lore_gcp::store::mutable_store::FirestoreMutableStoreSettings;
+use lore_revision::lock::LockStore;
 use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use serde::Deserialize;
 use tracing::info;
 
 use crate::plugins::ImmutableStorePluginFactory;
+use crate::plugins::LockStorePluginFactory;
 use crate::plugins::MutableStorePluginFactory;
 use crate::plugins::NotificationPlugin;
 use crate::plugins::NotificationPluginContext;
 use crate::plugins::NotificationPluginFactory;
+use crate::plugins::NotificationReceiver;
 use crate::plugins::PluginError;
 use crate::plugins::PluginRegistry;
 
@@ -159,6 +167,33 @@ pub struct GcpMutableStorePluginConfig {
     /// [`FirestoreMutableStore`] for the same reason it is unused there.
     #[serde(default)]
     pub force_write: bool,
+}
+
+/// Configuration for the GCP lock store plugin.
+#[derive(Debug, Clone, Deserialize)]
+pub struct GcpLockStorePluginConfig {
+    /// GCP project holding the Firestore database.
+    pub firestore_project: String,
+
+    /// Firestore database id. `None` uses the default database, `"(default)"`.
+    #[serde(default)]
+    pub firestore_database: Option<String>,
+
+    /// Firestore collection name for lock documents.
+    #[serde(default = "default_lock_store_collection")]
+    pub firestore_lock_store_collection: String,
+
+    /// Slow operation threshold in milliseconds for Firestore operations.
+    #[serde(default = "default_firestore_slow_threshold")]
+    pub slow_operation_threshold_millis: u64,
+
+    /// Timeout in milliseconds for one lock operation, including transaction retries.
+    #[serde(default = "default_firestore_timeout")]
+    pub timeout_millis: u64,
+}
+
+fn default_lock_store_collection() -> String {
+    "locks".to_string()
 }
 
 fn default_fragment_state_collection() -> String {
@@ -409,6 +444,68 @@ impl MutableStorePluginFactory for GcpMutableStorePluginFactory {
     }
 }
 
+/// Plugin factory for creating GCP lock stores.
+///
+/// This factory creates [`FirestoreLockStore`] instances backed by Firestore.
+pub struct GcpLockStorePluginFactory;
+
+impl GcpLockStorePluginFactory {
+    fn parse(&self, config: &toml::Value) -> Result<GcpLockStorePluginConfig, PluginError> {
+        config.clone().try_into().map_err(|e| {
+            PluginError::from(PluginConfigError {
+                plugin_name: self.name().to_string(),
+                message: format!("Failed to deserialize GCP lock store config: {e}"),
+            })
+        })
+    }
+}
+
+impl LockStorePluginFactory for GcpLockStorePluginFactory {
+    fn name(&self) -> &'static str {
+        PLUGIN_NAME
+    }
+
+    fn validate_config(&self, config: &toml::Value) -> Result<(), PluginError> {
+        self.parse(config).map(|_| ())
+    }
+
+    fn create(&self, config: &toml::Value) -> Result<Arc<dyn LockStore>, PluginError> {
+        let plugin_name = self.name();
+        let plugin_config = self.parse(config)?;
+
+        info!(
+            plugin_name = plugin_name,
+            firestore_project = %plugin_config.firestore_project,
+            firestore_collection = %plugin_config.firestore_lock_store_collection,
+            "Creating GCP lock store: {plugin_config:?}"
+        );
+
+        #[allow(clippy::disallowed_methods)]
+        let db = tokio::task::block_in_place(|| {
+            runtime().block_on(clients::build_firestore_db(
+                &plugin_config.firestore_project,
+                plugin_config.firestore_database.as_deref(),
+            ))
+        })
+        .map_err(|e| {
+            PluginError::from(PluginInitError {
+                plugin_name: plugin_name.to_string(),
+                message: format!("Failed to create Firestore client: {e}"),
+            })
+        })?;
+
+        let settings = FirestoreLockStoreSettings {
+            firestore_project: plugin_config.firestore_project,
+            firestore_database: plugin_config.firestore_database,
+            firestore_lock_store_collection: plugin_config.firestore_lock_store_collection,
+            timeout_millis: plugin_config.timeout_millis,
+            slow_operation_threshold_millis: plugin_config.slow_operation_threshold_millis,
+        };
+
+        Ok(Arc::new(FirestoreLockStore::new(db, &settings)))
+    }
+}
+
 /// Configuration for the GCP notification plugin.
 #[derive(Debug, Clone, Deserialize)]
 pub struct GcpNotificationPluginConfig {
@@ -427,16 +524,56 @@ pub struct GcpNotificationPluginConfig {
     /// the log line for its failure is dropped.
     #[serde(default = "default_pubsub_outcome_concurrency_limit")]
     pub pubsub_outcome_concurrency_limit: usize,
+
+    /// Deliver the events other server instances publish to this instance's
+    /// Subscribe RPC, read from a Pub/Sub subscription of its own.
+    #[serde(default)]
+    pub pubsub_receive: bool,
+
+    /// Subscription id of an existing subscription to read when receiving. Unset,
+    /// the instance creates `{pubsub_subscription_prefix}-{origin}` at startup and
+    /// deletes it at shutdown. A configured subscription must not be shared with
+    /// another instance: Pub/Sub delivers each message to only one reader of a
+    /// subscription.
+    #[serde(default)]
+    pub pubsub_subscription: Option<String>,
+
+    /// Prefix of the subscription id an instance creates.
+    #[serde(default = "default_pubsub_subscription_prefix")]
+    pub pubsub_subscription_prefix: String,
+
+    /// How long a created subscription may go unused before Pub/Sub deletes it.
+    /// Pub/Sub accepts 1 day at the least.
+    #[serde(default = "default_pubsub_subscription_ttl_seconds")]
+    pub pubsub_subscription_ttl_seconds: u64,
+
+    /// How long a created subscription retains unacknowledged messages. Pub/Sub
+    /// accepts 10 minutes at the least.
+    #[serde(default = "default_pubsub_message_retention_seconds")]
+    pub pubsub_message_retention_seconds: u64,
 }
 
 fn default_pubsub_outcome_concurrency_limit() -> usize {
     256
 }
 
+fn default_pubsub_subscription_prefix() -> String {
+    "lore-server".to_string()
+}
+
+fn default_pubsub_subscription_ttl_seconds() -> u64 {
+    86_400
+}
+
+fn default_pubsub_message_retention_seconds() -> u64 {
+    600
+}
+
 /// Plugin factory for creating the GCP notification sender.
 ///
-/// Publishes to Pub/Sub. It contributes no receivers, so obliterate propagation
-/// between server instances is not covered; see
+/// Publishes to Pub/Sub. With `pubsub_receive`, it also contributes a receiver
+/// that delivers the events other server instances publish to this instance's
+/// Subscribe RPC. Obliterate propagation between instances is not covered; see
 /// [`PubSubNotificationSender::obliterate`].
 pub struct GcpNotificationPluginFactory;
 
@@ -463,7 +600,7 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
     async fn create(
         &self,
         config: &toml::Value,
-        _context: &NotificationPluginContext,
+        context: &NotificationPluginContext,
     ) -> Result<NotificationPlugin, PluginError> {
         let plugin_name = self.name();
 
@@ -476,9 +613,9 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
             })?;
 
         let settings = PubSubSettings {
-            project: plugin_config.pubsub_project,
-            topic: plugin_config.pubsub_topic,
-            endpoint: plugin_config.pubsub_endpoint,
+            project: plugin_config.pubsub_project.clone(),
+            topic: plugin_config.pubsub_topic.clone(),
+            endpoint: plugin_config.pubsub_endpoint.clone(),
             outcome_concurrency_limit: plugin_config.pubsub_outcome_concurrency_limit,
         };
 
@@ -497,11 +634,71 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
                 })
             })?;
 
+        let mut receivers = Vec::new();
+        if plugin_config.pubsub_receive {
+            receivers.push(
+                create_receiver(plugin_name, &plugin_config, sender.origin(), context).await?,
+            );
+        }
+
         Ok(NotificationPlugin {
             sender: Arc::new(sender),
-            receivers: Vec::new(),
+            receivers,
         })
     }
+}
+
+/// Creates the receiver's subscription and returns the task that delivers from it
+/// to `context`'s in-process sender until `context`'s shutdown signal.
+async fn create_receiver(
+    plugin_name: &str,
+    plugin_config: &GcpNotificationPluginConfig,
+    origin: &str,
+    context: &NotificationPluginContext,
+) -> Result<NotificationReceiver, PluginError> {
+    let init_error = |message: String| {
+        PluginError::from(PluginInitError {
+            plugin_name: plugin_name.to_string(),
+            message,
+        })
+    };
+    let local = context
+        .local
+        .clone()
+        .ok_or_else(|| init_error("pubsub_receive needs the in-process sender".to_string()))?;
+    let mut shutdown = context
+        .shutdown
+        .clone()
+        .ok_or_else(|| init_error("pubsub_receive needs the shutdown signal".to_string()))?;
+
+    let settings = PubSubReceiverSettings {
+        project: plugin_config.pubsub_project.clone(),
+        topic: plugin_config.pubsub_topic.clone(),
+        endpoint: plugin_config.pubsub_endpoint.clone(),
+        subscription: plugin_config.pubsub_subscription.clone(),
+        subscription_prefix: plugin_config.pubsub_subscription_prefix.clone(),
+        subscription_ttl: Duration::from_secs(plugin_config.pubsub_subscription_ttl_seconds),
+        message_retention: Duration::from_secs(plugin_config.pubsub_message_retention_seconds),
+    };
+
+    let receiver = PubSubNotificationReceiver::new(&settings, origin)
+        .await
+        .map_err(|e| init_error(format!("Failed to create Pub/Sub receiver: {e}")))?;
+
+    info!(
+        plugin_name = plugin_name,
+        subscription = %receiver.subscription(),
+        "Receiving notification events from Pub/Sub"
+    );
+
+    Ok(Box::pin(async move {
+        receiver
+            .run(move |event| local.deliver(event), async move {
+                let _ = shutdown.wait_for(|&stopping| stopping).await;
+            })
+            .await;
+        Ok(())
+    }))
 }
 
 // =============================================================================
@@ -515,6 +712,7 @@ impl NotificationPluginFactory for GcpNotificationPluginFactory {
 pub fn register(registry: &mut PluginRegistry) {
     registry.register_immutable_store_plugin(Box::new(GcpImmutableStorePluginFactory));
     registry.register_mutable_store_plugin(Box::new(GcpMutableStorePluginFactory));
+    registry.register_lock_store_plugin(Box::new(GcpLockStorePluginFactory));
     registry.register_notification_plugin(Box::new(GcpNotificationPluginFactory));
 }
 
@@ -561,9 +759,11 @@ mod tests {
             "Expected 'gcp' in notification plugins, found: {notification_plugins:?}"
         );
 
-        // No lock store plugin: a Firestore-backed lock store is out of scope.
         let lock_plugins = registry.list_lock_store_plugins();
-        assert!(!lock_plugins.contains(&PLUGIN_NAME.to_string()));
+        assert!(
+            lock_plugins.contains(&PLUGIN_NAME.to_string()),
+            "Expected 'gcp' in lock store plugins, found: {lock_plugins:?}"
+        );
     }
 
     #[test]
@@ -605,6 +805,36 @@ mod tests {
 
         assert!(plugin_config.pubsub_endpoint.is_none());
         assert_eq!(plugin_config.pubsub_outcome_concurrency_limit, 256);
+        assert!(!plugin_config.pubsub_receive, "receiving is opt-in");
+        assert!(plugin_config.pubsub_subscription.is_none());
+        assert_eq!(plugin_config.pubsub_subscription_prefix, "lore-server");
+        assert_eq!(plugin_config.pubsub_subscription_ttl_seconds, 86_400);
+        assert_eq!(plugin_config.pubsub_message_retention_seconds, 600);
+    }
+
+    #[test]
+    fn test_notification_receiver_config_deserialization() {
+        let config_str = r#"
+            pubsub_project = "my-project"
+            pubsub_topic = "lore-events"
+            pubsub_receive = true
+            pubsub_subscription = "lore-events-replica-0"
+            pubsub_subscription_prefix = "lore"
+            pubsub_subscription_ttl_seconds = 172800
+            pubsub_message_retention_seconds = 1200
+        "#;
+
+        let config: toml::Value = toml::from_str(config_str).unwrap();
+        let plugin_config: GcpNotificationPluginConfig = config.try_into().unwrap();
+
+        assert!(plugin_config.pubsub_receive);
+        assert_eq!(
+            plugin_config.pubsub_subscription.as_deref(),
+            Some("lore-events-replica-0")
+        );
+        assert_eq!(plugin_config.pubsub_subscription_prefix, "lore");
+        assert_eq!(plugin_config.pubsub_subscription_ttl_seconds, 172_800);
+        assert_eq!(plugin_config.pubsub_message_retention_seconds, 1200);
     }
 
     /// `configure_notification` (`server.rs`) hands the plugin the whole
@@ -802,6 +1032,62 @@ mod tests {
         assert_eq!(plugin_config.slow_operation_threshold_millis, 2000);
         assert_eq!(plugin_config.timeout_millis, 30000);
         assert!(!plugin_config.force_write);
+    }
+
+    #[test]
+    fn test_lock_store_config_deserialization_with_defaults() {
+        let config: toml::Value = toml::from_str(r#"firestore_project = "my-project""#).unwrap();
+        let plugin_config: GcpLockStorePluginConfig = config.try_into().unwrap();
+
+        assert_eq!(plugin_config.firestore_project, "my-project");
+        assert!(plugin_config.firestore_database.is_none());
+        assert_eq!(plugin_config.firestore_lock_store_collection, "locks");
+        assert_eq!(plugin_config.slow_operation_threshold_millis, 2000);
+        assert_eq!(plugin_config.timeout_millis, 30000);
+    }
+
+    #[test]
+    fn test_lock_store_config_requires_firestore_project() {
+        let factory = GcpLockStorePluginFactory;
+        let err = factory
+            .validate_config(&toml::Value::Table(toml::map::Map::new()))
+            .expect_err("firestore_project must be configured");
+        assert_eq!(
+            err.as_plugin_config_error()
+                .expect("should be PluginConfigError")
+                .plugin_name,
+            PLUGIN_NAME
+        );
+    }
+
+    #[test]
+    fn test_lock_store_config_inherits_the_shared_firestore_settings() {
+        let plugins: std::collections::HashMap<String, toml::Value> = toml::from_str(
+            r#"
+            [gcp]
+            firestore_project = "my-gcp-project"
+            firestore_database = "my-db"
+
+            [gcp.mutable_store]
+            firestore_mutable_store_collection = "mutable_store"
+
+            [gcp.lock_store]
+            firestore_lock_store_collection = "file_locks"
+        "#,
+        )
+        .unwrap();
+
+        let resolved = crate::store::configuration::resolve_plugin_config_with_fallback(
+            &plugins,
+            PLUGIN_NAME,
+            "lock_store",
+        )
+        .expect("the lock store sub-table resolves");
+        let plugin_config: GcpLockStorePluginConfig = resolved.try_into().unwrap();
+
+        assert_eq!(plugin_config.firestore_project, "my-gcp-project");
+        assert_eq!(plugin_config.firestore_database.as_deref(), Some("my-db"));
+        assert_eq!(plugin_config.firestore_lock_store_collection, "file_locks");
     }
 
     #[test]

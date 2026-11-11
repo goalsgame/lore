@@ -19,10 +19,7 @@ use lore_storage::ImmutableStore;
 use lore_storage::MutableStore;
 use lore_telemetry::grpc_tower_layer::GrpcMetricsLayer;
 use lore_telemetry::user_agent_filter::UserAgentFilter;
-use tonic::transport::Certificate;
-use tonic::transport::Identity;
 use tonic::transport::Server;
-use tonic::transport::ServerTlsConfig;
 use tracing::info;
 
 use crate::auth::jwt::JwtVerifier;
@@ -34,8 +31,12 @@ use crate::grpc::forwarded_lock_service::LoreForwardedLockService;
 use crate::grpc::forwarded_repository::v1::service::LoreForwardedRepositoryV1Service;
 use crate::grpc::forwarded_revision::v1::service::LoreForwardedRevisionV1Service;
 use crate::grpc::replication_service::LoreReplicationService;
+use crate::grpc::server::bind_incoming;
+use crate::grpc::server::serve_with_tls;
 use crate::grpc::tower::tracing::LoreTracingLayer;
 use crate::hooks::HookDispatcher;
+use crate::tls::ReloadableCertificate;
+use crate::tls::grpc_server_tls_config;
 
 // Why Tower, why?
 // Just try to make this type alias match the 'router' type in GrpcServerBuilder.
@@ -138,17 +139,14 @@ impl GrpcInternalServerBuilder<WantsTlsConfig> {
         let tls_config = match (cert_path, key_path, cert_chain_path) {
             (Some(cert_path), Some(key_path), Some(cert_chain_path)) => {
                 info!("Loading TLS certs - cert: {cert_path:?} key: {key_path:?}");
-                let identity =
-                    Identity::from_pem(std::fs::read(cert_path)?, std::fs::read(key_path)?);
+                let certificate = ReloadableCertificate::load(vec![cert_path], key_path)?;
 
                 info!("Using CA cert: {cert_chain_path:?}");
-                let ca_cert = std::fs::read(cert_chain_path)?;
-
-                Some(
-                    ServerTlsConfig::new()
-                        .identity(identity)
-                        .client_ca_root(Certificate::from_pem(ca_cert)),
-                )
+                Some(grpc_server_tls_config(
+                    certificate,
+                    Some(&cert_chain_path),
+                    true,
+                )?)
             }
             (None, None, None) => None,
             (cert, key, chain) => {
@@ -187,7 +185,7 @@ pub struct WantsHttp2Config {
     environment: EnvironmentConfig,
     jwt_verifier: Option<JwtVerifier>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
-    tls_config: Option<ServerTlsConfig>,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl GrpcInternalServerBuilder<WantsHttp2Config> {
@@ -200,13 +198,11 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
     ) -> anyhow::Result<GrpcInternalServerBuilder<WantsAddress>> {
         let metrics_layer =
             tower::ServiceBuilder::new().layer(GrpcMetricsLayer::new(user_agent_filter));
-        let mut server = Server::builder()
+        let server = Server::builder()
             .http2_keepalive_interval(http2_keep_alive_interval)
             .http2_keepalive_timeout(http2_keep_alive_timeout);
 
-        if let Some(tls_config) = self.0.tls_config {
-            server = server.tls_config(tls_config)?;
-        }
+        let tls_config = self.0.tls_config;
         let tracing_levels = TraceLayerConfig::default();
         let mut router = server
             // Outermost, so everything inward runs on core: this stack is served
@@ -251,12 +247,16 @@ impl GrpcInternalServerBuilder<WantsHttp2Config> {
             ));
         }
 
-        Ok(GrpcInternalServerBuilder(WantsAddress { router }))
+        Ok(GrpcInternalServerBuilder(WantsAddress {
+            router,
+            tls_config,
+        }))
     }
 }
 
 pub struct WantsAddress {
     router: GrpcRouter,
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl GrpcInternalServerBuilder<WantsAddress> {
@@ -266,8 +266,12 @@ impl GrpcInternalServerBuilder<WantsAddress> {
         addr: SocketAddr,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
-        lore_spawn_net!(async move { self.0.router.serve_with_shutdown(addr, signal).await })
-            .await??;
+        let WantsAddress { router, tls_config } = self.0;
+        lore_spawn_net!(async move {
+            let incoming = bind_incoming(addr)?;
+            serve_with_tls!(router, incoming, tls_config, signal).map_err(anyhow::Error::from)
+        })
+        .await??;
         Ok(())
     }
 
@@ -278,16 +282,12 @@ impl GrpcInternalServerBuilder<WantsAddress> {
         listener: std::net::TcpListener,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> anyhow::Result<()> {
+        let WantsAddress { router, tls_config } = self.0;
         lore_spawn_net!(async move {
             listener.set_nonblocking(true)?;
             let listener = tokio::net::TcpListener::from_std(listener)?;
-            self.0
-                .router
-                .serve_with_incoming_shutdown(
-                    tokio_stream::wrappers::TcpListenerStream::new(listener),
-                    signal,
-                )
-                .await?;
+            let incoming = tokio_stream::wrappers::TcpListenerStream::new(listener);
+            serve_with_tls!(router, incoming, tls_config, signal)?;
             Ok::<(), anyhow::Error>(())
         })
         .await??;

@@ -378,6 +378,18 @@ async fn drain_then_close(
     let _ = shutdown_tx.send(true);
 }
 
+/// Reloads every TLS certificate the server presents from disk on each SIGHUP.
+///
+/// Installing the handler also stops SIGHUP from terminating the process.
+#[cfg(unix)]
+async fn reload_certificates_on_hangup(mut hangup: tokio::signal::unix::Signal) -> Result<()> {
+    while hangup.recv().await.is_some() {
+        info!("Received SIGHUP, reloading TLS certificates");
+        crate::tls::reload_certificates();
+    }
+    Ok(())
+}
+
 impl From<QuicSettings> for QuinnConfigBuilder {
     fn from(settings: QuicSettings) -> Self {
         let mut builder = QuinnConfigBuilder::default().num_listeners(settings.num_listeners);
@@ -1725,6 +1737,7 @@ async fn configure_notification(
     plugins: &HashMap<String, toml::Value>,
     repository_authorizer: Arc<dyn RepositoryAuthorizer>,
     authorization_timeout: Duration,
+    shutdown: tokio::sync::watch::Receiver<bool>,
 ) -> Result<(Arc<dyn NotificationSender>, Option<NotificationService>)> {
     let mode = notification_settings
         .as_ref()
@@ -1753,6 +1766,8 @@ async fn configure_notification(
             let context = NotificationPluginContext {
                 environment: environment.clone(),
                 immutable_store: immutable_store.cloned(),
+                local: Some(local.clone()),
+                shutdown: Some(shutdown),
             };
 
             let output = registry
@@ -2227,6 +2242,11 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
 
     let draining = Arc::new(AtomicBool::new(false));
     let drain = Duration::from_secs(settings.server.drain_seconds.into());
+    #[cfg(unix)]
+    {
+        let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
+        lore_spawn!(reload_certificates_on_hangup(hangup));
+    }
 
     // Spawn signal listener outside the endpoint JoinSet so the drain
     // timeout only starts after the signal fires.
@@ -2261,6 +2281,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             &settings.plugins,
             repository_authorizer.clone(),
             notification_authorization_timeout,
+            shutdown_tx.subscribe(),
         )
         .await?;
 

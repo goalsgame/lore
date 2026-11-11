@@ -7,15 +7,13 @@
 # - GCS bucket for immutable fragment payloads (with object versioning
 #   enabled, so obliterate can remove every generation of an object)
 # - Firestore database (native mode) for fragment lifecycle state,
-#   fragment reference associations, and the mutable store
-# - The two composite indexes documented in lore-gcp/firestore.indexes.json
+#   fragment reference associations, the mutable store and the lock store
+# - The composite indexes documented in lore-gcp/firestore.indexes.json
 #
 # Credentials: both GCS and Firestore use Application Default Credentials
 # (`gcloud auth application-default login`, a service account key via
 # GOOGLE_APPLICATION_CREDENTIALS, or workload identity) -- there is no
 # credential setting in this file.
-#
-# There is no GCP-backed lock store: lock_store.mode stays "local".
 #
 # GCP-specific settings are in the [plugins.gcp] section.
 
@@ -25,8 +23,10 @@ mode = "gcp"
 [mutable_store]
 mode = "gcp"
 
+# Locks live in Firestore, so every server sharing the collection sees the same
+# locks. "local" keeps them in one server's memory instead.
 [lock_store]
-mode = "local"
+mode = "gcp"
 
 # Publishes branch and lock events to Pub/Sub as the encoded
 # lore.notification.Event protobuf, the same message the in-process sender
@@ -51,9 +51,23 @@ mode = "local"
 # the gRPC Subscribe RPC works alongside the topic rather than being replaced
 # by it.
 #
-# What this does not cover: the sender contributes no receiver, so obliterate
-# propagation between server instances does not happen. That is correct for a
-# single instance and not for any other.
+# Several server instances: set pubsub_receive = true, and each instance also
+# delivers the events every other instance publishes to its own Subscribe
+# clients. Each message carries an origin attribute naming the instance that
+# published it, so an instance skips its own. Each instance reads through a
+# subscription of its own: by default it creates
+# {pubsub_subscription_prefix}-{origin} at startup, with an expiration policy
+# and a short message retention, and deletes it at shutdown. That needs
+# pubsub.topics.attachSubscription on the topic (in roles/pubsub.subscriber)
+# and pubsub.subscriptions.create, .consume and .delete in pubsub_project
+# (roles/pubsub.editor, or a custom role). Failing to delete is
+# logged and ignored; the expiration policy removes the subscription once it
+# has gone unused for pubsub_subscription_ttl_seconds. Alternatively, set
+# pubsub_subscription to a subscription created for this instance alone:
+# Pub/Sub hands each message to one reader of a subscription, so instances
+# sharing one would each miss the others' events.
+#
+# What this does not cover: obliterate propagation between server instances.
 #[notification]
 #mode = "gcp"
 #
@@ -65,13 +79,18 @@ mode = "local"
 #   firestore_project = "..."
 #   pubsub_project = "my-project"
 #   pubsub_topic = "lore-events"
+#   pubsub_receive = false                       # default
+#   pubsub_subscription = "lore-events-a"        # default unset: one is created
+#   pubsub_subscription_prefix = "lore-server"   # default
+#   pubsub_subscription_ttl_seconds = 86400      # default; Pub/Sub's minimum
+#   pubsub_message_retention_seconds = 600       # default; Pub/Sub's minimum
 
 # ---------------------------------------------------------------------
 # GCP Plugin Configuration
 # ---------------------------------------------------------------------
-# Firestore project/database are shared by both stores below and are
-# inherited by [plugins.gcp.immutable_store] / [plugins.gcp.mutable_store]
-# unless overridden there (the same [plugins.aws.http]-style inheritance
+# Firestore project/database are shared by the stores below and are
+# inherited by [plugins.gcp.immutable_store], [plugins.gcp.mutable_store] and
+# [plugins.gcp.lock_store] unless overridden there (the same [plugins.aws.http]-style inheritance
 # config-aws.toml relies on for settings shared across its stores).
 [plugins.gcp]
 firestore_project = "my-gcp-project"
@@ -97,3 +116,9 @@ firestore_fragment_associations_collection = "fragment_associations"
 firestore_mutable_store_collection = "mutable_store"
 slow_operation_threshold_millis = 2000
 timeout_millis = 15000
+
+# Lock store settings (Firestore)
+[plugins.gcp.lock_store]
+firestore_lock_store_collection = "locks"
+slow_operation_threshold_millis = 2000
+timeout_millis = 30000

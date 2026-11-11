@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::path::Path;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
 use std::time::SystemTime;
@@ -15,8 +16,11 @@ use rustls_pki_types::CertificateDer;
 use rustls_pki_types::pem::PemObject;
 use tokio::time::MissedTickBehavior;
 use tracing::debug;
+use tracing::info;
 use tracing::warn;
 use x509_parser::prelude::*;
+
+use crate::tls::ReloadableCertificate;
 
 /// Information extracted from a TLS certificate for metrics reporting.
 #[derive(Debug, Clone)]
@@ -82,8 +86,14 @@ pub fn parse_certificate_info(cert_path: &Path) -> Option<CertificateInfo> {
     };
 
     // The first certificate should be the leaf cert, so that's what we care about.
-    let cert_der = certs.first()?;
+    parse_certificate_der(cert_path, certs.first()?)
+}
 
+/// Extract metadata for metrics reporting from a DER certificate, labelled with `cert_path`.
+pub fn parse_certificate_der(
+    cert_path: &Path,
+    cert_der: &CertificateDer<'_>,
+) -> Option<CertificateInfo> {
     let (_, cert) = match X509Certificate::from_der(cert_der.as_ref()) {
         Ok(parsed) => parsed,
         Err(e) => {
@@ -126,14 +136,8 @@ fn record_certificate_expiry(expiry_timestamp: i64, labels: &[KeyValue]) {
 /// Spawns a background task that records the time remaining (in seconds) until the certificate
 /// expires. The metric can go negative if the certificate has already expired.
 pub fn start_certificate_metrics(cert_info: CertificateInfo, interval: Duration) {
-    // Pre-compute labels once since certificate info never changes
-    let labels = [
-        KeyValue::new("cert_path", cert_info.cert_path.display().to_string()),
-        KeyValue::new("subject", cert_info.subject),
-        KeyValue::new("serial", cert_info.serial),
-        KeyValue::new("expiry_timestamp", cert_info.expiry_timestamp),
-    ];
     let expiry_timestamp = cert_info.expiry_timestamp;
+    let labels = certificate_labels(cert_info);
 
     // Record immediately on startup
     record_certificate_expiry(expiry_timestamp, &labels);
@@ -145,6 +149,57 @@ pub fn start_certificate_metrics(cert_info: CertificateInfo, interval: Duration)
         loop {
             ticker.tick().await;
             record_certificate_expiry(expiry_timestamp, &labels);
+        }
+    });
+}
+
+fn certificate_labels(cert_info: CertificateInfo) -> [KeyValue; 4] {
+    [
+        KeyValue::new("cert_path", cert_info.cert_path.display().to_string()),
+        KeyValue::new("subject", cert_info.subject),
+        KeyValue::new("serial", cert_info.serial),
+        KeyValue::new("expiry_timestamp", cert_info.expiry_timestamp),
+    ]
+}
+
+/// Start periodic expiry reporting for the leaf of the certificate `certificate` presents now,
+/// labelled with `cert_path`, so that a reloaded certificate is reported from the next tick.
+pub fn start_served_certificate_metrics(
+    certificate: Arc<ReloadableCertificate>,
+    cert_path: PathBuf,
+    interval: Duration,
+) {
+    let certificate = Arc::downgrade(&certificate);
+    let certificate_in_use = certificate.clone();
+    let served = move || {
+        let current = certificate.upgrade()?.current();
+        parse_certificate_der(&cert_path, current.end_entity_cert().ok()?)
+    };
+    if let Some(cert_info) = served() {
+        info!(
+            cert_path = %cert_info.cert_path.display(),
+            subject = %cert_info.subject,
+            serial = %cert_info.serial,
+            expiry_timestamp = cert_info.expiry_timestamp,
+            "Parsed certificate for expiry metrics"
+        );
+    } else {
+        warn!("Could not parse the served certificate for expiry metrics");
+    }
+
+    lore_spawn!(async move {
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
+
+        loop {
+            ticker.tick().await;
+            if certificate_in_use.strong_count() == 0 {
+                break;
+            }
+            if let Some(cert_info) = served() {
+                let expiry_timestamp = cert_info.expiry_timestamp;
+                record_certificate_expiry(expiry_timestamp, &certificate_labels(cert_info));
+            }
         }
     });
 }
