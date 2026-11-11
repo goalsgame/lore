@@ -169,8 +169,10 @@ pub fn start_served_certificate_metrics(
     cert_path: PathBuf,
     interval: Duration,
 ) {
+    let certificate = Arc::downgrade(&certificate);
+    let certificate_in_use = certificate.clone();
     let served = move || {
-        let current = certificate.current();
+        let current = certificate.upgrade()?.current();
         parse_certificate_der(&cert_path, current.end_entity_cert().ok()?)
     };
     if let Some(cert_info) = served() {
@@ -191,6 +193,9 @@ pub fn start_served_certificate_metrics(
 
         loop {
             ticker.tick().await;
+            if certificate_in_use.strong_count() == 0 {
+                break;
+            }
             if let Some(cert_info) = served() {
                 let expiry_timestamp = cert_info.expiry_timestamp;
                 record_certificate_expiry(expiry_timestamp, &certificate_labels(cert_info));
