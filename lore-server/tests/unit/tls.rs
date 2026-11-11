@@ -325,3 +325,121 @@ async fn dropping_the_tls_incoming_releases_unfinished_handshakes() {
         .expect("the unfinished handshake is abandoned");
     assert!(matches!(read, Ok(0) | Err(_)), "got {read:?}");
 }
+
+#[test]
+fn a_malformed_chain_certificate_is_refused() {
+    let files = CertificateFiles::new();
+    let served = files.renew();
+    let chain = files.cert.with_file_name("chain.pem");
+    let issuer = lore_transport::tls::generate_self_signed(vec!["issuer".into()]).unwrap();
+    std::fs::write(&chain, &issuer.cert_pem).unwrap();
+    let certificate =
+        ReloadableCertificate::load(vec![files.cert.clone(), chain.clone()], files.key.clone())
+            .unwrap();
+
+    std::fs::write(
+        &chain,
+        "-----BEGIN CERTIFICATE-----\nAAECAwQF\n-----END CERTIFICATE-----\n",
+    )
+    .unwrap();
+    assert!(
+        certificate.reload().is_err(),
+        "a malformed certificate is refused"
+    );
+    assert_eq!(leaf(&certificate), served);
+    assert_eq!(certificate.current().cert.len(), 2);
+}
+
+/// Which client certificate a test client presents.
+#[derive(Clone, Copy, Debug)]
+enum ClientIdentity {
+    None,
+    Trusted,
+    Untrusted,
+}
+
+fn client_config(identity: ClientIdentity) -> rustls::ClientConfig {
+    let builder = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(SkipServerVerification::new());
+    let data = lore_server::quic::tests::test_data_path();
+    let mut config = match identity {
+        ClientIdentity::None => builder.with_no_client_auth(),
+        ClientIdentity::Trusted | ClientIdentity::Untrusted => {
+            let (cert, key) = match identity {
+                ClientIdentity::Trusted => ("test_client_cert.pem", "test_client_key.pem"),
+                _ => ("untrusted_cert.pem", "untrusted_key.pem"),
+            };
+            builder
+                .with_client_auth_cert(
+                    lore_transport::tls::load_certs(data.join(cert)).unwrap(),
+                    lore_transport::tls::load_private_key(data.join(key)).unwrap(),
+                )
+                .unwrap()
+        }
+    };
+    config.alpn_protocols = vec![b"h2".to_vec()];
+    config
+}
+
+/// Whether a listener with the given client-certificate policy completes a handshake with a
+/// client presenting `identity`.
+async fn handshake_accepted(
+    certificate: Arc<ReloadableCertificate>,
+    client_auth_required: bool,
+    identity: ClientIdentity,
+) -> bool {
+    use tokio_stream::StreamExt as _;
+
+    let ca = lore_server::quic::tests::test_data_path().join("test_ca.pem");
+    let config =
+        lore_server::tls::grpc_server_tls_config(certificate, Some(&ca), client_auth_required)
+            .unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let mut incoming = std::pin::pin!(lore_server::tls::tls_incoming(
+        tokio_stream::wrappers::TcpListenerStream::new(listener),
+        config,
+    ));
+
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(identity)));
+    let tcp = tokio::net::TcpStream::connect(address).await.unwrap();
+    let _client = connector
+        .connect(ServerName::try_from("localhost").unwrap(), tcp)
+        .await;
+    matches!(
+        tokio::time::timeout(Duration::from_secs(1), incoming.next()).await,
+        Ok(Some(Ok(_)))
+    )
+}
+
+/// Client-certificate policy is enforced by the listener, before and after a reload of the
+/// server certificate: required authentication accepts only trusted certificates, optional
+/// authentication also accepts none, and neither accepts an untrusted one.
+#[tokio::test]
+async fn client_certificate_policy_holds_across_a_reload() {
+    let files = CertificateFiles::new();
+    files.renew();
+    let certificate = files.load();
+
+    for reloaded in [false, true] {
+        if reloaded {
+            files.renew();
+            certificate.reload().unwrap();
+        }
+        for (required, identity, expected) in [
+            (true, ClientIdentity::Trusted, true),
+            (true, ClientIdentity::None, false),
+            (true, ClientIdentity::Untrusted, false),
+            (false, ClientIdentity::Trusted, true),
+            (false, ClientIdentity::None, true),
+            (false, ClientIdentity::Untrusted, false),
+        ] {
+            assert_eq!(
+                handshake_accepted(certificate.clone(), required, identity).await,
+                expected,
+                "required={required} identity={identity:?} reloaded={reloaded}"
+            );
+        }
+    }
+}
