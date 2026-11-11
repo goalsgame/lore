@@ -185,6 +185,16 @@ impl SendBuffer {
         self.offset
     }
 
+    /// Bytes written by the application and not yet acknowledged, sent or not
+    ///
+    /// Excludes acknowledged ranges still held behind an unacknowledged one.
+    ///
+    /// LORE: not upstream. Re-apply with `ConnectionStats::unacked_stream_bytes` when re-vendoring.
+    pub(super) fn unacked_bytes(&self) -> u64 {
+        let held_acked: u64 = self.acks.iter().map(|range| range.end - range.start).sum();
+        (self.unacked_len as u64).saturating_sub(held_acked)
+    }
+
     /// Whether all sent data has been acknowledged
     pub(super) fn is_fully_acked(&self) -> bool {
         self.unacked_len == 0
@@ -395,6 +405,25 @@ mod tests {
         buf.ack(0..16);
         assert_eq!(aggregate_unacked(&buf), &MSG[23..]);
         assert!(buf.acks.is_empty());
+    }
+
+    // LORE: not upstream. Re-apply with `ConnectionStats::unacked_stream_bytes` when re-vendoring.
+    #[test]
+    fn unacked_bytes_excludes_acks_behind_a_gap() {
+        let mut buf = SendBuffer::new();
+        const MSG: &[u8] = b"Hello, world with extra data!";
+        buf.write(MSG.into());
+        assert_eq!(buf.unacked_bytes(), MSG.len() as u64);
+        assert_eq!(buf.poll_transmit(16), (0..16, false));
+        assert_eq!(buf.poll_transmit(16), (16..23, true));
+        buf.ack(16..23);
+        assert_eq!(buf.unacked_bytes(), (MSG.len() - 7) as u64);
+        buf.ack(0..8);
+        assert_eq!(buf.unacked_bytes(), (MSG.len() - 15) as u64);
+        buf.ack(8..16);
+        assert_eq!(buf.unacked_bytes(), (MSG.len() - 23) as u64);
+        buf.ack(23..MSG.len() as u64);
+        assert_eq!(buf.unacked_bytes(), 0);
     }
 
     fn aggregate_unacked(buf: &SendBuffer) -> Vec<u8> {

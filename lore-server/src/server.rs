@@ -9,12 +9,15 @@
 #[cfg(feature = "seeding")]
 use std::any::Any;
 use std::collections::HashMap;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::sync::Weak;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -297,39 +300,82 @@ async fn wait_for_shutdown(
     }
 }
 
-async fn listen_for_termination(shutdown_tx: tokio::sync::watch::Sender<bool>) -> Result<()> {
+/// Waits for SIGINT or SIGTERM (CTRL-C on Windows) and logs which arrived.
+struct TerminationSignals {
     #[cfg(unix)]
-    let (mut ctrl_c, mut sigterm) = {
-        use tokio::signal::unix::SignalKind;
-        use tokio::signal::unix::signal;
-        (
-            signal(SignalKind::interrupt())?,
-            signal(SignalKind::terminate())?,
-        )
-    };
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
 
-    #[cfg(unix)]
-    tokio::select! {
-        _ = ctrl_c.recv() => {
-            info!("Received SIGINT. Initiating graceful shutdown");
-        },
-        _ = sigterm.recv() => {
-            info!("Received SIGTERM. Initiating graceful shutdown");
+impl TerminationSignals {
+    fn new() -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::SignalKind;
+            use tokio::signal::unix::signal;
+            Ok(Self {
+                interrupt: signal(SignalKind::interrupt())?,
+                terminate: signal(SignalKind::terminate())?,
+            })
         }
+        #[cfg(windows)]
+        Ok(Self {})
     }
 
-    #[cfg(windows)]
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            info!("Received CTRL-C. Initiating graceful shutdown");
+    async fn recv(&mut self) {
+        #[cfg(unix)]
+        tokio::select! {
+            _ = self.interrupt.recv() => info!("Received SIGINT"),
+            _ = self.terminate.recv() => info!("Received SIGTERM"),
         }
-        Err(err) => {
-            eprintln!("Unable to listen for shutdown signal: {err}");
+
+        #[cfg(windows)]
+        match tokio::signal::ctrl_c().await {
+            Ok(()) => info!("Received CTRL-C"),
+            Err(err) => {
+                eprintln!("Unable to listen for shutdown signal: {err}");
+                std::future::pending::<()>().await;
+            }
         }
     }
+}
 
-    let _ = shutdown_tx.send(true);
+async fn listen_for_termination(
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+    draining: Arc<AtomicBool>,
+    drain: Duration,
+) -> Result<()> {
+    let mut signals = TerminationSignals::new()?;
+    signals.recv().await;
+    drain_then_close(&shutdown_tx, &draining, drain, signals.recv()).await;
     Ok(())
+}
+
+/// Marks the server as draining, waits out `drain` (or until `cut_short` completes), then signals
+/// the endpoints to stop accepting connections.
+///
+/// While draining, `/health_check` answers 503 and every endpoint keeps serving, which gives a
+/// load balancer time to stop routing new connections here before they are refused.
+#[lore_macro::test_pub]
+async fn drain_then_close(
+    shutdown_tx: &tokio::sync::watch::Sender<bool>,
+    draining: &AtomicBool,
+    drain: Duration,
+    cut_short: impl Future<Output = ()>,
+) {
+    draining.store(true, Ordering::Relaxed);
+    if !drain.is_zero() {
+        info!("Draining for {drain:?} before closing endpoints; /health_check answers 503");
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        tokio::select! {
+            () = tokio::time::sleep(drain) => {}
+            () = cut_short => info!("Second shutdown signal, ending drain early"),
+            _ = shutdown_rx.wait_for(|&v| v) => {}
+        }
+    }
+    info!("Initiating graceful shutdown");
+    let _ = shutdown_tx.send(true);
 }
 
 /// Reloads every TLS certificate the server presents from disk on each SIGHUP.
@@ -384,6 +430,11 @@ fn connection_inflight_limit(settings: &QuicSettings, process_limit: usize) -> u
     })
 }
 
+/// Left of the connection close timeout for a QUIC endpoint's `CONNECTION_CLOSE` frames to reach
+/// its peers before the endpoint task is aborted.
+const QUIC_CLOSE_MARGIN: Duration = Duration::from_millis(500);
+
+#[allow(clippy::too_many_arguments)]
 async fn launch_quinn_server(
     name: &'static str,
     stream_handler_factory: Box<dyn StreamHandlerFactory>,
@@ -391,6 +442,7 @@ async fn launch_quinn_server(
     quic_settings: QuicSettings,
     congestion_algorithm: CongestionAlgorithm,
     generate_ephemeral_cert: bool,
+    connection_close_timeout: Duration,
     mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> Result<()> {
     let span = info_span!("QUIC server", name);
@@ -432,12 +484,11 @@ async fn launch_quinn_server(
         info!(address = %addr, "server starting");
         let server = QuinnServer::start(settings_builder.build()?)?;
 
-        // Wait for the shutdown signal, then close the endpoint gracefully.
-        // close() sends CONNECTION_CLOSE frames to all peers and causes
-        // accept() loops to return None.
         let _ = shutdown_rx.wait_for(|&v| v).await;
-        info!("closing endpoint");
-        server.close().await;
+        info!("draining endpoint");
+        server
+            .shutdown(connection_close_timeout.saturating_sub(QUIC_CLOSE_MARGIN))
+            .await;
 
         Ok(())
     }
@@ -697,6 +748,7 @@ fn build_lore_http_settings(
         available_interval_seconds: http_settings.available_interval_seconds,
         available_timeout_seconds: http_settings.available_timeout_seconds,
         store_health_check: http_settings.store_health_check,
+        draining: Arc::default(),
         presign: PresignSettings {
             hmac_key: http_settings.presigned_url_hmac_key.clone(),
             min_ttl_seconds: http_settings.presigned_url_min_ttl_seconds,
@@ -2188,6 +2240,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     let (shutdown_tx, _shutdown_rx) = tokio::sync::watch::channel(false);
     let mut endpoints = JoinSet::new();
 
+    let draining = Arc::new(AtomicBool::new(false));
+    let drain = Duration::from_secs(settings.server.drain_seconds.into());
     #[cfg(unix)]
     {
         let hangup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())?;
@@ -2198,7 +2252,8 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
     // timeout only starts after the signal fires.
     lore_spawn!({
         let shutdown_tx = shutdown_tx.clone();
-        listen_for_termination(shutdown_tx)
+        let draining = draining.clone();
+        listen_for_termination(shutdown_tx, draining, drain)
     });
 
     if !is_maintenance {
@@ -2274,7 +2329,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 repository_catalog,
                 settings,
                 notification,
-                notification_service,
+                notification_service.map(|service| service.closing_on(shutdown_rx.clone())),
                 hook_dispatcher.clone(),
                 user_agent_filter,
                 forwarded_requests,
@@ -2410,6 +2465,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 // User-facing endpoint: generate an ephemeral certificate when
                 // none is configured so the server runs with zero config.
                 true,
+                connection_close_timeout,
                 shutdown_rx,
             )
         });
@@ -2486,6 +2542,7 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
                 // and stall the next large get or put.
                 CongestionAlgorithm::Cubic,
                 generate_ephemeral_cert,
+                connection_close_timeout,
                 shutdown_rx,
             )
         });
@@ -2495,8 +2552,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
         if let Some(http_settings) = settings.server.http.as_ref()
             && http_settings.enabled
         {
-            let lore_http_settings =
+            let mut lore_http_settings =
                 build_lore_http_settings(http_settings, user_agent_filter.clone());
+            lore_http_settings.draining = draining.clone();
             let immutable_store = immutable_store.clone();
             let mutable_store = mutable_store.clone();
             let shutdown_rx = _shutdown_rx.clone();
@@ -2520,8 +2578,9 @@ async fn async_main(settings: (Settings, StringHash), config: ServerConfig) -> R
             let host = http_settings.host.clone();
             let port = http_settings.port;
             let user_agent_filter = user_agent_filter.clone();
+            let draining = draining.clone();
             let shutdown_rx = _shutdown_rx.clone();
-            LoreHttpServer::serve_maintenance(host, port, user_agent_filter, async move {
+            LoreHttpServer::serve_maintenance(host, port, user_agent_filter, draining, async move {
                 let _ = shutdown_rx.clone().wait_for(|&v| v).await;
             })
         });

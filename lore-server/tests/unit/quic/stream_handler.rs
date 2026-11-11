@@ -4,6 +4,8 @@ use std::net::SocketAddr;
 use std::net::UdpSocket;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -124,6 +126,16 @@ async fn serve_and_connect(
     factory: Box<dyn StreamHandlerFactory>,
     protocol: &'static str,
 ) -> Harness {
+    serve_and_connect_through(factory, protocol, None).await
+}
+
+/// As [`serve_and_connect`], with the client connected through a [`relay`] when `blackout` is
+/// given.
+async fn serve_and_connect_through(
+    factory: Box<dyn StreamHandlerFactory>,
+    protocol: &'static str,
+    blackout: Option<Arc<AtomicBool>>,
+) -> Harness {
     let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
     let server_addr = socket.local_addr().expect("Failed socket setup");
     drop(socket);
@@ -154,8 +166,12 @@ async fn serve_and_connect(
     let mut endpoint = Endpoint::client(client_addr).expect("Failed to create client endpoint");
     endpoint.set_default_client_config(client_config);
 
+    let connect_addr = match blackout {
+        Some(blackout) => relay(server_addr, blackout).await,
+        None => server_addr,
+    };
     let connection = endpoint
-        .connect(server_addr, "localhost")
+        .connect(connect_addr, "localhost")
         .unwrap()
         .await
         .unwrap();
@@ -171,6 +187,46 @@ async fn serve_and_connect(
         _server: server,
         _endpoint: endpoint,
     }
+}
+
+/// Forward datagrams between one client and `server`, dropping every datagram to the client
+/// while `blackout` is set. Returns the address the client connects to.
+async fn relay(server: SocketAddr, blackout: Arc<AtomicBool>) -> SocketAddr {
+    let client_side = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind relay");
+    let server_side = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("Failed to bind relay");
+    server_side
+        .connect(server)
+        .await
+        .expect("Failed to connect relay");
+    let address = client_side.local_addr().expect("Failed relay setup");
+
+    lore_spawn!(async move {
+        let mut client = None;
+        let mut from_client = vec![0u8; u16::MAX as usize];
+        let mut from_server = vec![0u8; u16::MAX as usize];
+        loop {
+            tokio::select! {
+                received = client_side.recv_from(&mut from_client) => {
+                    let Ok((len, peer)) = received else { return };
+                    client = Some(peer);
+                    let _ = server_side.send(&from_client[..len]).await;
+                }
+                received = server_side.recv(&mut from_server) => {
+                    let Ok(len) = received else { return };
+                    if let Some(peer) = client
+                        && !blackout.load(Ordering::Relaxed)
+                    {
+                        let _ = client_side.send_to(&from_server[..len], peer).await;
+                    }
+                }
+            }
+        }
+    });
+    address
 }
 
 const MOCK_PROTOCOL: &str = "mock-test/0.1";
@@ -197,7 +253,13 @@ enum MockBehaviour {
     Echo,
     /// Answer with more bytes than [`MOCK_MAX_CHUNK`] allows.
     Oversized,
+    /// Answer after [`SLOW_HANDLER_SLEEP`].
+    Slow,
 }
+
+/// How long [`MockBehaviour::Slow`] takes to answer: long enough to still be in flight when a
+/// test starts shutting the server down.
+const SLOW_HANDLER_SLEEP: Duration = Duration::from_secs(1);
 
 impl MockBehaviour {
     fn opcode(self) -> QuicOpCode {
@@ -205,6 +267,7 @@ impl MockBehaviour {
             MockBehaviour::Block => 1,
             MockBehaviour::Echo => 2,
             MockBehaviour::Oversized => 3,
+            MockBehaviour::Slow => 4,
         }
     }
 
@@ -213,6 +276,7 @@ impl MockBehaviour {
             MockBehaviour::Block,
             MockBehaviour::Echo,
             MockBehaviour::Oversized,
+            MockBehaviour::Slow,
         ]
         .into_iter()
         .find(|behaviour| behaviour.opcode() == opcode)
@@ -251,6 +315,10 @@ impl QuicService for MockService {
             }
             MockBehaviour::Echo => Ok(vec![Bytes::new()]),
             MockBehaviour::Oversized => Ok(vec![Bytes::from(vec![0xAB; MOCK_MAX_CHUNK + 1])]),
+            MockBehaviour::Slow => {
+                tokio::time::sleep(SLOW_HANDLER_SLEEP).await;
+                Ok(vec![Bytes::new()])
+            }
         }
     }
 
@@ -1532,6 +1600,180 @@ async fn test_v4_authorize_put_get_query_stop() {
         assert!(!resp.error, "Authorize stop session 2 failed: {resp:?}");
 
         send.finish().expect("Failed to finish stream");
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// Shutting down answers the requests a connection has already read, then closes it with the
+/// graceful application code, and refuses new connections meanwhile. No stream of the connection
+/// ends before the last answer is delivered, since a client reconnects on an ended stream.
+/// It does not wait for the timeout when every connection drains before it.
+#[tokio::test]
+async fn shutdown_answers_requests_in_flight_then_closes_connections() {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(30);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut harness = serve_and_connect(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+        )
+        .await;
+        let (mut idle_send, mut idle_recv) = harness.open_stream().await;
+        request(&mut idle_send, MockBehaviour::Echo, 1).await;
+        assert_eq!(response(&mut idle_recv).await.command_id, 1);
+
+        request(&mut harness.send, MockBehaviour::Slow, 2).await;
+        tokio::time::sleep(SLOW_HANDLER_SLEEP / 5).await;
+
+        let started = Instant::now();
+        let connection = harness.connection.clone();
+        let server_address = connection.remote_address();
+        let mut recv = harness.recv;
+        let endpoint = harness._endpoint.clone();
+        let (answered, idle_finished, (), closed, refused) = tokio::join!(
+            // The answer is polled first, so one arriving with the close is timed before it.
+            biased;
+            async move { (response(&mut recv).await, Instant::now()) },
+            async move {
+                let end = idle_recv.read_chunk(usize::MAX, false).await;
+                assert!(
+                    matches!(end, Err(ReadError::ConnectionLost(_))),
+                    "the idle stream ends with the connection: {end:?}"
+                );
+                Instant::now()
+            },
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+            connection.closed(),
+            async move {
+                tokio::time::sleep(SLOW_HANDLER_SLEEP / 20).await;
+                tokio::time::timeout(
+                    SLOW_HANDLER_SLEEP / 2,
+                    endpoint.connect(server_address, "localhost").unwrap(),
+                )
+                .await
+            },
+        );
+
+        assert!(
+            !matches!(refused, Ok(Ok(_))),
+            "a draining server accepts no new connection"
+        );
+        let (answered, answered_at) = answered;
+        assert!(
+            idle_finished >= answered_at,
+            "an idle stream was finished before the last answer"
+        );
+        assert_eq!(answered.command_id, 2);
+        assert!(
+            !answered.error,
+            "the request in flight is answered: {answered:?}"
+        );
+        match closed {
+            ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, quinn::VarInt::from_u32(0));
+            }
+            other => panic!("expected a graceful application close, got {other:?}"),
+        }
+        assert!(
+            started.elapsed() < SHUTDOWN_TIMEOUT / 2,
+            "shutdown waited for its timeout although the connection drained"
+        );
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// A draining connection is not closed while an answer is unacknowledged, even when consecutive
+/// losses have backed its retransmission timeout off far beyond a round trip.
+#[tokio::test]
+async fn shutdown_delivers_an_answer_through_consecutive_losses() {
+    const BLACKOUT: Duration = Duration::from_secs(4);
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(25);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let blackout = Arc::new(AtomicBool::new(false));
+        let mut harness = serve_and_connect_through(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+            Some(blackout.clone()),
+        )
+        .await;
+        request(&mut harness.send, MockBehaviour::Slow, 1).await;
+        tokio::time::sleep(SLOW_HANDLER_SLEEP / 5).await;
+        blackout.store(true, Ordering::Relaxed);
+
+        let connection = harness.connection.clone();
+        let mut recv = harness.recv;
+        let (answered, (), (), closed) = tokio::join!(
+            tokio::time::timeout(BLACKOUT * 4, response(&mut recv)),
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+            async {
+                tokio::time::sleep(BLACKOUT).await;
+                blackout.store(false, Ordering::Relaxed);
+            },
+            connection.closed(),
+        );
+
+        let answered = answered.expect("the answer arrives once datagrams flow again");
+        assert_eq!(answered.command_id, 1);
+        assert!(!answered.error, "got {answered:?}");
+        match closed {
+            ConnectionError::ApplicationClosed(close) => {
+                assert_eq!(close.error_code, quinn::VarInt::from_u32(0));
+            }
+            other => panic!("expected a graceful application close, got {other:?}"),
+        }
+    }))
+    .await
+    .expect("Test task failed");
+}
+
+/// A connection still busy when the timeout elapses is closed regardless.
+#[tokio::test]
+async fn shutdown_closes_busy_connections_at_the_timeout() {
+    const SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(200);
+
+    let (_immutable_store, _mutable_store, execution) =
+        test_store_create().await.expect("Failed to create store");
+    lore_spawn!(LORE_CONTEXT.scope(execution.clone(), async move {
+        let mut harness = serve_and_connect(
+            Box::new(SingleServiceFactory::new(
+                MOCK_PROTOCOL,
+                || MockService,
+                test_limits(),
+            )),
+            MOCK_PROTOCOL,
+        )
+        .await;
+        request(&mut harness.send, MockBehaviour::Block, 1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            harness._server.shutdown(SHUTDOWN_TIMEOUT),
+        )
+        .await
+        .expect("shutdown is bounded by its timeout");
+        let closed = tokio::time::timeout(Duration::from_secs(5), harness.connection.closed())
+            .await
+            .expect("the busy connection is closed");
+        assert!(
+            matches!(closed, ConnectionError::ApplicationClosed(_)),
+            "got {closed:?}"
+        );
     }))
     .await
     .expect("Test task failed");

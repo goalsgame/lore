@@ -24,6 +24,7 @@ use quinn::WriteError;
 use tokio::sync::Mutex;
 use tokio::sync::OwnedSemaphorePermit;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use tracing::Instrument;
 use tracing::debug;
 use tracing::error;
@@ -502,7 +503,8 @@ where
     async fn handle_stream(
         &self,
         recv: &mut RecvStream,
-        send: SendStream,
+        send: Arc<Mutex<SendStream>>,
+        stop: &CancellationToken,
     ) -> Result<(), StreamHandlerError> {
         debug!("Handling stream");
 
@@ -515,13 +517,20 @@ where
             Some(metrics_sender),
         );
 
-        let send = Arc::new(Mutex::new(send));
         let limiter = Arc::new(Semaphore::new(self.process_limit));
         // Kept across the loop so a chunk carrying several requests costs no allocation.
         let mut messages = Vec::new();
 
         loop {
-            let mut next_chunk = match recv.read_chunk(self.service.max_chunk_size(), false).await {
+            let read = tokio::select! {
+                biased;
+                () = stop.cancelled() => {
+                    debug!("Server draining, no longer reading requests from stream");
+                    return Ok(());
+                }
+                read = recv.read_chunk(self.service.max_chunk_size(), false) => read,
+            };
+            let mut next_chunk = match read {
                 Ok(chunk) => chunk,
                 Err(err) => {
                     if is_graceful_close(&err) {
@@ -573,6 +582,10 @@ where
         })?;
 
         Ok(())
+    }
+
+    fn in_flight(&self) -> usize {
+        self.admission.load(Ordering::Relaxed)
     }
 
     async fn close(

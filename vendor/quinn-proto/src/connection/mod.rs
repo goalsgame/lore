@@ -1292,6 +1292,8 @@ impl Connection {
         stats.path.min_rtt = self.path.rtt.min();
         stats.path.cwnd = self.path.congestion.window();
         stats.path.current_mtu = self.path.mtud.current_mtu();
+        // LORE: not upstream.
+        stats.unacked_stream_bytes = self.streams.unacked_send_bytes();
 
         stats
     }
