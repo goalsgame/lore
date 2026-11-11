@@ -1638,6 +1638,8 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
         let mut recv = harness.recv;
         let endpoint = harness._endpoint.clone();
         let (answered, idle_finished, (), closed, refused) = tokio::join!(
+            // The answer is polled first, so one arriving with the close is timed before it.
+            biased;
             async move { (response(&mut recv).await, Instant::now()) },
             async move {
                 let end = idle_recv.read_chunk(usize::MAX, false).await;
