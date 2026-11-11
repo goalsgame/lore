@@ -1036,10 +1036,15 @@ impl GcpImmutableStore {
         let holder_limit =
             i64::try_from((self.obliteration_lease / 2).as_millis()).unwrap_or(i64::MAX);
         let mut work = std::pin::pin!(work);
-        let mut guarded_work = std::future::poll_fn(|cx| {
-            let held = held_since.load(AtomicOrdering::Relaxed);
-            if unix_millis_now().saturating_sub(held) > holder_limit {
+        let overdue = |held: i64| {
+            let overdue = unix_millis_now().saturating_sub(held) > holder_limit;
+            if overdue {
                 warn!(%hash, held, "Obliteration mark went unrenewed too long; abandoning it");
+            }
+            overdue
+        };
+        let mut guarded_work = std::future::poll_fn(|cx| {
+            if overdue(held_since.load(AtomicOrdering::Relaxed)) {
                 return std::task::Poll::Ready(Err(StoreError::from(SlowDown)));
             }
             work.as_mut().poll(cx)
@@ -1050,6 +1055,9 @@ impl GcpImmutableStore {
                 biased;
                 () = tokio::time::sleep(self.obliteration_lease_renewal) => {
                     let held = held_since.load(AtomicOrdering::Relaxed);
+                    if overdue(held) {
+                        break Err(StoreError::from(SlowDown));
+                    }
                     match self.mark_obliterating(hash, FragmentStateEntry::obliterating(held)).await {
                         Ok(renewed) => held_since.store(renewed, AtomicOrdering::Relaxed),
                         Err(e) => {
@@ -1467,12 +1475,16 @@ impl GcpImmutableStore {
         );
 
         let span = tracing::Span::current();
+        let distinct: HashSet<Hash> = sub_fragments
+            .iter()
+            .map(|reference| reference.hash)
+            .collect();
         let mut join_set = JoinSet::new();
-        for reference in sub_fragments.iter() {
+        for sub_hash in distinct {
             let self_clone = self.clone();
             let stats = stats.clone();
             let sub_address = Address {
-                hash: reference.hash,
+                hash: sub_hash,
                 context: address.context,
             };
 
@@ -1489,27 +1501,30 @@ impl GcpImmutableStore {
         }
 
         let mut failures = false;
+        let mut only_slow_downs = true;
         while let Some(result) = join_set.join_next().await {
             match result {
                 Err(e) => {
                     failures = true;
+                    only_slow_downs = false;
                     warn!("Failed to join task for fragment reference obliterate: {e:?}");
                 }
                 Ok(Err((sub_address, e))) => {
                     failures = true;
+                    only_slow_downs &= e.is_slow_down();
                     warn!("Obliteration failed for sub-fragment {sub_address}: {e:?}");
                 }
                 Ok(Ok(())) => {}
             }
         }
 
-        if failures {
-            return Err(StoreError::internal(format!(
+        match (failures, only_slow_downs) {
+            (false, _) => Ok(()),
+            (true, true) => Err(StoreError::from(SlowDown)),
+            (true, false) => Err(StoreError::internal(format!(
                 "Failed to obliterate immutable {address}"
-            )));
+            ))),
         }
-
-        Ok(())
     }
 
     /// Obliterate one address. A sub-fragment that another obliteration holds fails with
@@ -2606,5 +2621,30 @@ mod emulator_tests {
 
         assert!(held.unwrap_err().is_slow_down());
         assert_eq!(resumed.load(AtomicOrdering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn an_overdue_holder_does_not_renew_its_mark() {
+        let mut store = emulator_store().await;
+        store.obliteration_lease = Duration::from_millis(200);
+        store.obliteration_lease_renewal = Duration::from_millis(150);
+        let hash = unique_hash();
+        publish_retrying(&store, hash).await.unwrap();
+        let taken = store
+            .take_obliteration_mark(hash, FragmentStateEntry::new(FragmentState::Stored))
+            .await
+            .unwrap();
+
+        let mut since = taken;
+        let held = store
+            .hold_obliteration_mark(hash, &mut since, std::future::pending::<Result<(), _>>())
+            .await;
+
+        assert!(held.unwrap_err().is_slow_down());
+        assert_eq!(since, taken);
+        assert_eq!(
+            store.load_state_entry(hash).await.unwrap(),
+            Some(FragmentStateEntry::obliterating(taken))
+        );
     }
 }
