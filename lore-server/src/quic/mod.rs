@@ -57,7 +57,7 @@ pub trait StreamDataHandler: Send + Sync + 'static {
     /// For handling data from stream-based streams (i.e. Quinn).
     ///
     /// Stops reading once `stop` is cancelled, without finishing `send`: requests already read
-    /// are still answered on it, and the caller finishes it once they have been.
+    /// are still answered on it.
     async fn handle_stream(
         &self,
         recv: &mut RecvStream,

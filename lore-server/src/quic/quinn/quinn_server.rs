@@ -45,6 +45,9 @@ const METRICS_QUINN_SERVER_LABEL: &str = "quinn_server_name";
 /// How often a draining connection checks whether its last request has been answered.
 const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
 
+/// Allowance for the peer's acknowledgement delay when waiting for stream data to settle.
+const SETTLE_ACK_DELAY: Duration = Duration::from_millis(50);
+
 /// Application close code and reason sent to peers when the server shuts down.
 const SHUTDOWN_CLOSE_CODE: u32 = 0;
 const SHUTDOWN_CLOSE_REASON: &[u8] = b"server shutting down";
@@ -310,6 +313,21 @@ fn run_loop(
     Ok(())
 }
 
+/// Waits until the connection has sent no stream data, retransmissions included, for long
+/// enough that the peer has most likely acknowledged what was sent.
+///
+/// Streams are not finished to learn of delivery: a client reconnects on a finished stream.
+async fn wait_for_stream_data_to_settle(connection: &quinn::Connection) {
+    loop {
+        let sent = connection.stats().frame_tx.stream;
+        let quiet = connection.rtt() * 4 + SETTLE_ACK_DELAY;
+        tokio::time::sleep(quiet).await;
+        if connection.stats().frame_tx.stream == sent {
+            return;
+        }
+    }
+}
+
 fn get_protocol(connection: &quinn::Connection) -> Result<String, anyhow::Error> {
     let handshake_data = connection
         .handshake_data()
@@ -378,10 +396,6 @@ async fn handle_conn(
 
     // Streams still reading requests.
     let readers = TaskTracker::new();
-    // Streams whose responses may not yet have reached the peer.
-    let writers = TaskTracker::new();
-    // Cancelled once every request read from this connection has been answered.
-    let answered = CancellationToken::new();
 
     // Keeps accepting requests until the connection closes or errors, or the server drains
     loop {
@@ -420,9 +434,7 @@ async fn handle_conn(
 
             let handler = connection_handler.clone();
             let draining = draining.clone();
-            let answered = answered.clone();
             let reader = readers.token();
-            let writer = writers.token();
             let connection = connection.clone();
             let send = Arc::new(tokio::sync::Mutex::new(send));
 
@@ -444,19 +456,11 @@ async fn handle_conn(
                     }
                 }
                 drop(reader);
+                // Both halves held open until the connection closes: finishing or stopping a
+                // stream makes the client reconnect, abandoning answers still in transit.
                 if draining.is_cancelled() {
-                    answered.cancelled().await;
-                    let delivered = {
-                        let mut send = send.lock().await;
-                        send.finish().ok().map(|()| send.stopped())
-                    };
-                    if let Some(delivered) = delivered {
-                        let _ = delivered.await;
-                    }
-                    drop(writer);
-                    // Held open: dropping it stops the peer's sends, failing requests a reconnect
-                    // retries.
                     connection.closed().await;
+                    drop(send);
                 }
             }
             .instrument(info_span!("handle_stream"))
@@ -472,9 +476,7 @@ async fn handle_conn(
     while connection_handler.in_flight() > 0 {
         tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
     }
-    answered.cancel();
-    writers.close();
-    writers.wait().await;
+    wait_for_stream_data_to_settle(&connection).await;
     info!("Connection drained, closing");
     connection.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
     Ok(())

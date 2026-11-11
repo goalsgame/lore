@@ -1551,7 +1551,7 @@ async fn test_v4_authorize_put_get_query_stop() {
 
 /// Shutting down answers the requests a connection has already read, then closes it with the
 /// graceful application code, and refuses new connections meanwhile. No stream of the connection
-/// is finished before the last answer is sent, since a client reconnects on a finished stream.
+/// ends before the last answer is delivered, since a client reconnects on an ended stream.
 /// It does not wait for the timeout when every connection drains before it.
 #[tokio::test]
 async fn shutdown_answers_requests_in_flight_then_closes_connections() {
@@ -1586,8 +1586,8 @@ async fn shutdown_answers_requests_in_flight_then_closes_connections() {
             async move {
                 let end = idle_recv.read_chunk(usize::MAX, false).await;
                 assert!(
-                    matches!(end, Ok(None)),
-                    "the idle stream is finished: {end:?}"
+                    matches!(end, Err(ReadError::ConnectionLost(_))),
+                    "the idle stream ends with the connection: {end:?}"
                 );
                 Instant::now()
             },
