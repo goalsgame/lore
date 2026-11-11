@@ -277,3 +277,51 @@ async fn quic_presents_a_reloaded_certificate_to_new_connections() {
     .await
     .unwrap();
 }
+
+/// Every configured certificate file must yield a certificate, so a renewal that empties the
+/// chain file is refused rather than leaving a leaf-only chain in use.
+#[test]
+fn an_emptied_chain_file_is_refused() {
+    let files = CertificateFiles::new();
+    let served = files.renew();
+    let chain = files.cert.with_file_name("chain.pem");
+    let issuer = lore_transport::tls::generate_self_signed(vec!["issuer".into()]).unwrap();
+    std::fs::write(&chain, &issuer.cert_pem).unwrap();
+    let certificate =
+        ReloadableCertificate::load(vec![files.cert.clone(), chain.clone()], files.key.clone())
+            .unwrap();
+    assert_eq!(certificate.current().cert.len(), 2);
+
+    std::fs::write(&chain, "").unwrap();
+    assert!(
+        certificate.reload().is_err(),
+        "an empty chain file is refused"
+    );
+    assert_eq!(leaf(&certificate), served);
+    assert_eq!(certificate.current().cert.len(), 2);
+}
+
+/// Dropping the accepted-connection stream releases connections whose handshake has not
+/// completed, rather than leaving them waiting on a silent client.
+#[tokio::test]
+async fn dropping_the_tls_incoming_releases_unfinished_handshakes() {
+    let files = CertificateFiles::new();
+    files.renew();
+    let config = lore_server::tls::grpc_server_tls_config(files.load(), None, false).unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let incoming = lore_server::tls::tls_incoming(
+        tokio_stream::wrappers::TcpListenerStream::new(listener),
+        config,
+    );
+
+    let mut silent = tokio::net::TcpStream::connect(address).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    drop(incoming);
+
+    let mut byte = [0u8; 1];
+    let read = tokio::time::timeout(Duration::from_secs(5), silent.read(&mut byte))
+        .await
+        .expect("the unfinished handshake is abandoned");
+    assert!(matches!(read, Ok(0) | Err(_)), "got {read:?}");
+}

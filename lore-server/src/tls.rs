@@ -4,6 +4,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Weak;
+use std::time::Duration;
 
 use anyhow::Context as _;
 use lore_base::lore_spawn;
@@ -119,13 +120,12 @@ impl ResolvesServerCert for ReloadableCertificate {
 fn read_certified_key(cert_files: &[PathBuf], key_file: &Path) -> anyhow::Result<CertifiedKey> {
     let mut chain = Vec::new();
     for cert_file in cert_files {
-        chain.extend(
-            lore_transport::tls::load_certs(cert_file)
-                .with_context(|| format!("reading certificate {}", cert_file.display()))?,
-        );
-    }
-    if chain.is_empty() {
-        anyhow::bail!("no certificate found in {cert_files:?}");
+        let certs = lore_transport::tls::load_certs(cert_file)
+            .with_context(|| format!("reading certificate {}", cert_file.display()))?;
+        if certs.is_empty() {
+            anyhow::bail!("no certificate found in {}", cert_file.display());
+        }
+        chain.extend(certs);
     }
     let key = lore_transport::tls::load_private_key(key_file)
         .with_context(|| format!("reading private key {}", key_file.display()))?;
@@ -194,7 +194,9 @@ pub fn grpc_server_tls_config(
 }
 
 /// Completes the TLS handshake for each connection `incoming` yields, without letting a slow
-/// handshake hold up the next accept. Ends when the returned stream is dropped.
+/// handshake hold up the next accept. At most [`TLS_MAX_HANDSHAKES`] run at once, each for at most
+/// [`TLS_HANDSHAKE_TIMEOUT`]. Dropping the returned stream stops accepting and abandons the
+/// handshakes in progress.
 pub fn tls_incoming<IO, E>(
     incoming: impl Stream<Item = Result<IO, E>> + Send + 'static,
     config: Arc<rustls::ServerConfig>,
@@ -205,6 +207,7 @@ where
 {
     let acceptor = tokio_rustls::TlsAcceptor::from(config);
     let (accepted, receiver) = tokio::sync::mpsc::channel(TLS_ACCEPT_BACKLOG);
+    let handshakes = Arc::new(tokio::sync::Semaphore::new(TLS_MAX_HANDSHAKES));
     lore_spawn!(async move {
         tokio::pin!(incoming);
         loop {
@@ -220,14 +223,27 @@ where
                     }
                 }
                 Some(Ok(io)) => {
+                    let permit = tokio::select! {
+                        () = accepted.closed() => break,
+                        permit = handshakes.clone().acquire_owned() => permit,
+                    };
+                    let Ok(permit) = permit else { break };
                     let acceptor = acceptor.clone();
                     let accepted = accepted.clone();
                     lore_spawn!(async move {
-                        match acceptor.accept(io).await {
-                            Ok(stream) => {
+                        let handshake =
+                            tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(io));
+                        let stream = tokio::select! {
+                            () = accepted.closed() => return,
+                            stream = handshake => stream,
+                        };
+                        drop(permit);
+                        match stream {
+                            Ok(Ok(stream)) => {
                                 let _ = accepted.send(Ok(stream)).await;
                             }
-                            Err(error) => debug!("TLS handshake failed: {error}"),
+                            Ok(Err(error)) => debug!("TLS handshake failed: {error}"),
+                            Err(_elapsed) => debug!("TLS handshake timed out"),
                         }
                     });
                 }
@@ -239,3 +255,9 @@ where
 
 /// Handshaken connections waiting for the server to take them.
 const TLS_ACCEPT_BACKLOG: usize = 128;
+
+/// Handshakes a TLS listener runs at once; further connections wait to be accepted.
+pub const TLS_MAX_HANDSHAKES: usize = 1024;
+
+/// Time a client has to complete the TLS handshake before its connection is dropped.
+pub const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
