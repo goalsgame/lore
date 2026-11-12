@@ -2779,7 +2779,7 @@ fn emit_diff_item_with_auto_resolve(
 /// the merge produces no conflict markers — any merge failure or any
 /// markers in the output preserve the conflict (returns `None`).
 #[lore_macro::test_pub]
-pub(crate) async fn try_auto_resolve_conflict(
+async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {

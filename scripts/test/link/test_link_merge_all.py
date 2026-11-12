@@ -4,6 +4,8 @@
 import pytest
 from error_types import ImproperArgumentsError, LocalChanges
 from link_helpers import (
+    SEPARATE_EDITS,
+    SEPARATE_EDITS_MERGED,
     link_pin,
     make_parent_with_link,
     make_repo,
@@ -70,14 +72,7 @@ def test_link_merge_all_merges_separate_edits_to_a_linked_file(
     """Edits to different lines of the same linked file merge as text, with no conflict."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
         new_lore_repo,
-        files=[
-            {
-                "path": "config.yaml",
-                "base": "one\ntwo\nthree\nfour\nfive\nsix\n",
-                "mine": "one on main\ntwo\nthree\nfour\nfive\nsix\n",
-                "theirs": "one\ntwo\nthree\nfour\nfive\nsix on feature\n",
-            }
-        ],
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
         source_path=source_path,
     )
 
@@ -85,7 +80,7 @@ def test_link_merge_all_merges_separate_edits_to_a_linked_file(
 
     merged_file = f"{link_path}/config.yaml"
     with urc.open_file(merged_file, "r") as f:
-        assert f.read() == "one on main\ntwo\nthree\nfour\nfive\nsix on feature\n"
+        assert f.read() == SEPARATE_EDITS_MERGED
     for suffix in (".mine", ".theirs", ".base"):
         assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
 
@@ -96,6 +91,71 @@ def test_link_merge_all_merges_separate_edits_to_a_linked_file(
     urc.push()
     status = urc.status()
     assert "local branch in sync with remote" in status.lower(), status
+
+
+@pytest.mark.smoke
+def test_link_merge_all_leaves_separate_edits_outside_the_exposed_subtree_in_conflict(
+    new_lore_repo,
+):
+    """Edits to different lines of a linked file the link does not expose are left a conflict,
+    as nothing on disk holds the file to merge them into."""
+    link_path = "linked/repo"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"content/exposed.txt": "exposed\n", "outside.yaml": SEPARATE_EDITS["base"]},
+        {"main-file.txt": "main repo content\n"},
+        source_path="content",
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Feature change through the mount", {f"{link_path}/exposed.txt": "feature\n"}
+    )
+    link_repo.sync()
+    link_repo.branch_switch("feature-branch")
+    link_repo.write_commit_push(
+        "Feature change outside", {"outside.yaml": SEPARATE_EDITS["theirs"]}
+    )
+
+    link_repo.branch_switch("main")
+    link_repo.write_commit_push(
+        "Main change outside", {"outside.yaml": SEPARATE_EDITS["mine"]}
+    )
+    urc.branch_switch("main")
+    urc.link_update(link_path)
+    urc.commit("Repin the link", non_interactive=True)
+    urc.push()
+
+    urc.branch_merge_start("feature-branch", message="Merge outside edits")
+
+    assert urc.revision_info(check=True, no_pager=True).message == "Repin the link", (
+        "A merge that could not write the merged file was committed"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("scoped", [False, True])
+def test_link_merge_abort_restores_separate_edits_merged_into_a_linked_file(
+    new_lore_repo, scoped
+):
+    """Aborting a merge restores a linked file it merged as text."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo, files=[{"path": "config.yaml", **SEPARATE_EDITS}]
+    )
+
+    link = link_path if scoped else None
+    urc.branch_merge_start("feature-branch", link=link, no_commit=True)
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS_MERGED
+
+    urc.branch_merge_abort(link=link)
+
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS["mine"], "The abort left the merged file"
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
 
 
 @pytest.mark.smoke

@@ -2258,10 +2258,7 @@ fn realize_file_merge(
             // A linked repository's paths name no file on disk until they are spelled from the
             // mount, which only a pass that writes the working tree does.
             if in_view && dry_run && repository.is_link() {
-                resolved = crate::branch::try_auto_resolve_conflict(change_from, change_to)
-                    .await
-                    .forward::<SyncError>("Failed to merge a linked file")?
-                    .is_some();
+                resolved = change_to.flags.is_conflict_automerged();
                 conflict = !resolved;
             } else if in_view {
                 (size, resolved) = merge_file_in_view(

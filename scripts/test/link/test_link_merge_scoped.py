@@ -3,7 +3,13 @@
 import re
 
 import pytest
-from link_helpers import link_pin, make_parent_with_link, setup_link_merge_conflict
+from link_helpers import (
+    SEPARATE_EDITS,
+    SEPARATE_EDITS_MERGED,
+    link_pin,
+    make_parent_with_link,
+    setup_link_merge_conflict,
+)
 
 
 @pytest.mark.smoke
@@ -423,14 +429,7 @@ def test_link_merge_merges_separate_edits_to_a_linked_file(new_lore_repo):
     """A --link merge merges edits to different lines of the same file as text."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
         new_lore_repo,
-        files=[
-            {
-                "path": "config.yaml",
-                "base": "one\ntwo\nthree\nfour\nfive\nsix\n",
-                "mine": "one on main\ntwo\nthree\nfour\nfive\nsix\n",
-                "theirs": "one\ntwo\nthree\nfour\nfive\nsix on feature\n",
-            }
-        ],
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
     )
 
     urc.branch_merge_start(
@@ -439,7 +438,7 @@ def test_link_merge_merges_separate_edits_to_a_linked_file(new_lore_repo):
 
     merged_file = f"{link_path}/config.yaml"
     with urc.open_file(merged_file, "r") as f:
-        assert f.read() == "one on main\ntwo\nthree\nfour\nfive\nsix on feature\n"
+        assert f.read() == SEPARATE_EDITS_MERGED
     for suffix in (".mine", ".theirs", ".base"):
         assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
 
