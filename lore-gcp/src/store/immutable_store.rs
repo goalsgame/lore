@@ -936,7 +936,7 @@ impl GcpImmutableStore {
 
     /// Replace the state document with `updated`, failing unless it still matches `expected`,
     /// including the time an `Obliterating` mark was taken. Obliteration uses this to take,
-    /// renew and release the mark.
+    /// renew and release the mark. A document that no longer matches answers `SlowDown`.
     async fn replace_state(
         &self,
         hash: Hash,
@@ -958,12 +958,14 @@ impl GcpImmutableStore {
     ) -> Result<FragmentStateEntry, StoreError> {
         let collection = self.fragment_state_collection.clone();
         let doc_id = hex_hash(hash);
+        let mismatched = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let _permit = self
             .firestore_write_semaphore
             .acquire()
             .await
             .expect("semaphore is never closed");
 
+        let observed_mismatch = mismatched.clone();
         bounded(
             self.firestore_timeout,
             self.firestore_slow_threshold,
@@ -972,6 +974,7 @@ impl GcpImmutableStore {
                 .run_transaction::<FragmentStateEntry, _, GcpError>(move |db, transaction| {
                     let collection = collection.clone();
                     let doc_id = doc_id.clone();
+                    let mismatched = mismatched.clone();
                     let expected = expected.clone();
                     let updated = updated();
                     async move {
@@ -986,6 +989,7 @@ impl GcpImmutableStore {
                             .map_err(BackoffError::Permanent)?;
 
                         if !current.is_some_and(|entry| entry.is_same_as(&expected)) {
+                            mismatched.store(true, AtomicOrdering::Relaxed);
                             return Err(BackoffError::Permanent(GcpError::Decode(format!(
                                 "fragment state for {doc_id} was not {expected:?} when moving to \
                                  {updated:?}"
@@ -1008,6 +1012,12 @@ impl GcpImmutableStore {
         )
         .await?
         .map_err(|err| match err {
+            firestore::errors::FirestoreError::ErrorInTransaction(inner)
+                if observed_mismatch.load(AtomicOrdering::Relaxed) =>
+            {
+                debug!(%inner, "Fragment state moved underneath an update");
+                StoreError::from(SlowDown)
+            }
             firestore::errors::FirestoreError::ErrorInTransaction(inner) => {
                 warn!(%inner, "Failed to update fragment state due to conflict");
                 StoreError::internal("Failed to update fragment state due to conflict")
@@ -1130,13 +1140,14 @@ impl GcpImmutableStore {
     }
 
     /// Make `held` immediately stale, so the next obliteration of `hash` takes it over and
-    /// finishes its scopes. A mark that is no longer `held` is left alone.
+    /// finishes its scopes. A mark that is no longer `held` is left alone. Best effort, bounded
+    /// by the Firestore timeout; on failure the mark expires with its lease.
     async fn expire_obliteration_mark(&self, hash: Hash, held: &FragmentStateEntry) {
-        if let Err(e) = self
-            .replace_state(hash, held.clone(), held.restamped(None))
-            .await
-        {
-            warn!(%hash, "Failed to expire an abandoned obliteration mark: {e:?}");
+        let expiry = self.replace_state(hash, held.clone(), held.restamped(None));
+        match tokio::time::timeout(self.firestore_timeout, expiry).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => warn!(%hash, "Failed to expire an abandoned obliteration mark: {e:?}"),
+            Err(_) => warn!(%hash, "Timed out expiring an abandoned obliteration mark"),
         }
     }
 
@@ -1906,17 +1917,13 @@ impl ImmutableStoreTrait for GcpImmutableStore {
                 }
             }
 
-            self.delete_association(partition, address)
+            let mut held = self
+                .take_obliteration_mark(address.hash, entry, partition, address.context)
                 .instrument(span.clone())
                 .await?;
             stats
                 .num_fragments
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-            let mut held = self
-                .take_obliteration_mark(address.hash, entry, partition, address.context)
-                .instrument(span.clone())
-                .await?;
             let scopes = held.parsed_scopes();
 
             let work = {
@@ -1995,12 +2002,17 @@ impl ImmutableStoreTrait for GcpImmutableStore {
                 }
                 ObliterationOutcome::Obliterated => FragmentState::Obliterated,
             };
-            self.replace_state(address.hash, held, FragmentStateEntry::new(updated))
+            let moved = self
+                .replace_state(address.hash, held.clone(), FragmentStateEntry::new(updated))
                 .instrument(span.clone())
-                .await
-                .inspect_err(|e| {
-                    warn!("Failed to move {address} out of its obliteration mark: {e:?}");
-                })
+                .await;
+            if let Err(e) = &moved {
+                warn!("Failed to move {address} out of its obliteration mark: {e:?}");
+                self.expire_obliteration_mark(address.hash, &held)
+                    .instrument(span.clone())
+                    .await;
+            }
+            moved
         })
         .into()
     }
@@ -2678,7 +2690,11 @@ mod emulator_tests {
             store.take_obliteration_mark(hash, stale, partition, context),
         );
 
-        assert!(first.is_ok() != second.is_ok());
+        let loser = match (first, second) {
+            (Ok(_), Err(loser)) | (Err(loser), Ok(_)) => loser,
+            other => panic!("exactly one take should win, got {other:?}"),
+        };
+        assert!(loser.is_slow_down());
     }
 
     #[tokio::test]
