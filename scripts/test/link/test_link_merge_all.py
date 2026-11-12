@@ -63,6 +63,42 @@ def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("source_path", ["/", "content/assets"])
+def test_link_merge_all_merges_separate_edits_to_a_linked_file(
+    new_lore_repo, source_path
+):
+    """Edits to different lines of the same linked file merge as text, with no conflict."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "config.yaml",
+                "base": "one\ntwo\nthree\nfour\nfive\nsix\n",
+                "mine": "one on main\ntwo\nthree\nfour\nfive\nsix\n",
+                "theirs": "one\ntwo\nthree\nfour\nfive\nsix on feature\n",
+            }
+        ],
+        source_path=source_path,
+    )
+
+    urc.branch_merge_start("feature-branch", message="Merge separate edits")
+
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == "one on main\ntwo\nthree\nfour\nfive\nsix on feature\n"
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
+
+    info = urc.revision_info(check=True, no_pager=True)
+    assert info.message == "Merge separate edits", "The merge was not committed"
+    assert info.merge, "The parent's merge revision does not record the merged branch"
+
+    urc.push()
+    status = urc.status()
+    assert "local branch in sync with remote" in status.lower(), status
+
+
+@pytest.mark.smoke
 def test_link_merge_all(new_lore_repo):
     """Default merge (no flags) across main + linked repos.
 

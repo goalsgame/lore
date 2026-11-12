@@ -422,22 +422,25 @@ pub struct MergeRepositoryResult {
     pub state_staged: Arc<State>,
     /// Endpoints for reconciling state the diff does not carry, such as link pins.
     pub endpoints: MergeDiffEndpoints,
-    /// Conflict-realization context: the 3-way merge inputs and the conflict
-    /// pairs from the diff. Surfaced so `merge_start_all` can spell them from
-    /// the link's mount and call `realize_conflicts` without re-running
-    /// diff3. `None` when no conflicts (`!has_conflicts`).
+    /// Conflict-realization context: the 3-way merge inputs and the pairs
+    /// of changes both sides made, auto-merged or not. Surfaced so
+    /// `merge_start_all` can spell them from the link's mount and call
+    /// `realize_conflicts` without re-running diff3. `None` for the top-level
+    /// repository, and when the diff paired no changes.
     pub conflict_context: Option<ConflictRealizeContext>,
 }
 
-/// Inputs needed to materialise conflict markers and `.mine`/`.theirs`/
-/// `.base` sidecars on disk after a merge. Produced by `merge_repository`,
-/// consumed by `merge_start_all` after `stage_link_pin` has placed the
-/// link's pre-merge content on disk.
+/// Inputs needed to materialise auto-merged content, conflict markers and
+/// `.mine`/`.theirs`/`.base` sidecars on disk after a merge. Produced by
+/// `merge_repository`, consumed by `merge_start_all` after `stage_link_pin`
+/// has placed the link's pre-merge content on disk.
 #[derive(Clone)]
 pub struct ConflictRealizeContext {
     pub state_base: Arc<State>,
     pub state_from: Arc<State>,
     pub state_to: Arc<State>,
+    /// The merge's staged state, which records which of `conflicts` were auto-merged.
+    pub state_staged: Arc<State>,
     /// Paths are relative to the merged repository's root, which for a linked repo merge is not
     /// the working tree: [`mount_conflicts`] names each by its node to spell it from the mount.
     pub conflicts: Arc<Vec<(NodeChange, NodeChange)>>,
@@ -610,6 +613,7 @@ async fn merge_repository(
     // `merge_start_all` needs the corresponding states to realize conflict
     // markers at a remapped mount path without re-running diff3.
     let (diff_base, diff_source, diff_target) = (diff.base, diff.source, diff.target);
+    let mounted = mount.is_some();
 
     let ApplyDiffResults {
         signature,
@@ -651,7 +655,7 @@ async fn merge_repository(
         .await;
     }
 
-    let conflict_context = if has_conflicts {
+    let conflict_context = if mounted && !conflicts.is_empty() {
         let state_base = state::State::deserialize(repository.clone(), diff_base)
             .await
             .forward::<MergeError>("deserializing diff base state")?;
@@ -665,6 +669,7 @@ async fn merge_repository(
             state_base,
             state_from,
             state_to,
+            state_staged: state_staged.clone(),
             conflicts,
         })
     } else {
@@ -969,6 +974,16 @@ async fn merge_start_link(
     .await
     .forward_with::<MergeError, _>(|| format!("staging link pin for {link_path}"))?;
 
+    if let Some(context) = result.conflict_context {
+        realize_link_merge(&PendingConflictRealize {
+            link_context,
+            link_path,
+            link_node,
+            context,
+        })
+        .await?;
+    }
+
     state
         .serialize_link_merge_state(repository.clone(), &[link_merge_entry])
         .await
@@ -1025,10 +1040,10 @@ struct MergedLink {
     new_signature: Hash,
 }
 
-/// Inputs captured for a link merge that produced conflicts so the caller can
-/// realize markers + sidecars on disk *after* `stage_link_pin` runs (the pin
-/// step expects the link's pre-merge content on disk; markers are written on
-/// top once the pin is in place).
+/// Inputs captured for a link merge in which both sides changed files, so the
+/// caller can write the merged files, or markers and sidecars, on disk *after*
+/// `stage_link_pin` runs (the pin step expects the link's pre-merge content on
+/// disk; the merge is written on top once the pin is in place).
 struct PendingConflictRealize {
     link_context: Arc<RepositoryContext>,
     link_path: String,
@@ -1116,14 +1131,15 @@ async fn mount_conflict_change(
 /// pairs two changes at different paths.
 async fn mount_conflicts(
     pending: &PendingConflictRealize,
+    conflicts: &[(NodeChange, NodeChange)],
     mount_path: &RelativePath,
 ) -> Result<Vec<(NodeChange, NodeChange)>, MergeError> {
     let source_path = link::pinned_source_path(pending.link_context.clone(), &pending.link_node)
         .await
         .forward::<MergeError>("resolving the path a conflicted link exposes")?;
 
-    let mut mounted = Vec::with_capacity(pending.context.conflicts.len());
-    for (from, to) in pending.context.conflicts.iter() {
+    let mut mounted = Vec::with_capacity(conflicts.len());
+    for (from, to) in conflicts {
         let (Some(from_mounted), Some(to_mounted)) = (
             mount_conflict_change(from, mount_path, &source_path).await,
             mount_conflict_change(to, mount_path, &source_path).await,
@@ -1138,6 +1154,53 @@ async fn mount_conflicts(
         mounted.push((from_mounted, to_mounted));
     }
     Ok(mounted)
+}
+
+/// Writes the files both sides of a link's merge changed at the link's mount, once
+/// `stage_link_pin` has put the link's pre-merge content there: the merged text where the
+/// merge resolved them, and conflict markers and sidecars where it did not. Sends a conflict
+/// event for each file left in conflict.
+///
+/// The link's context shares `path` with the parent, so absolute paths resolve to
+/// `<parent>/<mount>/<file>` while state block lookups stay in the link.
+async fn realize_link_merge(pending: &PendingConflictRealize) -> Result<(), MergeError> {
+    let mount_path = RelativePath::from_str(&pending.link_path)
+        .internal_with(|| format!("link not found: {}", pending.link_path))?;
+    let conflicts =
+        Arc::new(mount_conflicts(pending, &pending.context.conflicts, &mount_path).await?);
+    sync::realize_conflicts(
+        pending.link_context.clone(),
+        pending.context.state_base.clone(),
+        pending.context.state_from.clone(),
+        pending.context.state_to.clone(),
+        None, // staging already happened inside apply_diff for the link state
+        conflicts,
+        false,
+        Arc::new(sync::SyncRealizeStats::default()),
+        MergeType::BranchMerge,
+    )
+    .await
+    .forward::<MergeError>("realizing link merge")?;
+
+    let mut unresolved = Vec::new();
+    for conflict in pending.context.conflicts.iter() {
+        if is_left_in_conflict(
+            &pending.link_context,
+            &pending.context.state_staged,
+            conflict.0.path(),
+        )
+        .await
+        {
+            unresolved.push(conflict.clone());
+        }
+    }
+    for (from, _to) in mount_conflicts(pending, &unresolved, &mount_path).await? {
+        event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
+            path: LoreString::from(from.path().as_str()),
+        })
+        .send();
+    }
+    Ok(())
 }
 
 /// Run upfront eligibility checks for every link in `state_current`, returning
@@ -1389,22 +1452,19 @@ async fn merge_start_all(
         .await
         .forward_with::<MergeError, _>(|| format!("merging link {}", eligible.link_path))?;
 
-        if result.has_conflicts {
-            has_link_conflicts = true;
+        has_link_conflicts |= result.has_conflicts;
 
-            // Defer marker realization until after `stage_link_pin` puts the
-            // link's pre-merge content on disk; otherwise `stage_link_pin`'s
-            // file-system verify rejects the on-disk size as locally
-            // modified. The conflict event is deferred for the same reason
-            // (see `finalize_link_conflict_state`).
-            if !dry_run && let Some(ctx) = result.conflict_context.clone() {
-                pending_conflict_realizes.push(PendingConflictRealize {
-                    link_context: eligible.link_context.clone(),
-                    link_path: eligible.link_path.clone(),
-                    link_node: eligible.link_node,
-                    context: ctx,
-                });
-            }
+        // Defer realization until after `stage_link_pin` puts the link's
+        // pre-merge content on disk; otherwise `stage_link_pin`'s file-system
+        // verify rejects the on-disk size as locally modified. The conflict
+        // event is deferred for the same reason (see `realize_link_merge`).
+        if !dry_run && let Some(ctx) = result.conflict_context.clone() {
+            pending_conflict_realizes.push(PendingConflictRealize {
+                link_context: eligible.link_context.clone(),
+                link_path: eligible.link_path.clone(),
+                link_node: eligible.link_node,
+                context: ctx,
+            });
         }
 
         if !dry_run {
@@ -1483,6 +1543,7 @@ async fn merge_start_all(
         state_current,
         current_branch,
         &merged_links,
+        &pending_conflict_realizes,
         &link_merge_entries,
         dry_run,
     ))
@@ -1526,39 +1587,8 @@ async fn finalize_link_conflict_state(
         })?;
     }
 
-    // Now that each conflicted link's new state has been realized at the
-    // mount path by `stage_link_pin`, write conflict markers (and
-    // `.mine`/`.theirs`/`.base` sidecars) on top. Pass the link's
-    // `RepositoryContext` — its `path` is shared with the parent (set by
-    // `to_link_context`), so absolute paths resolve to
-    // `<parent>/<mount>/<file>` while state block lookups stay in the link.
     for pending in pending_conflict_realizes {
-        let mount_path = RelativePath::from_str(&pending.link_path)
-            .internal_with(|| format!("link not found: {}", pending.link_path))?;
-        let conflicts = Arc::new(mount_conflicts(pending, &mount_path).await?);
-        let conflict_stats = Arc::new(sync::SyncRealizeStats::default());
-        sync::realize_conflicts(
-            pending.link_context.clone(),
-            pending.context.state_base.clone(),
-            pending.context.state_from.clone(),
-            pending.context.state_to.clone(),
-            None, // staging already happened inside apply_diff for the link state
-            conflicts.clone(),
-            false,
-            conflict_stats,
-            MergeType::BranchMerge,
-        )
-        .await
-        .forward::<MergeError>("realizing link conflicts")?;
-
-        // Emit per-file conflict events at the same paths, so consumers see the
-        // same shape as for parent-level conflicts.
-        for (from, _to) in conflicts.iter() {
-            event::LoreEvent::BranchMergeConflictFile(LoreBranchMergeConflictFileEventData {
-                path: LoreString::from(from.path().as_str()),
-            })
-            .send();
-        }
+        realize_link_merge(pending).await?;
     }
 
     if !link_merge_entries.is_empty() {
@@ -1592,6 +1622,7 @@ async fn finalize_main_merge(
     state_current: Arc<State>,
     current_branch: BranchId,
     merged_links: &[MergedLink],
+    pending_link_merges: &[PendingConflictRealize],
     link_merge_entries: &[LinkMergeEntry],
     dry_run: bool,
 ) -> Result<Hash, MergeError> {
@@ -1630,6 +1661,9 @@ async fn finalize_main_merge(
             .forward_with::<MergeError, _>(|| {
                 format!("staging merged link pin for {}", merged.link_path)
             })?;
+        }
+        for pending in pending_link_merges {
+            realize_link_merge(pending).await?;
         }
     }
 
@@ -2757,12 +2791,7 @@ pub async fn emit_conflict_events(
     merge_type: MergeType,
 ) {
     for conflict in conflicts.iter() {
-        if let Ok(node) = state_staged
-            .find_node(repository.clone(), conflict.0.path().as_str())
-            .await
-            && (!node.is_staged_merge_conflict() || node.is_staged_merge_resolved())
-        {
-            // The file was auto resolved
+        if !is_left_in_conflict(&repository, state_staged, conflict.0.path()).await {
             continue;
         }
 
@@ -2790,6 +2819,18 @@ pub async fn emit_conflict_events(
             MergeType::None => {}
         }
     }
+}
+
+/// Whether the merge staged in `state_staged` left `path` in conflict rather than auto-merging it.
+async fn is_left_in_conflict(
+    repository: &Arc<RepositoryContext>,
+    state_staged: &State,
+    path: &RelativePath,
+) -> bool {
+    !state_staged
+        .find_node(repository.clone(), path.as_str())
+        .await
+        .is_ok_and(|node| !node.is_staged_merge_conflict() || node.is_staged_merge_resolved())
 }
 
 /// Per-entry view of a link merge ready to be rolled back or replayed.

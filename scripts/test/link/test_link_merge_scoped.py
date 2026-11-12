@@ -419,6 +419,36 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_merge_merges_separate_edits_to_a_linked_file(new_lore_repo):
+    """A --link merge merges edits to different lines of the same file as text."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "config.yaml",
+                "base": "one\ntwo\nthree\nfour\nfive\nsix\n",
+                "mine": "one on main\ntwo\nthree\nfour\nfive\nsix\n",
+                "theirs": "one\ntwo\nthree\nfour\nfive\nsix on feature\n",
+            }
+        ],
+    )
+
+    urc.branch_merge_start(
+        "feature-branch", link=link_path, message="Merge separate edits"
+    )
+
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == "one on main\ntwo\nthree\nfour\nfive\nsix on feature\n"
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
+
+    urc.push()
+    status = urc.status()
+    assert "local branch in sync with remote" in status.lower(), status
+
+
+@pytest.mark.smoke
 def test_link_merge_file_conflict_in_subdirectory(new_lore_repo):
     """File conflict in a subdirectory of a linked repo."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
