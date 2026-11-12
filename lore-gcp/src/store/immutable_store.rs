@@ -243,13 +243,17 @@ impl FragmentState {
 /// A row in the `fragment_state` collection.
 ///
 /// An `Obliterating` row carries `obliterating_since_millis`, the Unix time in milliseconds at
-/// which its holder last took or renewed the mark. A mark older than the store's obliteration
-/// lease, or one without the field, is stale and may be taken over by another obliteration.
+/// which its holder last took or renewed the mark, and `obliterating_scopes`, every
+/// `{partition_hex}_{context_hex}` an obliteration under this mark has worked on. A mark older
+/// than the store's obliteration lease, or one without a timestamp, is stale and may be taken
+/// over by another obliteration, which also finishes the scopes already recorded.
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 struct FragmentStateEntry {
     state: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     obliterating_since_millis: Option<i64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    obliterating_scopes: Vec<String>,
 }
 
 impl FragmentStateEntry {
@@ -257,13 +261,22 @@ impl FragmentStateEntry {
         Self {
             state: state.bits(),
             obliterating_since_millis: None,
+            obliterating_scopes: Vec::new(),
         }
     }
 
-    fn obliterating(since_millis: i64) -> Self {
+    fn obliterating(since_millis: Option<i64>, scopes: Vec<String>) -> Self {
         Self {
             state: FragmentState::Obliterating.bits(),
-            obliterating_since_millis: Some(since_millis),
+            obliterating_since_millis: since_millis,
+            obliterating_scopes: scopes,
+        }
+    }
+
+    fn restamped(&self, since_millis: Option<i64>) -> Self {
+        Self {
+            obliterating_since_millis: since_millis,
+            ..self.clone()
         }
     }
 
@@ -274,6 +287,7 @@ impl FragmentStateEntry {
     fn is_same_as(&self, other: &Self) -> bool {
         self.state() == other.state()
             && self.obliterating_since_millis == other.obliterating_since_millis
+            && self.obliterating_scopes == other.obliterating_scopes
     }
 
     /// Whether this is an `Obliterating` mark whose holder has not renewed it within `lease`.
@@ -289,6 +303,35 @@ impl FragmentStateEntry {
             }
         }
     }
+
+    /// The recorded scopes, with `partition`/`context` added if absent.
+    fn scopes_with(&self, partition: Partition, context: Context) -> Vec<String> {
+        let scope = obliteration_scope(partition, context);
+        let mut scopes = self.obliterating_scopes.clone();
+        if !scopes.contains(&scope) {
+            scopes.push(scope);
+        }
+        scopes
+    }
+
+    /// The recorded scopes that parse; a malformed one is skipped.
+    fn parsed_scopes(&self) -> Vec<(Partition, Context)> {
+        self.obliterating_scopes
+            .iter()
+            .filter_map(|scope| parse_obliteration_scope(scope))
+            .collect()
+    }
+}
+
+fn obliteration_scope(partition: Partition, context: Context) -> String {
+    format!("{}_{}", hex_partition(partition), hex_context(context))
+}
+
+fn parse_obliteration_scope(scope: &str) -> Option<(Partition, Context)> {
+    let (partition, context) = scope.split_once('_')?;
+    let partition: [u8; 16] = hex::decode(partition).ok()?.try_into().ok()?;
+    let context: [u8; 16] = hex::decode(context).ok()?.try_into().ok()?;
+    Some((Partition::from(partition), Context::from(context)))
 }
 
 fn unix_millis_now() -> i64 {
@@ -996,55 +1039,56 @@ impl GcpImmutableStore {
     }
 
     /// Take the obliteration mark for `hash` from `current`, which is either `Stored` or a stale
-    /// mark. Returns the time the mark was taken, which identifies it to renewal and release.
+    /// mark, adding `partition`/`context` to the scopes it records. Returns the mark as written.
     async fn take_obliteration_mark(
         &self,
         hash: Hash,
         current: FragmentStateEntry,
-    ) -> Result<i64, StoreError> {
-        self.mark_obliterating(hash, current).await
+        partition: Partition,
+        context: Context,
+    ) -> Result<FragmentStateEntry, StoreError> {
+        let scopes = current.scopes_with(partition, context);
+        self.mark_obliterating(hash, current, scopes).await
     }
 
-    /// Replace `current` with an `Obliterating` mark stamped at the time of the write, returning
-    /// that timestamp.
+    /// Replace `current` with an `Obliterating` mark over `scopes`, stamped at the time of the
+    /// write. Returns the mark as written.
     async fn mark_obliterating(
         &self,
         hash: Hash,
         current: FragmentStateEntry,
-    ) -> Result<i64, StoreError> {
-        let written = self
-            .replace_state_with(hash, current, || {
-                FragmentStateEntry::obliterating(unix_millis_now())
-            })
-            .await?;
-        written
-            .obliterating_since_millis
-            .ok_or_else(|| StoreError::internal("obliteration mark written without a timestamp"))
+        scopes: Vec<String>,
+    ) -> Result<FragmentStateEntry, StoreError> {
+        self.replace_state_with(hash, current, move || {
+            FragmentStateEntry::obliterating(Some(unix_millis_now()), scopes.clone())
+        })
+        .await
     }
 
-    /// Run `work` while holding the obliteration mark for `hash`, renewing it every
-    /// `obliteration_lease_renewal`. `since` tracks the mark's current timestamp. Fails, dropping
-    /// `work` without polling it again, as soon as a renewal finds the mark no longer ours or the
-    /// mark has gone unrenewed for half the lease.
+    /// Run `work` while holding `held`, the obliteration mark for `hash`, renewing it every
+    /// `obliteration_lease_renewal` and keeping `held` current. Fails, dropping `work` without
+    /// polling it again, as soon as a renewal finds the mark no longer ours or the mark has gone
+    /// unrenewed for half the lease, renewal included.
     async fn hold_obliteration_mark<T>(
         &self,
         hash: Hash,
-        since: &mut i64,
+        held: &mut FragmentStateEntry,
         work: impl Future<Output = Result<T, StoreError>>,
     ) -> Result<T, StoreError> {
-        let held_since = AtomicI64::new(*since);
+        let held_since = AtomicI64::new(held.obliterating_since_millis.unwrap_or(0));
         let holder_limit =
             i64::try_from((self.obliteration_lease / 2).as_millis()).unwrap_or(i64::MAX);
-        let mut work = std::pin::pin!(work);
-        let overdue = |held: i64| {
-            let overdue = unix_millis_now().saturating_sub(held) > holder_limit;
-            if overdue {
-                warn!(%hash, held, "Obliteration mark went unrenewed too long; abandoning it");
+        let remaining = |since: i64| {
+            let left = holder_limit.saturating_sub(unix_millis_now().saturating_sub(since));
+            if left <= 0 {
+                warn!(%hash, since, "Obliteration mark went unrenewed too long; abandoning it");
+                return None;
             }
-            overdue
+            Some(Duration::from_millis(u64::try_from(left).unwrap_or(0)))
         };
+        let mut work = std::pin::pin!(work);
         let mut guarded_work = std::future::poll_fn(|cx| {
-            if overdue(held_since.load(AtomicOrdering::Relaxed)) {
+            if remaining(held_since.load(AtomicOrdering::Relaxed)).is_none() {
                 return std::task::Poll::Ready(Err(StoreError::from(SlowDown)));
             }
             work.as_mut().poll(cx)
@@ -1054,23 +1098,46 @@ impl GcpImmutableStore {
             tokio::select! {
                 biased;
                 () = tokio::time::sleep(self.obliteration_lease_renewal) => {
-                    let held = held_since.load(AtomicOrdering::Relaxed);
-                    if overdue(held) {
+                    let since = held_since.load(AtomicOrdering::Relaxed);
+                    let Some(left) = remaining(since) else {
                         break Err(StoreError::from(SlowDown));
-                    }
-                    match self.mark_obliterating(hash, FragmentStateEntry::obliterating(held)).await {
-                        Ok(renewed) => held_since.store(renewed, AtomicOrdering::Relaxed),
-                        Err(e) => {
+                    };
+                    let renewal = self.mark_obliterating(
+                        hash,
+                        held.restamped(Some(since)),
+                        held.obliterating_scopes.clone(),
+                    );
+                    match tokio::time::timeout(left, renewal).await {
+                        Ok(Ok(renewed)) => held_since.store(
+                            renewed.obliterating_since_millis.unwrap_or(0),
+                            AtomicOrdering::Relaxed,
+                        ),
+                        Ok(Err(e)) => {
                             warn!(%hash, "Lost the obliteration mark while renewing it: {e:?}");
                             break Err(e);
+                        }
+                        Err(_) => {
+                            warn!(%hash, "Renewing the obliteration mark outlasted the holder");
+                            break Err(StoreError::from(SlowDown));
                         }
                     }
                 }
                 result = &mut guarded_work => break result,
             }
         };
-        *since = held_since.load(AtomicOrdering::Relaxed);
+        *held = held.restamped(Some(held_since.load(AtomicOrdering::Relaxed)));
         result
+    }
+
+    /// Make `held` immediately stale, so the next obliteration of `hash` takes it over and
+    /// finishes its scopes. A mark that is no longer `held` is left alone.
+    async fn expire_obliteration_mark(&self, hash: Hash, held: &FragmentStateEntry) {
+        if let Err(e) = self
+            .replace_state(hash, held.clone(), held.restamped(None))
+            .await
+        {
+            warn!(%hash, "Failed to expire an abandoned obliteration mark: {e:?}");
+        }
     }
 
     /// Record, and make repairable, a hash that is still referenced but whose payload is gone.
@@ -1492,7 +1559,7 @@ impl GcpImmutableStore {
                 join_set,
                 async move {
                     self_clone
-                        .obliterate_address(partition, sub_address, stats, true)
+                        .obliterate(partition, sub_address, stats)
                         .await
                         .map_err(|e| (sub_address, e))
                 }
@@ -1525,138 +1592,6 @@ impl GcpImmutableStore {
                 "Failed to obliterate immutable {address}"
             ))),
         }
-    }
-
-    /// Obliterate one address. A sub-fragment that another obliteration holds fails with
-    /// `SlowDown`, so its parent keeps the reference list it would need to finish the job.
-    fn obliterate_address(
-        self: Arc<Self>,
-        partition: Partition,
-        address: Address,
-        stats: Arc<StoreObliterateStats>,
-        as_sub_fragment: bool,
-    ) -> futures::future::BoxFuture<'static, Result<(), StoreError>> {
-        async move {
-            timed!(self.latency_histogram, &self.labels_obliterate, {
-                let span = tracing::Span::current();
-
-                let Some(entry) = self
-                    .load_state_entry(address.hash)
-                    .instrument(span.clone())
-                    .await?
-                else {
-                    info!("No fragment state for {address}, nothing to obliterate");
-                    return Ok(());
-                };
-
-                match entry.state() {
-                    FragmentState::Stored => {}
-                    FragmentState::Obliterating
-                        if entry.is_stale_mark(unix_millis_now(), self.obliteration_lease) =>
-                    {
-                        warn!(
-                            obliterating_since_millis = ?entry.obliterating_since_millis,
-                            "Taking over a stale obliteration mark for {address}"
-                        );
-                    }
-                    FragmentState::Obliterating if as_sub_fragment => {
-                        info!(
-                            "Sub-fragment {address} is held by another obliteration; asking the caller \
-                             to retry"
-                        );
-                        return Err(StoreError::from(SlowDown));
-                    }
-                    FragmentState::Obliterating | FragmentState::Obliterated => {
-                        info!("Fragment {address} is already being, or has already been, obliterated");
-                        return Ok(());
-                    }
-                }
-
-                self.delete_association(partition, address)
-                    .instrument(span.clone())
-                    .await?;
-                stats
-                    .num_fragments
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                let mut since = self
-                    .take_obliteration_mark(address.hash, entry)
-                    .instrument(span.clone())
-                    .await?;
-
-                let work = {
-                    let store = self.clone();
-                    let stats = stats.clone();
-                    let span = span.clone();
-                    async move {
-                        store
-                            .delete_association(partition, address)
-                            .instrument(span.clone())
-                            .await?;
-
-                        tokio::time::sleep(store.obliteration_drain).await;
-
-                        if store
-                            .has_associations(address.hash)
-                            .instrument(span.clone())
-                            .await?
-                        {
-                            return Ok(ObliterationOutcome::StillReferenced);
-                        }
-
-                        store
-                            .clone()
-                            .obliterate_sub_fragments(partition, address, stats.clone())
-                            .instrument(span.clone())
-                            .await?;
-
-                        store
-                            .delete_payload(address.hash)
-                            .instrument(span.clone())
-                            .await?;
-
-                        stats
-                            .num_payloads
-                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-                        Ok(ObliterationOutcome::Obliterated)
-                    }
-                };
-
-                let outcome = self
-                    .hold_obliteration_mark(address.hash, &mut since, work)
-                    .await?;
-
-                let held = FragmentStateEntry::obliterating(since);
-                match outcome {
-                    ObliterationOutcome::StillReferenced => {
-                        info!("Fragment still associated, releasing the obliteration mark");
-                        self.replace_state(
-                            address.hash,
-                            held,
-                            FragmentStateEntry::new(FragmentState::Stored),
-                        )
-                        .instrument(span.clone())
-                        .await
-                        .inspect_err(|e| {
-                            warn!("Failed to release the obliteration mark: {e:?}");
-                        })
-                    }
-                    ObliterationOutcome::Obliterated => self
-                        .replace_state(
-                            address.hash,
-                            held,
-                            FragmentStateEntry::new(FragmentState::Obliterated),
-                        )
-                        .await
-                        .inspect_err(|e| {
-                            warn!("Failed to finalize obliterate for {address}: {e:?}");
-                        }),
-                }
-            })
-            .into()
-        }
-        .boxed()
     }
 
     async fn do_query_batch(
@@ -1938,8 +1873,136 @@ impl ImmutableStoreTrait for GcpImmutableStore {
         address: Address,
         stats: Arc<StoreObliterateStats>,
     ) -> Result<(), StoreError> {
-        self.obliterate_address(partition, address, stats, false)
-            .await
+        timed!(self.latency_histogram, &self.labels_obliterate, {
+            let span = tracing::Span::current();
+
+            let Some(entry) = self
+                .load_state_entry(address.hash)
+                .instrument(span.clone())
+                .await?
+            else {
+                info!("No fragment state for {address}, nothing to obliterate");
+                return Ok(());
+            };
+
+            match entry.state() {
+                FragmentState::Stored => {}
+                FragmentState::Obliterating
+                    if entry.is_stale_mark(unix_millis_now(), self.obliteration_lease) =>
+                {
+                    warn!(
+                        obliterating_since_millis = ?entry.obliterating_since_millis,
+                        scopes = ?entry.obliterating_scopes,
+                        "Taking over a stale obliteration mark for {address}"
+                    );
+                }
+                FragmentState::Obliterating => {
+                    info!("Fragment {address} is held by another obliteration; asking to retry");
+                    return Err(StoreError::from(SlowDown));
+                }
+                FragmentState::Obliterated => {
+                    info!("Fragment {address} has already been obliterated");
+                    return Ok(());
+                }
+            }
+
+            self.delete_association(partition, address)
+                .instrument(span.clone())
+                .await?;
+            stats
+                .num_fragments
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+            let mut held = self
+                .take_obliteration_mark(address.hash, entry, partition, address.context)
+                .instrument(span.clone())
+                .await?;
+            let scopes = held.parsed_scopes();
+
+            let work = {
+                let store = self.clone();
+                let stats = stats.clone();
+                let span = span.clone();
+                async move {
+                    for &(scope_partition, context) in &scopes {
+                        store
+                            .delete_association(
+                                scope_partition,
+                                Address {
+                                    hash: address.hash,
+                                    context,
+                                },
+                            )
+                            .instrument(span.clone())
+                            .await?;
+                    }
+
+                    tokio::time::sleep(store.obliteration_drain).await;
+
+                    if store
+                        .has_associations(address.hash)
+                        .instrument(span.clone())
+                        .await?
+                    {
+                        return Ok(ObliterationOutcome::StillReferenced);
+                    }
+
+                    for &(scope_partition, context) in &scopes {
+                        store
+                            .clone()
+                            .obliterate_sub_fragments(
+                                scope_partition,
+                                Address {
+                                    hash: address.hash,
+                                    context,
+                                },
+                                stats.clone(),
+                            )
+                            .instrument(span.clone())
+                            .await?;
+                    }
+
+                    store
+                        .delete_payload(address.hash)
+                        .instrument(span.clone())
+                        .await?;
+
+                    stats
+                        .num_payloads
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+                    Ok(ObliterationOutcome::Obliterated)
+                }
+            };
+
+            let outcome = match self
+                .hold_obliteration_mark(address.hash, &mut held, work)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    self.expire_obliteration_mark(address.hash, &held)
+                        .instrument(span.clone())
+                        .await;
+                    return Err(e);
+                }
+            };
+
+            let updated = match outcome {
+                ObliterationOutcome::StillReferenced => {
+                    info!("Fragment still associated, releasing the obliteration mark");
+                    FragmentState::Stored
+                }
+                ObliterationOutcome::Obliterated => FragmentState::Obliterated,
+            };
+            self.replace_state(address.hash, held, FragmentStateEntry::new(updated))
+                .instrument(span.clone())
+                .await
+                .inspect_err(|e| {
+                    warn!("Failed to move {address} out of its obliteration mark: {e:?}");
+                })
+        })
+        .into()
     }
 
     // Note: this is not atomic with a concurrent `obliterate` of the same source hash — see the
@@ -2058,7 +2121,7 @@ mod tests {
     #[test]
     fn a_mark_within_its_lease_is_not_stale() {
         let lease = Duration::from_secs(90);
-        let mark = FragmentStateEntry::obliterating(1_000_000);
+        let mark = FragmentStateEntry::obliterating(Some(1_000_000), Vec::new());
         assert!(!mark.is_stale_mark(1_000_000, lease));
         assert!(!mark.is_stale_mark(1_090_000, lease));
         assert!(!mark.is_stale_mark(900_000, lease));
@@ -2067,7 +2130,7 @@ mod tests {
     #[test]
     fn a_mark_past_its_lease_is_stale() {
         let lease = Duration::from_secs(90);
-        let mark = FragmentStateEntry::obliterating(1_000_000);
+        let mark = FragmentStateEntry::obliterating(Some(1_000_000), Vec::new());
         assert!(mark.is_stale_mark(1_090_001, lease));
     }
 
@@ -2075,6 +2138,29 @@ mod tests {
     fn a_mark_without_a_timestamp_is_stale() {
         let mark = FragmentStateEntry::new(FragmentState::Obliterating);
         assert!(mark.is_stale_mark(0, Duration::from_secs(90)));
+    }
+
+    #[test]
+    fn a_scope_round_trips_and_is_recorded_once() {
+        let partition = Partition::from([2u8; 16]);
+        let context = Context::from([3u8; 16]);
+        let other = Partition::from([4u8; 16]);
+        let mark = FragmentStateEntry::new(FragmentState::Stored);
+
+        let mark = FragmentStateEntry::obliterating(None, mark.scopes_with(partition, context));
+        let mark = FragmentStateEntry::obliterating(None, mark.scopes_with(other, context));
+        let mark = FragmentStateEntry::obliterating(None, mark.scopes_with(partition, context));
+
+        assert_eq!(
+            mark.parsed_scopes(),
+            vec![(partition, context), (other, context)]
+        );
+    }
+
+    #[test]
+    fn a_malformed_scope_is_skipped() {
+        let mark = FragmentStateEntry::obliterating(None, vec!["nonsense".to_owned()]);
+        assert!(mark.parsed_scopes().is_empty());
     }
 
     #[test]
@@ -2133,13 +2219,26 @@ mod emulator_tests {
         read_concurrency_limit: usize,
         firestore_timeout_millis: u64,
     ) -> GcpImmutableStore {
+        emulator_store_with_gcs(read_concurrency_limit, firestore_timeout_millis, None).await
+    }
+
+    /// `gcs_endpoint`, when given, is where every GCS call goes, and calls time out after 2 s.
+    async fn emulator_store_with_gcs(
+        read_concurrency_limit: usize,
+        firestore_timeout_millis: u64,
+        gcs_endpoint: Option<&str>,
+    ) -> GcpImmutableStore {
         let suffix = uuid::Uuid::new_v4().simple().to_string();
         let settings = GcpImmutableStoreSettings::new(
             GcsStoreSettings {
                 bucket: format!("lore-gcp-emulator-tests-{suffix}"),
-                endpoint: None,
+                endpoint: gcs_endpoint.map(str::to_owned),
                 slow_operation_threshold_millis: 2_000,
-                timeout_millis: 30_000,
+                timeout_millis: if gcs_endpoint.is_some() {
+                    2_000
+                } else {
+                    30_000
+                },
             },
             FirestoreImmutableStoreSettings {
                 firestore_project: PROJECT.to_owned(),
@@ -2154,7 +2253,7 @@ mod emulator_tests {
             false,
         );
 
-        let (storage, control) = crate::clients::build_storage_clients(None, None)
+        let (storage, control) = crate::clients::build_storage_clients(gcs_endpoint, gcs_endpoint)
             .await
             .expect("building GCS clients the emulator tests never call");
 
@@ -2407,13 +2506,23 @@ mod emulator_tests {
         Arc::new(emulator_store_with(64, 200).await)
     }
 
+    /// A short-drain store whose GCS calls all fail, so an obliteration that finds its hash
+    /// unreferenced fails at its first GCS call.
+    async fn failing_gcs_store() -> Arc<GcpImmutableStore> {
+        Arc::new(emulator_store_with_gcs(64, 200, Some("http://127.0.0.1:1")).await)
+    }
+
+    fn address_in(context: u8) -> Address {
+        Address {
+            hash: unique_hash(),
+            context: Context::from([context; 16]),
+        }
+    }
+
     /// A stored hash with an association in a partition other than the one obliterating it, so
     /// an obliteration that takes the mark finds it still referenced and releases it.
     async fn hash_referenced_elsewhere(store: &GcpImmutableStore) -> (Partition, Address) {
-        let address = Address {
-            hash: unique_hash(),
-            context: Context::from([6u8; 16]),
-        };
+        let address = address_in(6);
         let obliterating = Partition::from([21u8; 16]);
         let elsewhere = Partition::from([22u8; 16]);
 
@@ -2437,6 +2546,19 @@ mod emulator_tests {
             .unwrap();
     }
 
+    async fn take(store: &GcpImmutableStore, hash: Hash) -> FragmentStateEntry {
+        publish_retrying(store, hash).await.unwrap();
+        store
+            .take_obliteration_mark(
+                hash,
+                FragmentStateEntry::new(FragmentState::Stored),
+                Partition::from([1u8; 16]),
+                Context::from([1u8; 16]),
+            )
+            .await
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn obliterate_takes_over_a_stale_mark() {
         let store = short_drain_store().await;
@@ -2446,7 +2568,7 @@ mod emulator_tests {
         mark(
             &store,
             address.hash,
-            FragmentStateEntry::obliterating(stale_since),
+            FragmentStateEntry::obliterating(Some(stale_since), Vec::new()),
         )
         .await;
 
@@ -2488,23 +2610,57 @@ mod emulator_tests {
     }
 
     #[tokio::test]
-    async fn obliterate_leaves_a_fresh_mark_alone() {
+    async fn obliterate_asks_to_retry_under_a_fresh_mark_and_leaves_it_alone() {
         let store = short_drain_store().await;
         let (partition, address) = hash_referenced_elsewhere(&store).await;
-        let fresh = FragmentStateEntry::obliterating(unix_millis_now());
+        let fresh = FragmentStateEntry::obliterating(Some(unix_millis_now()), Vec::new());
         mark(&store, address.hash, fresh.clone()).await;
 
-        store
+        let result = store
             .clone()
             .obliterate(partition, address, Arc::default())
-            .await
-            .unwrap();
+            .await;
 
+        assert!(result.unwrap_err().is_slow_down());
         assert_eq!(
             store.load_state_entry(address.hash).await.unwrap(),
             Some(fresh)
         );
         assert!(store.exists(partition, address).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_failed_obliteration_expires_its_mark_and_a_takeover_keeps_its_scope() {
+        let store = failing_gcs_store().await;
+        let address = address_in(7);
+        let first = Partition::from([31u8; 16]);
+        let second = Partition::from([32u8; 16]);
+        publish_retrying(&store, address.hash).await.unwrap();
+        store.associate_fragment(first, address).await.unwrap();
+
+        let failed = store
+            .clone()
+            .obliterate(first, address, Arc::default())
+            .await;
+
+        assert!(failed.is_err());
+        let after_first = store.load_state_entry(address.hash).await.unwrap().unwrap();
+        assert_eq!(after_first.state(), FragmentState::Obliterating);
+        assert_eq!(after_first.obliterating_since_millis, None);
+        assert_eq!(after_first.parsed_scopes(), vec![(first, address.context)]);
+
+        let retried = store
+            .clone()
+            .obliterate(second, address, Arc::default())
+            .await;
+
+        assert!(retried.is_err());
+        let after_second = store.load_state_entry(address.hash).await.unwrap().unwrap();
+        assert_eq!(after_second.obliterating_since_millis, None);
+        assert_eq!(
+            after_second.parsed_scopes(),
+            vec![(first, address.context), (second, address.context)]
+        );
     }
 
     #[tokio::test]
@@ -2514,10 +2670,12 @@ mod emulator_tests {
         publish_retrying(&store, hash).await.unwrap();
         let stale = FragmentStateEntry::new(FragmentState::Obliterating);
         mark(&store, hash, stale.clone()).await;
+        let partition = Partition::from([1u8; 16]);
+        let context = Context::from([1u8; 16]);
 
         let (first, second) = tokio::join!(
-            store.take_obliteration_mark(hash, stale.clone()),
-            store.take_obliteration_mark(hash, stale),
+            store.take_obliteration_mark(hash, stale.clone(), partition, context),
+            store.take_obliteration_mark(hash, stale, partition, context),
         );
 
         assert!(first.is_ok() != second.is_ok());
@@ -2528,26 +2686,20 @@ mod emulator_tests {
         let mut store = emulator_store().await;
         store.obliteration_lease_renewal = Duration::from_millis(100);
         let hash = unique_hash();
-        publish_retrying(&store, hash).await.unwrap();
-        let taken = store
-            .take_obliteration_mark(hash, FragmentStateEntry::new(FragmentState::Stored))
-            .await
-            .unwrap();
+        let taken = take(&store, hash).await;
 
-        let mut since = taken;
+        let mut held = taken.clone();
         store
-            .hold_obliteration_mark(hash, &mut since, async {
+            .hold_obliteration_mark(hash, &mut held, async {
                 tokio::time::sleep(Duration::from_millis(550)).await;
                 Ok(())
             })
             .await
             .unwrap();
 
-        assert!(since > taken);
-        assert_eq!(
-            store.load_state_entry(hash).await.unwrap(),
-            Some(FragmentStateEntry::obliterating(since))
-        );
+        assert!(held.obliterating_since_millis > taken.obliterating_since_millis);
+        assert_eq!(held.obliterating_scopes, taken.obliterating_scopes);
+        assert_eq!(store.load_state_entry(hash).await.unwrap(), Some(held));
     }
 
     #[tokio::test]
@@ -2555,47 +2707,24 @@ mod emulator_tests {
         let mut store = emulator_store().await;
         store.obliteration_lease_renewal = Duration::from_millis(100);
         let hash = unique_hash();
-        publish_retrying(&store, hash).await.unwrap();
-        let mut since = store
-            .take_obliteration_mark(hash, FragmentStateEntry::new(FragmentState::Stored))
-            .await
-            .unwrap();
+        let mut held = take(&store, hash).await;
         store
             .replace_state(
                 hash,
-                FragmentStateEntry::obliterating(since),
-                FragmentStateEntry::obliterating(since + 1),
+                held.clone(),
+                held.restamped(held.obliterating_since_millis.map(|since| since + 1)),
             )
             .await
             .unwrap();
 
-        let held = tokio::time::timeout(
+        let result = tokio::time::timeout(
             Duration::from_secs(10),
-            store.hold_obliteration_mark(hash, &mut since, std::future::pending::<Result<(), _>>()),
+            store.hold_obliteration_mark(hash, &mut held, std::future::pending::<Result<(), _>>()),
         )
         .await
         .expect("a lost mark ends the hold");
 
-        assert!(held.is_err());
-    }
-
-    #[tokio::test]
-    async fn a_sub_fragment_held_by_another_obliteration_fails_its_parent() {
-        let store = short_drain_store().await;
-        let (partition, address) = hash_referenced_elsewhere(&store).await;
-        let fresh = FragmentStateEntry::obliterating(unix_millis_now());
-        mark(&store, address.hash, fresh.clone()).await;
-
-        let result = store
-            .clone()
-            .obliterate_address(partition, address, Arc::default(), true)
-            .await;
-
-        assert!(result.unwrap_err().is_slow_down());
-        assert_eq!(
-            store.load_state_entry(address.hash).await.unwrap(),
-            Some(fresh)
-        );
+        assert!(result.is_err());
     }
 
     #[tokio::test]
@@ -2604,22 +2733,18 @@ mod emulator_tests {
         store.obliteration_lease = Duration::from_millis(200);
         store.obliteration_lease_renewal = Duration::from_secs(60);
         let hash = unique_hash();
-        publish_retrying(&store, hash).await.unwrap();
-        let mut since = store
-            .take_obliteration_mark(hash, FragmentStateEntry::new(FragmentState::Stored))
-            .await
-            .unwrap();
+        let mut held = take(&store, hash).await;
         let resumed = AtomicUsize::new(0);
 
-        let held = store
-            .hold_obliteration_mark(hash, &mut since, async {
+        let result = store
+            .hold_obliteration_mark(hash, &mut held, async {
                 tokio::time::sleep(Duration::from_millis(300)).await;
                 resumed.fetch_add(1, AtomicOrdering::SeqCst);
                 Ok(())
             })
             .await;
 
-        assert!(held.unwrap_err().is_slow_down());
+        assert!(result.unwrap_err().is_slow_down());
         assert_eq!(resumed.load(AtomicOrdering::SeqCst), 0);
     }
 
@@ -2629,22 +2754,42 @@ mod emulator_tests {
         store.obliteration_lease = Duration::from_millis(200);
         store.obliteration_lease_renewal = Duration::from_millis(150);
         let hash = unique_hash();
-        publish_retrying(&store, hash).await.unwrap();
-        let taken = store
-            .take_obliteration_mark(hash, FragmentStateEntry::new(FragmentState::Stored))
+        let taken = take(&store, hash).await;
+
+        let mut held = taken.clone();
+        let result = store
+            .hold_obliteration_mark(hash, &mut held, std::future::pending::<Result<(), _>>())
+            .await;
+
+        assert!(result.unwrap_err().is_slow_down());
+        assert_eq!(held, taken);
+        assert_eq!(store.load_state_entry(hash).await.unwrap(), Some(taken));
+    }
+
+    #[tokio::test]
+    async fn a_renewal_that_cannot_finish_within_the_holder_deadline_gives_up() {
+        let mut store = emulator_store().await;
+        store.obliteration_lease = Duration::from_millis(400);
+        store.obliteration_lease_renewal = Duration::from_millis(100);
+        let hash = unique_hash();
+        let taken = take(&store, hash).await;
+        let permits = store
+            .firestore_write_semaphore
+            .clone()
+            .acquire_many_owned(32)
             .await
             .unwrap();
 
-        let mut since = taken;
-        let held = store
-            .hold_obliteration_mark(hash, &mut since, std::future::pending::<Result<(), _>>())
-            .await;
+        let mut held = taken.clone();
+        let result = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.hold_obliteration_mark(hash, &mut held, std::future::pending::<Result<(), _>>()),
+        )
+        .await
+        .expect("the renewal is bounded by the holder deadline");
+        drop(permits);
 
-        assert!(held.unwrap_err().is_slow_down());
-        assert_eq!(since, taken);
-        assert_eq!(
-            store.load_state_entry(hash).await.unwrap(),
-            Some(FragmentStateEntry::obliterating(taken))
-        );
+        assert!(result.unwrap_err().is_slow_down());
+        assert_eq!(store.load_state_entry(hash).await.unwrap(), Some(taken));
     }
 }
