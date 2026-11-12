@@ -344,6 +344,35 @@ def test_link_merge_all_checks_a_linked_file_at_the_mount(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_link_merge_all_checks_a_linked_file_at_the_mount_when_only_the_source_changed(
+    new_lore_repo,
+):
+    """A branch that only adds to its base merges a changed linked file whose path the parent
+    also holds a file of its own at."""
+    link_path = "goals-connectors"
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"BUILD.bazel": "linked build file, base\n"},
+        {"BUILD.bazel": "parent build file, which is longer than the linked one\n"},
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Change the linked build file",
+        {f"{link_path}/BUILD.bazel": "linked build file, changed on feature-branch\n"},
+    )
+    urc.branch_switch("main")
+
+    urc.branch_merge_start("feature-branch", message="Merge the linked build file")
+
+    with urc.open_file(f"{link_path}/BUILD.bazel", "r") as f:
+        assert f.read() == "linked build file, changed on feature-branch\n"
+    with urc.open_file("BUILD.bazel", "r") as f:
+        assert f.read() == "parent build file, which is longer than the linked one\n"
+
+
+@pytest.mark.smoke
 def test_link_merge_all_refuses_a_local_change_in_a_link_exposing_a_subtree(
     new_lore_repo,
 ):
