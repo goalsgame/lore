@@ -94,6 +94,33 @@ def test_link_merge_all_merges_separate_edits_to_a_linked_file(
 
 
 @pytest.mark.smoke
+def test_link_merge_all_leaves_separate_edits_to_a_linked_file_that_is_not_text_in_conflict(
+    new_lore_repo,
+):
+    """Separate edits to a linked file whose current content is not text are left a conflict,
+    as the working-tree merge refuses it."""
+    urc, _link_repo, _link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "config.yaml",
+                "base": SEPARATE_EDITS["base"],
+                "mine": SEPARATE_EDITS["mine"]
+                .replace("main", "m\u00e9ain")
+                .encode("latin-1"),
+                "theirs": SEPARATE_EDITS["theirs"],
+            }
+        ],
+    )
+
+    urc.branch_merge_start("feature-branch", message="Merge separate edits")
+
+    assert (
+        urc.revision_info(check=True, no_pager=True).message == "Main branch changes"
+    ), "A merge the working tree could not make was committed"
+
+
+@pytest.mark.smoke
 def test_link_merge_all_leaves_separate_edits_outside_the_exposed_subtree_in_conflict(
     new_lore_repo,
 ):
@@ -135,13 +162,16 @@ def test_link_merge_all_leaves_separate_edits_outside_the_exposed_subtree_in_con
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("source_path", ["/", "content/assets"])
 @pytest.mark.parametrize("scoped", [False, True])
 def test_link_merge_abort_restores_separate_edits_merged_into_a_linked_file(
-    new_lore_repo, scoped
+    new_lore_repo, scoped, source_path
 ):
     """Aborting a merge restores a linked file it merged as text."""
     urc, _link_repo, link_path = setup_link_merge_conflict(
-        new_lore_repo, files=[{"path": "config.yaml", **SEPARATE_EDITS}]
+        new_lore_repo,
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
+        source_path=source_path,
     )
 
     link = link_path if scoped else None

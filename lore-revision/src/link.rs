@@ -1220,11 +1220,14 @@ pub async fn drain_link_tracker(
 ///
 /// `link_path` is the link's mount path in the parent repository. Paths
 /// are mount-prefixed under it, which is how the parent's filesystem
-/// operation names them.
+/// operation names them. `source_path` is the subtree of the linked
+/// repository the link exposes, which `paths` are relative to; they are
+/// looked up in `link_state` below it.
 pub async fn restore_link_paths_from_state(
     repository: Arc<RepositoryContext>,
     link_context: Arc<RepositoryContext>,
     link_path: RelativePath,
+    source_path: &RelativePath,
     link_state: Arc<State>,
     paths: &[RelativePath],
 ) -> Result<(), LinkError> {
@@ -1237,8 +1240,13 @@ pub async fn restore_link_paths_from_state(
             let mount_path = link_path.join(link_relative.as_str());
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
 
+            let state_path = if source_path.is_empty() {
+                link_relative.clone()
+            } else {
+                source_path.join(link_relative.as_str())
+            };
             let node_link = link_state
-                .find_node_link(link_context.clone(), link_relative.as_str())
+                .find_node_link(link_context.clone(), state_path.as_str())
                 .await
                 .forward::<LinkError>("Failed resolving link node")?;
             if !node_link.is_valid_or_root() {

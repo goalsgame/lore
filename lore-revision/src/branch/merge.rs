@@ -2902,18 +2902,22 @@ async fn link_merged_files(
     .await
 }
 
-/// Writes `paths` at the link's mount back to what the link held at `base_signature`, and
-/// removes their merge sidecars.
+/// Writes `paths`, relative to the subtree `link_node` exposes, at the link's mount back to what
+/// the link held at `base_signature`, and removes their merge sidecars.
 async fn restore_link_merged_files(
     repository: &Arc<RepositoryContext>,
     link_context: &Arc<RepositoryContext>,
     link_path: &RelativePath,
+    link_node: &Node,
     base_signature: Hash,
     paths: &[RelativePath],
 ) -> Result<(), MergeError> {
     if paths.is_empty() {
         return Ok(());
     }
+    let source_path = link::pinned_source_path(link_context.clone(), link_node)
+        .await
+        .forward::<MergeError>("resolving the path a link exposes")?;
     let base_link_state = state::State::deserialize(link_context.clone(), base_signature)
         .await
         .forward::<MergeError>("deserializing base link state")?;
@@ -2921,6 +2925,7 @@ async fn restore_link_merged_files(
         repository.clone(),
         link_context.clone(),
         link_path.clone(),
+        &source_path,
         base_link_state,
         paths,
     )
@@ -3030,6 +3035,7 @@ pub async fn branch_merge_abort(
                 &repository,
                 &r.link_context,
                 &r.link_path_rel,
+                &r.link_node,
                 entry.base.signature,
                 &merged_paths,
             )
@@ -3133,6 +3139,7 @@ async fn merge_abort_link(
         &repository,
         &link_context,
         &link_path_rel,
+        &link_node,
         entry.base.signature,
         &merged_paths,
     )
