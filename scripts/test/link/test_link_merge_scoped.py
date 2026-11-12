@@ -3,7 +3,13 @@
 import re
 
 import pytest
-from link_helpers import link_pin, make_parent_with_link, setup_link_merge_conflict
+from link_helpers import (
+    SEPARATE_EDITS,
+    SEPARATE_EDITS_MERGED,
+    link_pin,
+    make_parent_with_link,
+    setup_link_merge_conflict,
+)
 
 
 @pytest.mark.smoke
@@ -416,6 +422,29 @@ def test_link_merge_file_conflict_resolve(new_lore_repo):
     assert "manually resolved content" in content, (
         f"File should have manually resolved content - Got: {content}"
     )
+
+
+@pytest.mark.smoke
+def test_link_merge_merges_separate_edits_to_a_linked_file(new_lore_repo):
+    """A --link merge merges edits to different lines of the same file as text."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
+    )
+
+    urc.branch_merge_start(
+        "feature-branch", link=link_path, message="Merge separate edits"
+    )
+
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS_MERGED
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
+
+    urc.push()
+    status = urc.status()
+    assert "local branch in sync with remote" in status.lower(), status
 
 
 @pytest.mark.smoke

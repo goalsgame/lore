@@ -4,6 +4,8 @@
 import pytest
 from error_types import ImproperArgumentsError, LocalChanges
 from link_helpers import (
+    SEPARATE_EDITS,
+    SEPARATE_EDITS_MERGED,
     link_pin,
     make_parent_with_link,
     make_repo,
@@ -60,6 +62,130 @@ def test_link_merge_all_conflict_in_a_link_exposing_a_subtree(new_lore_repo):
 
     with urc.open_file(conflict_file, "r") as f:
         assert "resolved through the mount" in f.read()
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("source_path", ["/", "content/assets"])
+def test_link_merge_all_merges_separate_edits_to_a_linked_file(
+    new_lore_repo, source_path
+):
+    """Edits to different lines of the same linked file merge as text, with no conflict."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
+        source_path=source_path,
+    )
+
+    urc.branch_merge_start("feature-branch", message="Merge separate edits")
+
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS_MERGED
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
+
+    info = urc.revision_info(check=True, no_pager=True)
+    assert info.message == "Merge separate edits", "The merge was not committed"
+    assert info.merge, "The parent's merge revision does not record the merged branch"
+
+    urc.push()
+    status = urc.status()
+    assert "local branch in sync with remote" in status.lower(), status
+
+
+@pytest.mark.smoke
+def test_link_merge_all_leaves_separate_edits_to_a_linked_file_that_is_not_text_in_conflict(
+    new_lore_repo,
+):
+    """Separate edits to a linked file whose current content is not text are left a conflict,
+    as the working-tree merge refuses it."""
+    urc, _link_repo, _link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[
+            {
+                "path": "config.yaml",
+                "base": SEPARATE_EDITS["base"],
+                "mine": SEPARATE_EDITS["mine"]
+                .replace("main", "m\u00e9ain")
+                .encode("latin-1"),
+                "theirs": SEPARATE_EDITS["theirs"],
+            }
+        ],
+    )
+
+    urc.branch_merge_start("feature-branch", message="Merge separate edits")
+
+    assert (
+        urc.revision_info(check=True, no_pager=True).message == "Main branch changes"
+    ), "A merge the working tree could not make was committed"
+
+
+@pytest.mark.smoke
+def test_link_merge_all_leaves_separate_edits_outside_the_exposed_subtree_in_conflict(
+    new_lore_repo,
+):
+    """Edits to different lines of a linked file the link does not expose are left a conflict,
+    as nothing on disk holds the file to merge them into."""
+    link_path = "linked/repo"
+    urc, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"content/exposed.txt": "exposed\n", "outside.yaml": SEPARATE_EDITS["base"]},
+        {"main-file.txt": "main repo content\n"},
+        source_path="content",
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Feature change through the mount", {f"{link_path}/exposed.txt": "feature\n"}
+    )
+    link_repo.sync()
+    link_repo.branch_switch("feature-branch")
+    link_repo.write_commit_push(
+        "Feature change outside", {"outside.yaml": SEPARATE_EDITS["theirs"]}
+    )
+
+    link_repo.branch_switch("main")
+    link_repo.write_commit_push(
+        "Main change outside", {"outside.yaml": SEPARATE_EDITS["mine"]}
+    )
+    urc.branch_switch("main")
+    urc.link_update(link_path)
+    urc.commit("Repin the link", non_interactive=True)
+    urc.push()
+
+    urc.branch_merge_start("feature-branch", message="Merge outside edits")
+
+    assert urc.revision_info(check=True, no_pager=True).message == "Repin the link", (
+        "A merge that could not write the merged file was committed"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("source_path", ["/", "content/assets"])
+@pytest.mark.parametrize("scoped", [False, True])
+def test_link_merge_abort_restores_separate_edits_merged_into_a_linked_file(
+    new_lore_repo, scoped, source_path
+):
+    """Aborting a merge restores a linked file it merged as text."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
+        source_path=source_path,
+    )
+
+    link = link_path if scoped else None
+    urc.branch_merge_start("feature-branch", link=link, no_commit=True)
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS_MERGED
+
+    urc.branch_merge_abort(link=link)
+
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS["mine"], "The abort left the merged file"
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
 
 
 @pytest.mark.smoke
@@ -215,6 +341,35 @@ def test_link_merge_all_checks_a_linked_file_at_the_mount(new_lore_repo):
         assert f.read() == "parent build file, which is longer than the linked one\n", (
             "The parent's own file must be left alone"
         )
+
+
+@pytest.mark.smoke
+def test_link_merge_all_checks_a_linked_file_at_the_mount_when_only_the_source_changed(
+    new_lore_repo,
+):
+    """A branch that only adds to its base merges a changed linked file whose path the parent
+    also holds a file of its own at."""
+    link_path = "goals-connectors"
+    urc, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_path,
+        {"BUILD.bazel": "linked build file, base\n"},
+        {"BUILD.bazel": "parent build file, which is longer than the linked one\n"},
+    )
+
+    urc.branch_create("feature-branch")
+    urc.write_commit_push(
+        "Change the linked build file",
+        {f"{link_path}/BUILD.bazel": "linked build file, changed on feature-branch\n"},
+    )
+    urc.branch_switch("main")
+
+    urc.branch_merge_start("feature-branch", message="Merge the linked build file")
+
+    with urc.open_file(f"{link_path}/BUILD.bazel", "r") as f:
+        assert f.read() == "linked build file, changed on feature-branch\n"
+    with urc.open_file("BUILD.bazel", "r") as f:
+        assert f.read() == "parent build file, which is longer than the linked one\n"
 
 
 @pytest.mark.smoke

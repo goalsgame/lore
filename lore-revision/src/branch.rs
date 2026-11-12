@@ -2776,8 +2776,9 @@ fn emit_diff_item_with_auto_resolve(
 
 /// Realises the three sides of one conflict into temp files and runs
 /// `merge3_text_by_pathbuf`. Returns `Some(resolved_change)` only when
-/// the merge produces no conflict markers — any merge failure or any
-/// markers in the output preserve the conflict (returns `None`).
+/// theirs and mine are text and the merge produces no conflict markers —
+/// any merge failure or any markers in the output preserve the conflict
+/// (returns `None`).
 #[lore_macro::test_pub]
 async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
@@ -2925,6 +2926,19 @@ async fn try_auto_resolve_conflict(
         let _ = lore_io::IoDriver::global()
             .write_file_bytes(&mine_path, bytes::Bytes::new(), false)
             .await;
+    }
+
+    // Must agree with the working-tree merge, which refuses a mine that is not text.
+    if change_to.to.mapping.node.is_valid_node_id()
+        && !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&mine_path))
+            .await
+            .unwrap_or(false)
+    {
+        lore_trace!("Change to mine is not diffable and cannot be auto resolved, continue");
+        let _ = util::fs::unlink(base_path).await;
+        let _ = util::fs::unlink(theirs_path).await;
+        let _ = util::fs::unlink(mine_path).await;
+        return Ok(None);
     }
 
     let resolved = match crate::merge::merge3_text_by_pathbuf(
