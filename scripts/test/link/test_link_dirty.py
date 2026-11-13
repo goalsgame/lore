@@ -280,3 +280,18 @@ def test_link_status_scan_of_an_uncommitted_link_matches_a_whole_tree_scan(
     whole = _scan_actions(_parent_with_staged_link(new_lore_repo))
     assert whole.pop(DEFAULT_LINK_MOUNT, None) == "add"
     assert scoped == whole, f"Scoped scan {scoped} differs from whole-tree scan {whole}"
+
+
+def test_link_status_scan_of_a_mount_replaced_by_a_file_matches_a_whole_tree_scan(
+    new_lore_repo,
+):
+    results = []
+    for path in (DEFAULT_LINK_MOUNT, None):
+        parent_repo, _link_repo = make_parent_with_link(
+            new_lore_repo, link_files={"linked.txt": "linked\n"}
+        )
+        parent_repo.rmtree(DEFAULT_LINK_MOUNT)
+        parent_repo.write_files({DEFAULT_LINK_MOUNT: "now a file\n"})
+        results.append(_scan_actions(parent_repo, path))
+    scoped, whole = results
+    assert scoped == whole, f"Scoped scan {scoped} differs from whole-tree scan {whole}"

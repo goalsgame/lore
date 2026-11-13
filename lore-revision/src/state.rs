@@ -6516,11 +6516,11 @@ pub(crate) async fn diff_filesystem_queuing(
         .resolve(repository_current.clone(), state_current.clone())
         .await?;
 
-    // A mount missing from disk stays the link node, which keeps the link whole.
+    // A mount that is not a directory on disk stays the link node, which keeps the link whole.
     let mount_on_disk = operation
         .file_info(&path)
         .await
-        .is_ok_and(|info| info.exists());
+        .is_ok_and(|info| info.is_dir());
     let (link_from, link_current) = if mount_on_disk {
         (
             link_at(&repository_from, &state_from, node_link_from.node).await?,
