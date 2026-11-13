@@ -9,6 +9,8 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -3148,59 +3150,92 @@ async fn load_stack(
 }
 
 /// Extends `stack` with the stacks of the branches it ends in, until it reaches
-/// a branch with no recorded parent or one already in the stack. Each step
-/// first completes the ancestor's own stack the same way, then keeps only the
-/// points the last entry's revision descends from (see [`inherited_stack`]),
-/// and stops where that revision's branch cannot be read.
+/// a branch with no recorded parent or one already in the stack. Each step uses
+/// the ancestor's own completed stack, keeping only the points the last entry's
+/// revision descends from (see [`inherited_stack`]), and stops where that
+/// revision's branch cannot be read.
 async fn complete_stack(
     repository: Arc<RepositoryContext>,
     stack: Vec<BranchPoint>,
 ) -> Vec<BranchPoint> {
-    complete_stack_within(repository, stack, MAX_STACK_COMPLETION_DEPTH).await
+    let mut completion = StackCompletion {
+        repository,
+        completed: HashMap::new(),
+        expanding: HashSet::new(),
+        budget: STACK_COMPLETION_BUDGET,
+    };
+    let stack = completion.extend(stack).await;
+    if completion.budget == 0 {
+        lore_warn!("Stopped completing branch stacks after {STACK_COMPLETION_BUDGET} branches");
+    }
+    stack
 }
 
-/// How many ancestors deep [`complete_stack`] reconstructs stacks, which also
-/// bounds a cycle in recorded stacks.
-const MAX_STACK_COMPLETION_DEPTH: usize = 32;
+/// How many branches one [`complete_stack`] completes the stack of.
+const STACK_COMPLETION_BUDGET: usize = 4096;
 
-fn complete_stack_within(
+/// One [`complete_stack`] traversal: each branch's stack is completed at most
+/// once, and a branch already being completed is read as recorded, which ends
+/// a cycle in recorded stacks.
+struct StackCompletion {
     repository: Arc<RepositoryContext>,
-    mut stack: Vec<BranchPoint>,
-    depth: usize,
-) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send>> {
-    Box::pin(async move {
-        if depth == 0 {
-            return stack;
-        }
-        while let Some(last) = stack.last().cloned() {
-            let Ok(recorded) =
-                crate::revision::recorded_branch(repository.clone(), last.revision).await
-            else {
-                break;
-            };
-            let parent_stack = complete_stack_within(
-                repository.clone(),
-                load_stack(repository.clone(), last.branch, "ancestor").await,
-                depth - 1,
-            )
-            .await;
-            let inherited = inherited_stack(last.branch, last.revision, recorded, &parent_stack);
-            let len = stack.len();
-            for point in inherited {
-                if point.branch == last.branch {
-                    continue;
+    completed: HashMap<BranchId, Vec<BranchPoint>>,
+    expanding: HashSet<BranchId>,
+    budget: usize,
+}
+
+impl StackCompletion {
+    fn extend<'a>(
+        &'a mut self,
+        mut stack: Vec<BranchPoint>,
+    ) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send + 'a>> {
+        Box::pin(async move {
+            while let Some(last) = stack.last().cloned() {
+                let Ok(recorded) =
+                    crate::revision::recorded_branch(self.repository.clone(), last.revision).await
+                else {
+                    break;
+                };
+                let parent_stack = self.completed_stack(last.branch).await;
+                let inherited =
+                    inherited_stack(last.branch, last.revision, recorded, &parent_stack);
+                let len = stack.len();
+                for point in inherited {
+                    if point.branch == last.branch {
+                        continue;
+                    }
+                    if stack.iter().any(|known| known.branch == point.branch) {
+                        break;
+                    }
+                    stack.push(point);
                 }
-                if stack.iter().any(|known| known.branch == point.branch) {
+                if stack.len() == len {
                     break;
                 }
-                stack.push(point);
             }
-            if stack.len() == len {
-                break;
+            stack
+        })
+    }
+
+    fn completed_stack<'a>(
+        &'a mut self,
+        branch: BranchId,
+    ) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(stack) = self.completed.get(&branch) {
+                return stack.clone();
             }
-        }
-        stack
-    })
+            let recorded = load_stack(self.repository.clone(), branch, "ancestor").await;
+            if self.budget == 0 || !self.expanding.insert(branch) {
+                return recorded;
+            }
+            self.budget -= 1;
+            let stack = self.extend(recorded).await;
+            self.expanding.remove(&branch);
+            self.completed.insert(branch, stack.clone());
+            stack
+        })
+    }
 }
 
 /// The branch points a branch created from `branch` at `revision` inherits from

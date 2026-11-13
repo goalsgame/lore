@@ -891,31 +891,25 @@ async fn chain_of_short_stacks_without_commits_reaches_the_default_branch() {
 
         let (main_branch, branch_point) = create_test_main(repository_context.clone()).await;
 
-        // A, B and C each name only their parent, and none has a commit of its
-        // own: every branch point is main's revision.
-        let branch_a = create_shared_branch(
-            repository_context.clone(),
-            "branch_a",
-            vec![BranchPoint {
-                branch: main_branch,
-                revision: branch_point,
-            }],
-        )
-        .await;
-        let branch_b = create_shared_branch(
-            repository_context.clone(),
-            "branch_b",
-            vec![BranchPoint {
-                branch: branch_a,
-                revision: branch_point,
-            }],
-        )
-        .await;
+        // Forty branches, each naming only its parent and none with a commit of
+        // its own: every branch point is main's revision.
+        let mut parent = main_branch;
+        for i in 0..40 {
+            parent = create_shared_branch(
+                repository_context.clone(),
+                &format!("chain_{i}"),
+                vec![BranchPoint {
+                    branch: parent,
+                    revision: branch_point,
+                }],
+            )
+            .await;
+        }
         let branch_c = create_branch(
             repository_context.clone(),
             "branch_c",
             vec![BranchPoint {
-                branch: branch_b,
+                branch: parent,
                 revision: branch_point,
             }],
         )
