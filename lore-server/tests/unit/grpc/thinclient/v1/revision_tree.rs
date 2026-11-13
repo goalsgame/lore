@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model_v1;
@@ -21,9 +22,11 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
+use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
 use lore_server::authnz::repository_authorizer::RepositoryAuthorizer;
+use lore_server::authnz::repository_authorizer::VerifiedToken;
 use lore_server::authnz::resource_grants_authorizer::ResourceGrantsAuthorizer;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
@@ -41,6 +44,21 @@ use crate::store::test_support::test_store_create;
 
 fn allow_all() -> Arc<dyn RepositoryAuthorizer> {
     Arc::new(AllowAllRepositoryAuthorizer)
+}
+
+/// Grants everything, but only online: every in-memory question needs I/O.
+struct OnlineOnly;
+
+#[async_trait]
+impl RepositoryAuthorizer for OnlineOnly {
+    async fn check_repository_access(
+        &self,
+        _token: Option<&VerifiedToken<'_>>,
+        _repository_id: RepositoryId,
+        _action: Action,
+    ) -> Result<(), Status> {
+        Ok(())
+    }
 }
 
 /// A Tier 2 deployment reading the legacy `resources` claim shape, so
@@ -769,6 +787,53 @@ async fn path_prefix_at_subdirectory_emits_descendants() {
         assert!(
             !paths.contains(&"top.txt"),
             "top.txt should be filtered out, got {paths:?}",
+        );
+    }))
+    .await;
+}
+
+#[tokio::test]
+async fn path_prefix_in_own_repository_needs_no_link_read() {
+    let repository = random::<RepositoryId>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("test stores");
+
+    Box::pin(LORE_CONTEXT.scope(execution, async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository,
+        ));
+        let (_branch, signature) = push_branch_with_subdir(&repository_context).await;
+
+        let response = handler(
+            make_request(
+                repository,
+                Query::Signature(signature.into()),
+                Some("subdir".into()),
+                None,
+            ),
+            immutable_store,
+            mutable_store,
+            Arc::new(OnlineOnly),
+            DEFAULT_HISTORY_STEP_SIZE,
+            RevisionListAcceleration::default(),
+        )
+        .await
+        .expect("handler ok");
+
+        let paths: Vec<String> = collect(response)
+            .await
+            .into_iter()
+            .map(|r| r.expect("stream item"))
+            .filter_map(|item| match item.payload {
+                Some(Payload::Node(n)) => Some(n.path),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            paths.iter().any(|p| p == "subdir/inner.txt"),
+            "expected subdir/inner.txt in {paths:?}",
         );
     }))
     .await;
