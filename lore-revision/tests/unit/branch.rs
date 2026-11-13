@@ -1166,3 +1166,37 @@ async fn each_relayed_diff_item_is_held_once() {
     }))
     .await;
 }
+
+fn point(branch: u8, rev: u8) -> BranchPoint {
+    BranchPoint {
+        branch: branch_id(branch),
+        revision: revision(rev),
+    }
+}
+
+#[test]
+fn inherited_stack_keeps_only_points_the_revision_descends_from() {
+    // A forked from main at m3; main forked from trunk at t1.
+    let stack_of_a = [point(1, 3), point(9, 1)];
+    let a = branch_id(2);
+
+    assert_eq!(
+        inherited_stack(a, revision(7), a, &stack_of_a),
+        stack_of_a.to_vec(),
+        "a revision on A descends from all of A's fork points"
+    );
+    assert_eq!(
+        inherited_stack(a, revision(1), branch_id(1), &stack_of_a),
+        vec![point(1, 1), point(9, 1)],
+        "a revision on main from before A forked forks from main there, not at m3"
+    );
+    assert_eq!(
+        inherited_stack(a, revision(5), branch_id(9), &stack_of_a),
+        vec![point(9, 5)],
+        "a revision on trunk keeps only trunk"
+    );
+    assert!(
+        inherited_stack(a, revision(4), branch_id(8), &stack_of_a).is_empty(),
+        "a revision on a branch outside the stack inherits nothing"
+    );
+}

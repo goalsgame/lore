@@ -3148,25 +3148,63 @@ async fn load_stack(
 }
 
 /// Extends `stack` with the stacks of the branches it ends in, until it reaches
-/// a branch with no recorded parent or one already in the stack.
+/// a branch with no recorded parent or one already in the stack. Each step keeps
+/// only the points the last entry's revision descends from (see
+/// [`inherited_stack`]), and stops where that revision's branch cannot be read.
 async fn complete_stack(
     repository: Arc<RepositoryContext>,
     mut stack: Vec<BranchPoint>,
 ) -> Vec<BranchPoint> {
     while let Some(last) = stack.last().cloned() {
+        let Ok(recorded) =
+            crate::revision::recorded_branch(repository.clone(), last.revision).await
+        else {
+            break;
+        };
         let parent_stack = load_stack(repository.clone(), last.branch, "ancestor").await;
+        let inherited = inherited_stack(last.branch, last.revision, recorded, &parent_stack);
         let len = stack.len();
-        for parent in parent_stack {
-            if stack.iter().any(|known| known.branch == parent.branch) {
+        for (i, point) in inherited.into_iter().enumerate() {
+            if i == 0 && point.branch == last.branch {
+                continue;
+            }
+            if stack.iter().any(|known| known.branch == point.branch) {
                 break;
             }
-            stack.push(parent);
+            stack.push(point);
         }
         if stack.len() == len {
             break;
         }
     }
     stack
+}
+
+/// The branch points a branch created from `branch` at `revision` inherits from
+/// `branch`'s own stack, given the branch `revision` was committed on.
+///
+/// Only points `revision` descends from are inherited: all of `stack` when
+/// `revision` is on `branch`; from the stack entry for `recorded` on, with
+/// `revision` as that entry's point, when `revision` is on a branch further down
+/// the stack; none otherwise.
+pub fn inherited_stack(
+    branch: BranchId,
+    revision: Hash,
+    recorded: BranchId,
+    stack: &[BranchPoint],
+) -> Vec<BranchPoint> {
+    if recorded == branch {
+        return stack.to_vec();
+    }
+    let Some(i) = stack.iter().position(|point| point.branch == recorded) else {
+        return vec![];
+    };
+    let mut out = vec![BranchPoint {
+        branch: recorded,
+        revision,
+    }];
+    out.extend_from_slice(&stack[i + 1..]);
+    out
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor

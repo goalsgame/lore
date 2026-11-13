@@ -379,8 +379,25 @@ pub async fn create_branch(
         branch: parent_id,
         revision: parent_latest,
     }];
-    match branch::metadata_remote(remote.clone(), repository.clone(), parent_id).await {
-        Ok(parent_metadata) => branch_stack.extend(branch::stack(&parent_metadata)),
+    let inherited = match (
+        branch::metadata_remote(remote.clone(), repository.clone(), parent_id).await,
+        crate::revision::recorded_branch(repository.clone(), parent_latest).await,
+    ) {
+        (Ok(parent_metadata), Ok(recorded)) => Ok(branch::inherited_stack(
+            parent_id,
+            parent_latest,
+            recorded,
+            &branch::stack(&parent_metadata),
+        )),
+        (Err(err), _) => Err(err.to_string()),
+        (_, Err(err)) => Err(err.to_string()),
+    };
+    match inherited {
+        Ok(inherited) => branch_stack.extend(
+            inherited
+                .into_iter()
+                .filter(|point| point.branch != parent_id),
+        ),
         Err(err) => lore_warn!(
             "Could not read the stack of parent branch {parent_id} in link repository {}: {err}",
             repository.id
