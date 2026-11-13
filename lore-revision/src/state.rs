@@ -6503,6 +6503,8 @@ pub(crate) async fn diff_filesystem_queuing(
     let (repository_from, state_from) = node_link_from
         .resolve(repository_from.clone(), state_from.clone())
         .await?;
+    let (repository_from, state_from, node_from) =
+        enter_link_at(repository_from, state_from, node_link_from.node).await?;
 
     let node_link_to = state_current
         .find_node_link(repository_current.clone(), path.as_str())
@@ -6515,6 +6517,18 @@ pub(crate) async fn diff_filesystem_queuing(
     let (repository_current, state_current) = node_link_to
         .resolve(repository_current.clone(), state_current.clone())
         .await?;
+    let (repository_current, state_current, node_current) =
+        enter_link_at(repository_current, state_current, node_link_to.node).await?;
+
+    let link_mounts = if node_from != node_link_from.node || node_current != node_link_to.node {
+        let mut linked_trees = vec![(&state_from, &repository_from, node_from)];
+        if node_current != node_from || !Arc::ptr_eq(&state_current, &state_from) {
+            linked_trees.push((&state_current, &repository_current, node_current));
+        }
+        Arc::new(collect_link_mounts(&linked_trees, &path).await?)
+    } else {
+        link_mounts
+    };
 
     Ok(diff_with(
         operation,
@@ -6524,13 +6538,13 @@ pub(crate) async fn diff_filesystem_queuing(
                 repository: repository_from,
                 state: state_from,
                 path: path.clone(),
-                node: node_link_from.node,
+                node: node_from,
             },
             current: NodeMapping {
                 repository: repository_current,
                 state: state_current,
                 path: path.clone(),
-                node: node_link_to.node,
+                node: node_current,
             },
             filesystem_path: path,
             states,
@@ -6542,6 +6556,25 @@ pub(crate) async fn diff_filesystem_queuing(
             discards,
         },
     ))
+}
+
+/// Where a walk that starts at `node` begins: the linked tree's root when `node` is a link, the
+/// way a walk crossing the link from its parent enters it, and `node` itself otherwise.
+async fn enter_link_at(
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    node: NodeID,
+) -> Result<(Arc<RepositoryContext>, Arc<State>, NodeID), StateError> {
+    if !node.is_valid_node_id() {
+        return Ok((repository, state, node));
+    }
+    let entry = state.node(repository.clone(), node).await?;
+    if !entry.is_link() {
+        return Ok((repository, state, node));
+    }
+    let link = entry.linked_node();
+    let (repository, state) = link.resolve(repository, state).await?;
+    Ok((repository, state, link.node))
 }
 
 /// Patch-discard the nodes a parallel filesystem walk collected — a reverted `DirtyAdd`, an

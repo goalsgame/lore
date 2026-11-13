@@ -199,3 +199,34 @@ def test_link_check_dirty_persists_verified_markers_inside_a_link(new_lore_repo)
         "Expected the link pin restored to the committed revision once no marker remains"
     )
     assert status_by_path(parent_repo) == {}
+
+
+@pytest.mark.parametrize("source_path", ["/", "/mounted"])
+def test_link_status_scan_of_the_mount_itself_compares_against_the_link(
+    new_lore_repo, source_path
+):
+    prefix = "" if source_path == "/" else "mounted/"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={
+            f"{prefix}linked.txt": "linked\n",
+            f"{prefix}sub/kept.txt": "kept\n",
+        },
+        source_path=source_path,
+    )
+    edited = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+
+    assert status_by_path(parent_repo, path=DEFAULT_LINK_MOUNT, scan=True) == {}, (
+        "A scan of the mount must find the link's own files tracked"
+    )
+    assert status_by_path(parent_repo) == {}
+
+    parent_repo.write_files({edited: "edited through the mount\n"})
+    entries = status_by_path(parent_repo, path=DEFAULT_LINK_MOUNT, scan=True)
+    assert entries.keys() == {edited}, f"Expected only the edit, got: {entries}"
+    assert entries[edited].get("action") == "keep"
+
+    parent_repo.stage(DEFAULT_LINK_MOUNT, scan=True)
+    staged = status_by_path(parent_repo)
+    assert staged.keys() == {edited}, f"Expected only the edit staged, got: {staged}"
+    assert staged[edited].get("flagStaged") is True
