@@ -1537,7 +1537,7 @@ pub struct ResolvedRevision {
 }
 
 /// The branch `revision` records, which is the branch it was committed on.
-async fn recorded_branch(
+pub(crate) async fn recorded_branch(
     repository: Arc<RepositoryContext>,
     revision: Hash,
 ) -> Result<BranchId, StateError> {

@@ -29,6 +29,7 @@ use crate::lore::RepositoryId;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_info;
+use crate::lore_warn;
 use crate::node::Node;
 use crate::node::NodeBlock;
 use crate::node::NodeFlags;
@@ -341,11 +342,6 @@ pub async fn create_branch(
 
     let user_id = execution_context().user_id().await;
 
-    let branch_stack = vec![BranchPoint {
-        branch: parent_id,
-        revision: parent_latest,
-    }];
-
     let revision = remote
         .revision(repository.id)
         .await
@@ -377,6 +373,35 @@ pub async fn create_branch(
             revision: parent_latest,
             reused: false,
         });
+    }
+
+    let mut branch_stack = vec![BranchPoint {
+        branch: parent_id,
+        revision: parent_latest,
+    }];
+    let inherited = match (
+        branch::metadata_remote(remote.clone(), repository.clone(), parent_id).await,
+        crate::revision::recorded_branch(repository.clone(), parent_latest).await,
+    ) {
+        (Ok(parent_metadata), Ok(recorded)) => Ok(branch::inherited_stack(
+            parent_id,
+            parent_latest,
+            recorded,
+            &branch::stack(&parent_metadata),
+        )),
+        (Err(err), _) => Err(err.to_string()),
+        (_, Err(err)) => Err(err.to_string()),
+    };
+    match inherited {
+        Ok(inherited) => branch_stack.extend(
+            inherited
+                .into_iter()
+                .filter(|point| point.branch != parent_id),
+        ),
+        Err(err) => lore_warn!(
+            "Could not read the stack of parent branch {parent_id} in link repository {}: {err}",
+            repository.id
+        ),
     }
 
     let latest = revision
@@ -2393,7 +2418,7 @@ pub async fn link_has_content_divergence(
             // revision when the cause was actually a transient failure
             // (network, missing fragment). Surface enough context for a
             // user looking at logs to find this site.
-            crate::lore_warn!(
+            lore_warn!(
                 "link_has_content_divergence: diff3 failed for repo {}, \
                  source revision {source_revision} on branch {source_branch}, \
                  current revision {current_revision} on branch {current_branch}. \

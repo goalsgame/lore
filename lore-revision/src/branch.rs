@@ -9,6 +9,8 @@ pub mod push;
 pub mod reset;
 
 use std::cmp::PartialEq;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::str;
@@ -3026,59 +3028,10 @@ pub async fn resolve_diff3_base(
     );
 
     let common_ancestor = if source_branch != target_branch {
-        let source_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), source_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), source_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote source branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local source branch metadata available and have no remote");
-            vec![]
-        };
+        let source_stack = load_stack(repository.clone(), source_branch, "source").await;
+        let target_stack = load_stack(repository.clone(), target_branch, "target").await;
 
-        let target_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), target_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for target branch {target_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), target_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for target branch {target_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote target branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local target branch metadata available and have no remote");
-            vec![]
-        };
-
-        let Some(common_ancestor) = find_common_ancestor_from_branch_points(
+        let mut common_ancestor = find_common_ancestor_from_branch_points(
             repository.clone(),
             source_branch,
             source_revision,
@@ -3087,8 +3040,26 @@ pub async fn resolve_diff3_base(
             target_revision,
             &target_stack,
         )
-        .await?
-        else {
+        .await?;
+
+        if common_ancestor.is_none() {
+            let (source_stack, target_stack) = join!(
+                complete_stack(repository.clone(), source_stack),
+                complete_stack(repository.clone(), target_stack)
+            );
+            common_ancestor = find_common_ancestor_from_branch_points(
+                repository.clone(),
+                source_branch,
+                source_revision,
+                &source_stack,
+                target_branch,
+                target_revision,
+                &target_stack,
+            )
+            .await?;
+        }
+
+        let Some(common_ancestor) = common_ancestor else {
             return Err(InvalidArguments {
                 reason: format!(
                     "source branch {source_branch} and target branch {target_branch} have no common branch in their branch stacks"
@@ -3148,6 +3119,157 @@ pub async fn resolve_diff3_base(
     }
 
     Ok(base_revision)
+}
+
+/// Branch stack of `branch`, read from local metadata, else from the remote.
+/// Empty when neither has the branch.
+async fn load_stack(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    side: &str,
+) -> Vec<BranchPoint> {
+    if let Ok(branch_metadata) = metadata(repository.clone(), branch).await {
+        let stack = stack(&branch_metadata);
+        lore_debug!("Loaded local metadata for {side} branch {branch}, found stack {stack:?}");
+        return stack;
+    }
+
+    let Ok(remote) = repository.remote().await else {
+        lore_debug!("No local {side} branch metadata available and have no remote");
+        return vec![];
+    };
+
+    let Ok(branch_metadata) = metadata_remote(remote, repository.clone(), branch).await else {
+        lore_debug!("No local or remote {side} branch metadata available");
+        return vec![];
+    };
+
+    let stack = stack(&branch_metadata);
+    lore_debug!("Loaded remote metadata for {side} branch {branch}, found stack {stack:?}");
+    stack
+}
+
+/// Extends `stack` with the stacks of the branches it ends in, until it reaches
+/// a branch with no recorded parent or one already in the stack. Each step uses
+/// the ancestor's own completed stack, keeping only the points the last entry's
+/// revision descends from (see [`inherited_stack`]), and stops where that
+/// revision's branch cannot be read.
+async fn complete_stack(
+    repository: Arc<RepositoryContext>,
+    stack: Vec<BranchPoint>,
+) -> Vec<BranchPoint> {
+    let mut completion = StackCompletion {
+        repository,
+        completed: HashMap::new(),
+        expanding: HashSet::new(),
+        budget: STACK_COMPLETION_BUDGET,
+    };
+    let stack = completion.extend(stack).await;
+    if completion.budget == 0 {
+        lore_warn!("Stopped completing branch stacks after {STACK_COMPLETION_BUDGET} branches");
+    }
+    stack
+}
+
+/// How many branch stacks one [`complete_stack`] reads; once spent, it reads
+/// no more metadata.
+const STACK_COMPLETION_BUDGET: usize = 4096;
+
+/// One [`complete_stack`] traversal: each branch's stack is completed at most
+/// once, and a branch already being completed is read as recorded, which ends
+/// a cycle in recorded stacks.
+struct StackCompletion {
+    repository: Arc<RepositoryContext>,
+    completed: HashMap<BranchId, Vec<BranchPoint>>,
+    expanding: HashSet<BranchId>,
+    budget: usize,
+}
+
+impl StackCompletion {
+    fn extend<'a>(
+        &'a mut self,
+        mut stack: Vec<BranchPoint>,
+    ) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send + 'a>> {
+        Box::pin(async move {
+            while let Some(last) = stack.last().cloned() {
+                if self.budget == 0 {
+                    break;
+                }
+                let Ok(recorded) =
+                    crate::revision::recorded_branch(self.repository.clone(), last.revision).await
+                else {
+                    break;
+                };
+                let parent_stack = self.completed_stack(last.branch).await;
+                let inherited =
+                    inherited_stack(last.branch, last.revision, recorded, &parent_stack);
+                let len = stack.len();
+                for point in inherited {
+                    if point.branch == last.branch {
+                        continue;
+                    }
+                    if stack.iter().any(|known| known.branch == point.branch) {
+                        break;
+                    }
+                    stack.push(point);
+                }
+                if stack.len() == len {
+                    break;
+                }
+            }
+            stack
+        })
+    }
+
+    fn completed_stack<'a>(
+        &'a mut self,
+        branch: BranchId,
+    ) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send + 'a>> {
+        Box::pin(async move {
+            if let Some(stack) = self.completed.get(&branch) {
+                return stack.clone();
+            }
+            if self.budget == 0 {
+                return vec![];
+            }
+            self.budget -= 1;
+            let recorded = load_stack(self.repository.clone(), branch, "ancestor").await;
+            if !self.expanding.insert(branch) {
+                return recorded;
+            }
+            let stack = self.extend(recorded).await;
+            self.expanding.remove(&branch);
+            self.completed.insert(branch, stack.clone());
+            stack
+        })
+    }
+}
+
+/// The branch points a branch created from `branch` at `revision` inherits from
+/// `branch`'s own stack, given the branch `revision` was committed on.
+///
+/// Only points `revision` descends from are inherited: all of `stack` when
+/// `revision` is on `branch`; from the stack entry for `recorded` on, with
+/// `revision` as that entry's point, when `revision` is on a branch further down
+/// the stack; none otherwise.
+pub fn inherited_stack(
+    branch: BranchId,
+    revision: Hash,
+    recorded: BranchId,
+    stack: &[BranchPoint],
+) -> Vec<BranchPoint> {
+    if recorded == branch {
+        return stack.to_vec();
+    }
+    let Some(i) = stack.iter().position(|point| point.branch == recorded) else {
+        return vec![];
+    };
+    let mut out = vec![BranchPoint {
+        branch: recorded,
+        revision,
+    }];
+    out.extend_from_slice(&stack[i + 1..]);
+    out
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor
