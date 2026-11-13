@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: MIT
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use lore_base::runtime::LORE_CONTEXT;
 use lore_base::types::Hash;
 use lore_proto::lore::model::v1 as model_v1;
@@ -21,7 +22,6 @@ use lore_revision::node::NodeFlags;
 use lore_revision::node::ROOT_NODE;
 use lore_revision::repository::RepositoryContext;
 use lore_revision::state;
-use async_trait::async_trait;
 use lore_server::authnz::repository_authorizer::Action;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::RawToken;
