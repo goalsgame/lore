@@ -3026,59 +3026,10 @@ pub async fn resolve_diff3_base(
     );
 
     let common_ancestor = if source_branch != target_branch {
-        let source_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), source_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for source branch {source_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), source_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for source branch {source_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote source branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local source branch metadata available and have no remote");
-            vec![]
-        };
+        let source_stack = load_stack(repository.clone(), source_branch, "source").await;
+        let target_stack = load_stack(repository.clone(), target_branch, "target").await;
 
-        let target_stack = if let Ok(branch_metadata) =
-            metadata(repository.clone(), target_branch).await
-        {
-            let stack = stack(&branch_metadata);
-            lore_debug!(
-                "Loaded local metadata for target branch {target_branch}, found stack {stack:?}"
-            );
-            stack
-        } else if let Ok(remote) = repository.remote().await {
-            if let Ok(branch_metadata) =
-                metadata_remote(remote, repository.clone(), target_branch).await
-            {
-                let stack = stack(&branch_metadata);
-                lore_debug!(
-                    "Loaded remote metadata for target branch {target_branch}, found stack {stack:?}"
-                );
-                stack
-            } else {
-                lore_debug!("No local or remote target branch metadata available");
-                vec![]
-            }
-        } else {
-            lore_debug!("No local target branch metadata available and have no remote");
-            vec![]
-        };
-
-        let Some(common_ancestor) = find_common_ancestor_from_branch_points(
+        let mut common_ancestor = find_common_ancestor_from_branch_points(
             repository.clone(),
             source_branch,
             source_revision,
@@ -3087,8 +3038,26 @@ pub async fn resolve_diff3_base(
             target_revision,
             &target_stack,
         )
-        .await?
-        else {
+        .await?;
+
+        if common_ancestor.is_none() {
+            let (source_stack, target_stack) = join!(
+                complete_stack(repository.clone(), source_stack),
+                complete_stack(repository.clone(), target_stack)
+            );
+            common_ancestor = find_common_ancestor_from_branch_points(
+                repository.clone(),
+                source_branch,
+                source_revision,
+                &source_stack,
+                target_branch,
+                target_revision,
+                &target_stack,
+            )
+            .await?;
+        }
+
+        let Some(common_ancestor) = common_ancestor else {
             return Err(InvalidArguments {
                 reason: format!(
                     "source branch {source_branch} and target branch {target_branch} have no common branch in their branch stacks"
@@ -3148,6 +3117,56 @@ pub async fn resolve_diff3_base(
     }
 
     Ok(base_revision)
+}
+
+/// Branch stack of `branch`, read from local metadata, else from the remote.
+/// Empty when neither has the branch.
+async fn load_stack(
+    repository: Arc<RepositoryContext>,
+    branch: BranchId,
+    side: &str,
+) -> Vec<BranchPoint> {
+    if let Ok(branch_metadata) = metadata(repository.clone(), branch).await {
+        let stack = stack(&branch_metadata);
+        lore_debug!("Loaded local metadata for {side} branch {branch}, found stack {stack:?}");
+        return stack;
+    }
+
+    let Ok(remote) = repository.remote().await else {
+        lore_debug!("No local {side} branch metadata available and have no remote");
+        return vec![];
+    };
+
+    let Ok(branch_metadata) = metadata_remote(remote, repository.clone(), branch).await else {
+        lore_debug!("No local or remote {side} branch metadata available");
+        return vec![];
+    };
+
+    let stack = stack(&branch_metadata);
+    lore_debug!("Loaded remote metadata for {side} branch {branch}, found stack {stack:?}");
+    stack
+}
+
+/// Extends `stack` with the stacks of the branches it ends in, until it reaches
+/// a branch with no recorded parent or one already in the stack.
+async fn complete_stack(
+    repository: Arc<RepositoryContext>,
+    mut stack: Vec<BranchPoint>,
+) -> Vec<BranchPoint> {
+    while let Some(last) = stack.last().cloned() {
+        let parent_stack = load_stack(repository.clone(), last.branch, "ancestor").await;
+        let len = stack.len();
+        for parent in parent_stack {
+            if stack.iter().any(|known| known.branch == parent.branch) {
+                break;
+            }
+            stack.push(parent);
+        }
+        if stack.len() == len {
+            break;
+        }
+    }
+    stack
 }
 
 /// `diff3` minus the streaming wrapper. Resolves the common ancestor

@@ -777,3 +777,101 @@ async fn disjoint_histories_fall_back_to_the_older_branch_point() {
         "A zero base is the empty tree, which conflicts on every path in both branches"
     );
 }
+
+/*
+    (main latest)  X           X (branch B latest, stack names only branch A)
+                   |           |
+                   X           X (branch A latest)
+                   |          /
+    (branch point) X---------/
+*/
+/// A branch whose stack names only its parent, as a branch create cascade
+/// records in a linked repository, reaches the default branch through its
+/// parent's stack.
+#[tokio::test]
+async fn stack_naming_only_the_parent_reaches_the_default_branch_through_it() {
+    let repository = random::<Context>();
+    let (immutable_store, mutable_store, execution) =
+        test_store_create().await.expect("Failed to create stores");
+
+    let (base, branch_point) = Box::pin(LORE_CONTEXT.scope(execution.clone(), async move {
+        let repository_context = Arc::new(RepositoryContext::new_server_context(
+            immutable_store.clone(),
+            mutable_store.clone(),
+            repository.into(),
+        ));
+
+        let (main_branch, branch_point) = create_test_main(repository_context.clone()).await;
+
+        let write_token = get_write_token();
+        let branch_a = BranchId::from(uuid::Uuid::now_v7());
+        lore_revision::branch::create(
+            repository_context.clone(),
+            &write_token,
+            branch_a,
+            "branch_a",
+            branch::default_category(),
+            "BranchCreator",
+            12345,
+            vec![BranchPoint {
+                branch: main_branch,
+                revision: branch_point,
+            }],
+            false,
+            false,
+        )
+        .await
+        .expect("Could not create branch A");
+        let branch_a_revision =
+            push_revision_on_branch(repository_context.clone(), branch_a, branch_point, 2).await;
+
+        let branch_b = create_branch(
+            repository_context.clone(),
+            "branch_b",
+            vec![BranchPoint {
+                branch: branch_a,
+                revision: branch_a_revision,
+            }],
+        )
+        .await;
+        let branch_b_revision =
+            push_revision_on_branch(repository_context.clone(), branch_b, branch_a_revision, 3)
+                .await;
+
+        let mut main_revision = branch_point;
+        for revision_number in 2..4 {
+            main_revision = push_revision_on_branch(
+                repository_context.clone(),
+                main_branch,
+                main_revision,
+                revision_number,
+            )
+            .await;
+        }
+
+        let mut request = Request::new(BranchDiffRequest {
+            branch_target: branch_b.into(),
+            branch_source: main_branch.into(),
+            revision_target: Some(branch_b_revision.into()),
+            revision_source: Some(main_revision.into()),
+            autoresolve: false,
+        });
+        request.metadata_mut().insert_bin(
+            REPOSITORY_ID_KEY,
+            tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
+        );
+
+        let response = handler(request, immutable_store, mutable_store, allow_all())
+            .await
+            .expect("Branch diff must follow the parent's stack to the default branch")
+            .into_inner();
+
+        (Hash::from(response.revision_base), branch_point)
+    }))
+    .await;
+
+    assert_eq!(
+        base, branch_point,
+        "Branch A's branch point on main is where main and branch B meet"
+    );
+}
