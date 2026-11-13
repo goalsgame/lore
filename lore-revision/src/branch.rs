@@ -3148,36 +3148,59 @@ async fn load_stack(
 }
 
 /// Extends `stack` with the stacks of the branches it ends in, until it reaches
-/// a branch with no recorded parent or one already in the stack. Each step keeps
-/// only the points the last entry's revision descends from (see
-/// [`inherited_stack`]), and stops where that revision's branch cannot be read.
+/// a branch with no recorded parent or one already in the stack. Each step
+/// first completes the ancestor's own stack the same way, then keeps only the
+/// points the last entry's revision descends from (see [`inherited_stack`]),
+/// and stops where that revision's branch cannot be read.
 async fn complete_stack(
     repository: Arc<RepositoryContext>,
-    mut stack: Vec<BranchPoint>,
+    stack: Vec<BranchPoint>,
 ) -> Vec<BranchPoint> {
-    while let Some(last) = stack.last().cloned() {
-        let Ok(recorded) =
-            crate::revision::recorded_branch(repository.clone(), last.revision).await
-        else {
-            break;
-        };
-        let parent_stack = load_stack(repository.clone(), last.branch, "ancestor").await;
-        let inherited = inherited_stack(last.branch, last.revision, recorded, &parent_stack);
-        let len = stack.len();
-        for (i, point) in inherited.into_iter().enumerate() {
-            if i == 0 && point.branch == last.branch {
-                continue;
+    complete_stack_within(repository, stack, MAX_STACK_COMPLETION_DEPTH).await
+}
+
+/// How many ancestors deep [`complete_stack`] reconstructs stacks, which also
+/// bounds a cycle in recorded stacks.
+const MAX_STACK_COMPLETION_DEPTH: usize = 32;
+
+fn complete_stack_within(
+    repository: Arc<RepositoryContext>,
+    mut stack: Vec<BranchPoint>,
+    depth: usize,
+) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send>> {
+    Box::pin(async move {
+        if depth == 0 {
+            return stack;
+        }
+        while let Some(last) = stack.last().cloned() {
+            let Ok(recorded) =
+                crate::revision::recorded_branch(repository.clone(), last.revision).await
+            else {
+                break;
+            };
+            let parent_stack = complete_stack_within(
+                repository.clone(),
+                load_stack(repository.clone(), last.branch, "ancestor").await,
+                depth - 1,
+            )
+            .await;
+            let inherited = inherited_stack(last.branch, last.revision, recorded, &parent_stack);
+            let len = stack.len();
+            for point in inherited {
+                if point.branch == last.branch {
+                    continue;
+                }
+                if stack.iter().any(|known| known.branch == point.branch) {
+                    break;
+                }
+                stack.push(point);
             }
-            if stack.iter().any(|known| known.branch == point.branch) {
+            if stack.len() == len {
                 break;
             }
-            stack.push(point);
         }
-        if stack.len() == len {
-            break;
-        }
-    }
-    stack
+        stack
+    })
 }
 
 /// The branch points a branch created from `branch` at `revision` inherits from
