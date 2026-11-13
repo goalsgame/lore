@@ -3171,7 +3171,8 @@ async fn complete_stack(
     stack
 }
 
-/// How many branches one [`complete_stack`] completes the stack of.
+/// How many branch stacks one [`complete_stack`] reads; once spent, it reads
+/// no more metadata.
 const STACK_COMPLETION_BUDGET: usize = 4096;
 
 /// One [`complete_stack`] traversal: each branch's stack is completed at most
@@ -3191,6 +3192,9 @@ impl StackCompletion {
     ) -> Pin<Box<dyn Future<Output = Vec<BranchPoint>> + Send + 'a>> {
         Box::pin(async move {
             while let Some(last) = stack.last().cloned() {
+                if self.budget == 0 {
+                    break;
+                }
                 let Ok(recorded) =
                     crate::revision::recorded_branch(self.repository.clone(), last.revision).await
                 else {
@@ -3225,11 +3229,14 @@ impl StackCompletion {
             if let Some(stack) = self.completed.get(&branch) {
                 return stack.clone();
             }
-            let recorded = load_stack(self.repository.clone(), branch, "ancestor").await;
-            if self.budget == 0 || !self.expanding.insert(branch) {
-                return recorded;
+            if self.budget == 0 {
+                return vec![];
             }
             self.budget -= 1;
+            let recorded = load_stack(self.repository.clone(), branch, "ancestor").await;
+            if !self.expanding.insert(branch) {
+                return recorded;
+            }
             let stack = self.extend(recorded).await;
             self.expanding.remove(&branch);
             self.completed.insert(branch, stack.clone());
