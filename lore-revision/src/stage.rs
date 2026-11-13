@@ -912,7 +912,7 @@ impl StageDescent {
                 );
 
                 let linked_repository = self.repository.to_link_context(link_repository_id).await;
-                let mut linked_state = State::deserialize(self.repository.clone(), link_revision)
+                let mut linked_state = State::deserialize(linked_repository.clone(), link_revision)
                     .await
                     .forward::<StageError>("Failed to deserialize revision state")?;
 

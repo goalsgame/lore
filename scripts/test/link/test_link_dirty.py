@@ -199,3 +199,99 @@ def test_link_check_dirty_persists_verified_markers_inside_a_link(new_lore_repo)
         "Expected the link pin restored to the committed revision once no marker remains"
     )
     assert status_by_path(parent_repo) == {}
+
+
+@pytest.mark.parametrize("source_path", ["/", "/mounted"])
+def test_link_status_scan_of_the_mount_itself_compares_against_the_link(
+    new_lore_repo, source_path
+):
+    prefix = "" if source_path == "/" else "mounted/"
+    parent_repo, _link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={
+            f"{prefix}linked.txt": "linked\n",
+            f"{prefix}sub/kept.txt": "kept\n",
+        },
+        source_path=source_path,
+    )
+    edited = f"{DEFAULT_LINK_MOUNT}/linked.txt"
+
+    assert status_by_path(parent_repo, path=DEFAULT_LINK_MOUNT, scan=True) == {}, (
+        "A scan of the mount must find the link's own files tracked"
+    )
+    assert status_by_path(parent_repo) == {}
+
+    parent_repo.write_files({edited: "edited through the mount\n"})
+    entries = status_by_path(parent_repo, path=DEFAULT_LINK_MOUNT, scan=True)
+    assert entries.keys() == {edited}, f"Expected only the edit, got: {entries}"
+    assert entries[edited].get("action") == "keep"
+
+    parent_repo.stage(DEFAULT_LINK_MOUNT, scan=True)
+    staged = status_by_path(parent_repo)
+    assert staged.keys() == {edited}, f"Expected only the edit staged, got: {staged}"
+    assert staged[edited].get("flagStaged") is True
+
+
+def _scan_actions(repo, path=None) -> dict[str, str]:
+    entries = status_by_path(repo, path=path, scan=True)
+    return {
+        key: entry.get("action")
+        for key, entry in entries.items()
+        if key.startswith(f"{DEFAULT_LINK_MOUNT}")
+    }
+
+
+def _parent_with_staged_link(new_lore_repo):
+    parent_repo = make_repo(
+        new_lore_repo, {DEFAULT_PARENT_FILE: "baseline\n"}, "Baseline"
+    )
+    link_repo = make_repo(
+        new_lore_repo, {"linked.txt": "linked\n", "sub/kept.txt": "kept\n"}, "Linked"
+    )
+    parent_repo.link_add(DEFAULT_LINK_MOUNT, link_repo.get_id(), "/")
+    return parent_repo
+
+
+@pytest.mark.parametrize("source_path", ["/", "/mounted"])
+def test_link_status_scan_of_a_missing_mount_matches_a_whole_tree_scan(
+    new_lore_repo, source_path
+):
+    prefix = "" if source_path == "/" else "mounted/"
+    results = []
+    for path in (DEFAULT_LINK_MOUNT, None):
+        parent_repo, _link_repo = make_parent_with_link(
+            new_lore_repo,
+            link_files={
+                f"{prefix}linked.txt": "linked\n",
+                f"{prefix}sub/kept.txt": "kept\n",
+            },
+            source_path=source_path,
+        )
+        parent_repo.rmtree(DEFAULT_LINK_MOUNT)
+        results.append(_scan_actions(parent_repo, path))
+    scoped, whole = results
+    assert scoped == whole, f"Scoped scan {scoped} differs from whole-tree scan {whole}"
+
+
+def test_link_status_scan_of_an_uncommitted_link_matches_a_whole_tree_scan(
+    new_lore_repo,
+):
+    scoped = _scan_actions(_parent_with_staged_link(new_lore_repo), DEFAULT_LINK_MOUNT)
+    whole = _scan_actions(_parent_with_staged_link(new_lore_repo))
+    assert whole.pop(DEFAULT_LINK_MOUNT, None) == "add"
+    assert scoped == whole, f"Scoped scan {scoped} differs from whole-tree scan {whole}"
+
+
+def test_link_status_scan_of_a_mount_replaced_by_a_file_matches_a_whole_tree_scan(
+    new_lore_repo,
+):
+    results = []
+    for path in (DEFAULT_LINK_MOUNT, None):
+        parent_repo, _link_repo = make_parent_with_link(
+            new_lore_repo, link_files={"linked.txt": "linked\n"}
+        )
+        parent_repo.rmtree(DEFAULT_LINK_MOUNT)
+        parent_repo.write_files({DEFAULT_LINK_MOUNT: "now a file\n"})
+        results.append(_scan_actions(parent_repo, path))
+    scoped, whole = results
+    assert scoped == whole, f"Scoped scan {scoped} differs from whole-tree scan {whole}"
