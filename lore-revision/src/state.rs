@@ -5156,7 +5156,7 @@ pub async fn gather_tree_paths(
         if !node_link.is_valid() {
             return Err(NodeNotFound.into());
         }
-        if !can_read(node_link.repository) {
+        if node_link.repository != repository.id && !can_read(node_link.repository) {
             lore_debug!(
                 "Path resolution stops at unauthorized repository {}",
                 node_link.repository,
