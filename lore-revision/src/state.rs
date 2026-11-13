@@ -6503,8 +6503,6 @@ pub(crate) async fn diff_filesystem_queuing(
     let (repository_from, state_from) = node_link_from
         .resolve(repository_from.clone(), state_from.clone())
         .await?;
-    let (repository_from, state_from, node_from) =
-        enter_link_at(repository_from, state_from, node_link_from.node).await?;
 
     let node_link_to = state_current
         .find_node_link(repository_current.clone(), path.as_str())
@@ -6517,12 +6515,44 @@ pub(crate) async fn diff_filesystem_queuing(
     let (repository_current, state_current) = node_link_to
         .resolve(repository_current.clone(), state_current.clone())
         .await?;
-    let (repository_current, state_current, node_current) =
-        enter_link_at(repository_current, state_current, node_link_to.node).await?;
 
-    let link_mounts = if node_from != node_link_from.node || node_current != node_link_to.node {
+    // A mount missing from disk stays the link node, which keeps the link whole.
+    let mount_on_disk = operation
+        .file_info(&path)
+        .await
+        .is_ok_and(|info| info.exists());
+    let (link_from, link_current) = if mount_on_disk {
+        (
+            link_at(&repository_from, &state_from, node_link_from.node).await?,
+            link_at(&repository_current, &state_current, node_link_to.node).await?,
+        )
+    } else {
+        (None, None)
+    };
+
+    let (repository_from, state_from, node_from) = match link_from {
+        Some(link) => {
+            let (repository, state) = link.resolve(repository_from, state_from).await?;
+            (repository, state, link.node)
+        }
+        None => (repository_from, state_from, node_link_from.node),
+    };
+    let (repository_current, state_current, node_current) = match (link_current, link_from) {
+        (Some(link), _) => {
+            let (repository, state) = link.resolve(repository_current, state_current).await?;
+            (repository, state, link.node)
+        }
+        // Only the staged tree holds the link: both sides walk its linked tree.
+        (None, Some(_)) => (repository_from.clone(), state_from.clone(), node_from),
+        (None, None) => (repository_current, state_current, node_link_to.node),
+    };
+
+    let link_mounts = if link_from.is_some() || link_current.is_some() {
         let mut linked_trees = vec![(&state_from, &repository_from, node_from)];
-        if node_current != node_from || !Arc::ptr_eq(&state_current, &state_from) {
+        if node_current != node_from
+            || repository_current.id != repository_from.id
+            || !Arc::ptr_eq(&state_current, &state_from)
+        {
             linked_trees.push((&state_current, &repository_current, node_current));
         }
         Arc::new(collect_link_mounts(&linked_trees, &path).await?)
@@ -6558,23 +6588,17 @@ pub(crate) async fn diff_filesystem_queuing(
     ))
 }
 
-/// Where a walk that starts at `node` begins: the linked tree's root when `node` is a link, the
-/// way a walk crossing the link from its parent enters it, and `node` itself otherwise.
-async fn enter_link_at(
-    repository: Arc<RepositoryContext>,
-    state: Arc<State>,
+/// The link `node` is, when it is one.
+async fn link_at(
+    repository: &Arc<RepositoryContext>,
+    state: &Arc<State>,
     node: NodeID,
-) -> Result<(Arc<RepositoryContext>, Arc<State>, NodeID), StateError> {
+) -> Result<Option<NodeLink>, StateError> {
     if !node.is_valid_node_id() {
-        return Ok((repository, state, node));
+        return Ok(None);
     }
     let entry = state.node(repository.clone(), node).await?;
-    if !entry.is_link() {
-        return Ok((repository, state, node));
-    }
-    let link = entry.linked_node();
-    let (repository, state) = link.resolve(repository, state).await?;
-    Ok((repository, state, link.node))
+    Ok(entry.is_link().then(|| entry.linked_node()))
 }
 
 /// Patch-discard the nodes a parallel filesystem walk collected — a reverted `DirtyAdd`, an
