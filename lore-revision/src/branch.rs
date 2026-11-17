@@ -4268,7 +4268,7 @@ fn emit_diff_item_with_auto_resolve(
 /// resolved change carries the executable bit [`change::merged_mode`] gives
 /// the file.
 #[lore_macro::test_pub]
-async fn try_auto_resolve_conflict(
+pub(crate) async fn try_auto_resolve_conflict(
     change_from: &NodeChange,
     change_to: &NodeChange,
 ) -> Result<Option<NodeChange>, BranchError> {
