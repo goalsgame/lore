@@ -4416,6 +4416,19 @@ pub(crate) async fn try_auto_resolve_conflict(
             .await;
     }
 
+    // Must agree with the working-tree merge, which refuses a mine that is not text.
+    if change_to.to.mapping.node.is_valid_node_id()
+        && !crate::infer::infer_is_diffable(&lore_storage::ContentSource::file(&mine_path))
+            .await
+            .unwrap_or(false)
+    {
+        lore_trace!("Change to mine is not diffable and cannot be auto resolved, continue");
+        let _ = util::fs::unlink(base_path).await;
+        let _ = util::fs::unlink(theirs_path).await;
+        let _ = util::fs::unlink(mine_path).await;
+        return Ok(None);
+    }
+
     let resolved = match crate::merge::merge3_text_by_pathbuf(
         base_path.clone(),
         mine_path.clone(),

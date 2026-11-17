@@ -1525,10 +1525,13 @@ pub async fn restore_link_paths_from_state(
             let mount_path = link_path.join(link_relative.as_str());
             sync::unlink_merge_artifacts(&operation, &mount_path).await;
 
-            let node_link = link_state
+            let node_link = match link_state
                 .find_relative_node_link(link_context.clone(), mounted, link_relative.as_str())
                 .await
-                .forward::<LinkError>("Failed resolving link node")?;
+            {
+                Err(err) if err.is_node_not_found() => continue,
+                found => found.forward::<LinkError>("Failed resolving link node")?,
+            };
             if !node_link.is_valid_or_root() {
                 continue;
             }
