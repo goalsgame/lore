@@ -198,6 +198,13 @@ def assert_mount_exposes(
         f"Mount {link_path} should expose exactly {sorted(expected_names)}, "
         f"got: {mounted}"
     )
+# Edits to different lines of one file, which merge as text.
+SEPARATE_EDITS = {
+    "base": "one\ntwo\nthree\nfour\nfive\nsix\n",
+    "mine": "one on main\ntwo\nthree\nfour\nfive\nsix\n",
+    "theirs": "one\ntwo\nthree\nfour\nfive\nsix on feature\n",
+}
+SEPARATE_EDITS_MERGED = "one on main\ntwo\nthree\nfour\nfive\nsix on feature\n"
 
 
 def setup_link_merge_conflict(

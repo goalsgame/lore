@@ -8,6 +8,8 @@ import sys
 import pytest
 from error_types import UnresolvedConflictError
 from link_helpers import (
+    SEPARATE_EDITS,
+    SEPARATE_EDITS_MERGED,
     assert_mount_exposes,
     link_pin,
     make_parent_with_link,
@@ -564,6 +566,26 @@ def test_link_commit_refuses_a_conflict_below_a_deleted_directory_by_its_path(
     with pytest.raises(UnresolvedConflictError) as refused:
         urc.commit("Merge with the directory removed")
     assert f"{link_path}/Sub/data.txt" in str(refused.value), refused.value
+def test_link_merge_merges_separate_edits_to_a_linked_file(new_lore_repo):
+    """A --link merge merges edits to different lines of the same file as text."""
+    urc, _link_repo, link_path = setup_link_merge_conflict(
+        new_lore_repo,
+        files=[{"path": "config.yaml", **SEPARATE_EDITS}],
+    )
+
+    urc.branch_merge_start(
+        "feature-branch", link=link_path, message="Merge separate edits"
+    )
+
+    merged_file = f"{link_path}/config.yaml"
+    with urc.open_file(merged_file, "r") as f:
+        assert f.read() == SEPARATE_EDITS_MERGED
+    for suffix in (".mine", ".theirs", ".base"):
+        assert not urc.file_exists(merged_file + suffix), f"Left a {suffix} sidecar"
+
+    urc.push()
+    status = urc.status()
+    assert "local branch in sync with remote" in status.lower(), status
 
 
 @pytest.mark.smoke
