@@ -2075,7 +2075,20 @@ impl ImmutableStoreTrait for GcpImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
+    async fn flush(
+        self: Arc<Self>,
+        _options: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
 

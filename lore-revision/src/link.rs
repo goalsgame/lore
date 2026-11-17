@@ -391,7 +391,7 @@ pub async fn create_branch(
         revision: parent_latest,
     }];
     let inherited = match (
-        branch::metadata_remote(remote.clone(), repository.clone(), parent_id).await,
+        branch::metadata(repository.clone(), parent_id).await,
         crate::revision::recorded_branch(repository.clone(), parent_latest).await,
     ) {
         (Ok(parent_metadata), Ok(recorded)) => Ok(branch::inherited_stack(

@@ -4620,24 +4620,12 @@ async fn load_stack(
     branch: BranchId,
     side: &str,
 ) -> Vec<BranchPoint> {
-    if let Ok(branch_metadata) = metadata(repository.clone(), branch).await {
-        let stack = stack(&branch_metadata);
-        lore_debug!("Loaded local metadata for {side} branch {branch}, found stack {stack:?}");
-        return stack;
-    }
-
-    let Ok(remote) = repository.remote().await else {
-        lore_debug!("No local {side} branch metadata available and have no remote");
-        return vec![];
-    };
-
-    let Ok(branch_metadata) = metadata_remote(remote, repository.clone(), branch).await else {
+    let Ok(branch_metadata) = metadata(repository, branch).await else {
         lore_debug!("No local or remote {side} branch metadata available");
         return vec![];
     };
-
     let stack = stack(&branch_metadata);
-    lore_debug!("Loaded remote metadata for {side} branch {branch}, found stack {stack:?}");
+    lore_debug!("Loaded metadata for {side} branch {branch}, found stack {stack:?}");
     stack
 }
 

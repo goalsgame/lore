@@ -7,7 +7,6 @@ use lore_base::types::Hash;
 use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
 use lore_proto::lore::repository::v1::RepositoryDeleteResponse;
 use lore_revision::branch;
-use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;

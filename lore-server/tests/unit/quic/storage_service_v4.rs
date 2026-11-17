@@ -478,6 +478,7 @@ mod authorized_session {
                     "test-user".into(),
                     grants,
                     Some(expired_token.clone()),
+                    Vec::new(),
                 )
                 .unwrap();
             for command in [

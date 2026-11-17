@@ -131,12 +131,15 @@ mod name_scoped_token {
     use std::sync::Arc;
 
     use lore_base::runtime::LORE_CONTEXT;
+    use lore_revision::lore::RepositoryId;
     use lore_server::auth::jwt::AuthorizationToken;
     use lore_server::auth::jwt::ResourcePermission;
     use lore_server::authnz::repository_authorizer::RawToken;
+    use lore_server::authnz::repository_registry::RepositoryRegistry;
     use lore_server::hooks::HookDispatcher;
     use lore_telemetry::InstrumentProvider;
     use opentelemetry::KeyValue;
+    use tonic::Request;
 
     use super::*;
     use crate::store::test_support::test_store_create;
@@ -189,7 +192,7 @@ mod name_scoped_token {
                 let id = request.get_ref().id.clone();
                 let err = handler(
                     request,
-                    None,
+                    &RepositoryRegistry::Unregistered,
                     immutable_store.clone(),
                     mutable_store.clone(),
                     &hook_dispatcher,
@@ -230,7 +233,7 @@ mod name_scoped_token {
             .scope(execution, async move {
                 handler(
                     scoped_request("goalables/app"),
-                    None,
+                    &RepositoryRegistry::Unregistered,
                     immutable_store,
                     mutable_store,
                     &hook_dispatcher,

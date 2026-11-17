@@ -24,8 +24,8 @@ use tracing::warn;
 
 use super::repository_query::repository_query_id;
 use super::repository_query::repository_query_name;
-use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::authnz::repository_authorizer::authorize_repository_create;
+use crate::authnz::repository_registry::RepositoryRegistry;
 use crate::grpc::FilterSlowDownExt;
 use crate::grpc::ServerResultExt;
 use crate::grpc::extract_authorization_header;
