@@ -9,9 +9,15 @@ use axum::response::IntoResponse;
 
 use crate::http::server::ServerHealth;
 
+/// Body of the 503 answered while the server drains before shutting down.
+pub const DRAINING_BODY: &str = "draining";
+
 pub async fn handler(State(state): State<Arc<ServerHealth>>) -> impl IntoResponse {
-    if state.store_health_check && !state.available.load(Ordering::Relaxed) {
-        return StatusCode::SERVICE_UNAVAILABLE;
+    if state.draining.load(Ordering::Relaxed) {
+        return (StatusCode::SERVICE_UNAVAILABLE, DRAINING_BODY).into_response();
     }
-    StatusCode::OK
+    if state.store_health_check && !state.available.load(Ordering::Relaxed) {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    StatusCode::OK.into_response()
 }

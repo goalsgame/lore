@@ -531,3 +531,101 @@ mod validate_endpoint_security {
         assert!(message.contains("cert_chain"), "got: {message}");
     }
 }
+
+/// The sequence between a shutdown signal and the endpoints closing.
+mod drain_then_close {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use lore_server::server::drain_then_close;
+
+    /// Long enough for a loaded host to observe the state in the middle of it.
+    const DRAIN: Duration = Duration::from_millis(500);
+
+    #[tokio::test]
+    async fn health_reports_draining_at_once_and_endpoints_close_after_the_drain() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let draining = AtomicBool::new(false);
+        let started = Instant::now();
+
+        let drain = drain_then_close(&shutdown_tx, &draining, DRAIN, std::future::pending());
+        tokio::pin!(drain);
+        assert!(
+            tokio::time::timeout(DRAIN / 5, &mut drain).await.is_err(),
+            "the drain lasts its full period"
+        );
+        assert!(draining.load(Ordering::Relaxed));
+        assert!(
+            !*shutdown_rx.borrow(),
+            "endpoints keep accepting while draining"
+        );
+
+        drain.await;
+        assert!(*shutdown_rx.borrow());
+        assert!(started.elapsed() >= DRAIN);
+    }
+
+    #[tokio::test]
+    async fn no_drain_closes_endpoints_at_once() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let draining = AtomicBool::new(false);
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            drain_then_close(
+                &shutdown_tx,
+                &draining,
+                Duration::ZERO,
+                std::future::pending(),
+            ),
+        )
+        .await
+        .expect("no drain does not wait");
+
+        assert!(draining.load(Ordering::Relaxed));
+        assert!(*shutdown_rx.borrow());
+    }
+
+    #[tokio::test]
+    async fn a_second_signal_ends_the_drain_early() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let draining = AtomicBool::new(false);
+        let started = Instant::now();
+
+        drain_then_close(
+            &shutdown_tx,
+            &draining,
+            Duration::from_secs(3600),
+            tokio::time::sleep(DRAIN),
+        )
+        .await;
+
+        assert!(*shutdown_rx.borrow());
+        assert!(started.elapsed() < Duration::from_secs(60));
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_failing_while_draining_closes_the_rest_at_once() {
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let draining = AtomicBool::new(false);
+        let started = Instant::now();
+
+        tokio::join!(
+            drain_then_close(
+                &shutdown_tx,
+                &draining,
+                Duration::from_secs(3600),
+                std::future::pending(),
+            ),
+            async {
+                tokio::time::sleep(DRAIN).await;
+                shutdown_tx.send(true).unwrap();
+            },
+        );
+
+        assert!(*shutdown_rx.borrow());
+        assert!(started.elapsed() < Duration::from_secs(60));
+    }
+}

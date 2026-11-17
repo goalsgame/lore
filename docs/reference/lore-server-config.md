@@ -86,7 +86,8 @@ The `[server]` table and its sub-tables configure the network endpoints, gracefu
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close after a shutdown signal. |
+| `server.drain_seconds` | `0` | Seconds after a shutdown signal during which `/health_check` answers `503` while every endpoint keeps accepting and serving, so a load balancer can move new connections elsewhere. A second signal ends the drain early. |
+| `server.connection_close_timeout_seconds` | `5` | Seconds to wait for open connections to close once the endpoints stop accepting new ones. gRPC connections are sent `GOAWAY` and their requests finish; notification subscriptions end with `UNAVAILABLE`; QUIC connections stop reading new requests, finish those in flight and are then closed. |
 | `server.runtime_shutdown_timeout_seconds` | `25` | Seconds to wait for the async runtime to shut down after connections close. Accepts the alias `shutdown_delay_seconds`. |
 | `server.trust_unsigned_identity` | `false` | Without `[server.auth]`, take the caller's identity from an unsigned bearer token on gRPC, HTTP and QUIC. See [Unsigned identity](#unsigned-identity). The server refuses to start if it is set beside `[server.auth]`. |
 | `server.upstream_connections` | `4` | Storage connections the server opens to the [upstream](../glossary.md#upstream) of a `remote` immutable or mutable store for each identity it authenticates there as (see [Remote store mode](#remote-store-mode)), from `1` to `10`; `0` reads as `1`. The connections belong to the upstream and the identity, not to a repository: every repository the server reaches there as that identity shares them, as do its QUIC, gRPC and socket handlers. |

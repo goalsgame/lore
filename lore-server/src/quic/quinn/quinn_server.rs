@@ -26,6 +26,8 @@ use socket2::Domain;
 use socket2::Protocol;
 use socket2::Type;
 use tokio_metrics::TaskMonitor;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::debug;
 use tracing::info;
 use tracing::info_span;
@@ -54,9 +56,21 @@ const MAX_INCOMING: usize = 1 << 16;
 /// for one endpoint.
 const INCOMING_BUFFER_SIZE_TOTAL: u64 = 100 << 20;
 
+/// How often a draining connection checks whether its last request has been answered, and
+/// whether the peer has acknowledged every answer.
+const DRAIN_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
+/// Application close code and reason sent to peers when the server shuts down.
+const SHUTDOWN_CLOSE_CODE: u32 = 0;
+const SHUTDOWN_CLOSE_REASON: &[u8] = b"server shutting down";
+
 pub struct QuinnServer {
     /// One per socket, all serving the same port.
     endpoints: Vec<quinn::Endpoint>,
+    /// Cancelled when the server starts draining: connections stop reading new requests.
+    draining: CancellationToken,
+    /// One task per accepted connection, each ending once its connection is closed.
+    connections: TaskTracker,
 }
 
 impl QuinnServer {
@@ -160,17 +174,48 @@ impl QuinnServer {
                 .collect::<std::io::Result<Vec<_>>>()?
         };
 
-        run_loop(&endpoints, settings)?;
+        let draining = CancellationToken::new();
+        let connections = TaskTracker::new();
+        run_loop(&endpoints, settings, &draining, &connections)?;
 
-        Ok(Self { endpoints })
+        Ok(Self {
+            endpoints,
+            draining,
+            connections,
+        })
+    }
+
+    /// Stop accepting connections and close the open ones once they are idle.
+    ///
+    /// New handshakes are refused at once. Every open connection stops reading new requests,
+    /// answers the ones it has already read, and is then closed with application code 0, which
+    /// a client treats as a reason to reconnect. Connections still busy after `timeout` are
+    /// closed regardless, as [`QuinnServer::close`] does.
+    pub async fn shutdown(&self, timeout: Duration) {
+        for endpoint in &self.endpoints {
+            endpoint.set_server_config(None);
+        }
+        self.draining.cancel();
+        self.connections.close();
+        if tokio::time::timeout(timeout, self.connections.wait())
+            .await
+            .is_err()
+        {
+            warn!(
+                remaining = self.connections.len(),
+                "QUIC connections still busy after {timeout:?}, closing them"
+            );
+        }
+        self.close().await;
     }
 
     /// Gracefully close all connections on every endpoint. Sends `CONNECTION_CLOSE`
     /// frames to all peers (causing accept loops to return `None`) and waits for
     /// the frames to be delivered.
     pub async fn close(&self) {
+        self.draining.cancel();
         for endpoint in &self.endpoints {
-            endpoint.close(VarInt::from_u32(0), b"server shutting down");
+            endpoint.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
         }
         for endpoint in &self.endpoints {
             endpoint.wait_idle().await;
@@ -296,7 +341,12 @@ fn bind_socket(address: SocketAddr) -> anyhow::Result<std::net::UdpSocket> {
     Ok(socket.into())
 }
 
-fn run_loop(endpoints: &[quinn::Endpoint], settings: QuinnConfig) -> anyhow::Result<()> {
+fn run_loop(
+    endpoints: &[quinn::Endpoint],
+    settings: QuinnConfig,
+    draining: &CancellationToken,
+    connections: &TaskTracker,
+) -> anyhow::Result<()> {
     let stream_handler_factory = Arc::new(settings.stream_handler_factory);
     let metrics_interval = settings.metrics_frequency;
 
@@ -342,6 +392,8 @@ fn run_loop(endpoints: &[quinn::Endpoint], settings: QuinnConfig) -> anyhow::Res
                 monitor.clone(),
                 metrics_interval,
                 stream_handler_factory.clone(),
+                draining.clone(),
+                connections.clone(),
             );
         }
     }
@@ -357,6 +409,8 @@ fn spawn_listener(
     monitor: TaskMonitor,
     metrics_interval: Duration,
     stream_handler_factory: Arc<Box<dyn StreamHandlerFactory>>,
+    draining: CancellationToken,
+    connections: TaskTracker,
 ) {
     // The `instrument` function from `tracing` conflicts with the `instrument` function from
     // the `TaskMonitor` so we need to use a scoped import.
@@ -372,23 +426,27 @@ fn spawn_listener(
 
                     let monitor = monitor.clone();
                     let stream_handler_factory = stream_handler_factory.clone();
+                    let draining = draining.clone();
 
                     lore_spawn_net!(
-                        LORE_CONTEXT.scope(
-                            execution_context(),
-                            async move {
-                                if let Err(error) = handle_conn(
-                                    connection,
-                                    monitor,
-                                    metrics_interval,
-                                    stream_handler_factory,
-                                )
-                                .await
-                                {
-                                    warn!("Error handling connection: {error}");
+                        connections.track_future(
+                            LORE_CONTEXT.scope(
+                                execution_context(),
+                                async move {
+                                    if let Err(error) = handle_conn(
+                                        connection,
+                                        monitor,
+                                        metrics_interval,
+                                        stream_handler_factory,
+                                        draining,
+                                    )
+                                    .await
+                                    {
+                                        warn!("Error handling connection: {error}");
+                                    }
                                 }
-                            }
-                            .in_current_span(),
+                                .in_current_span(),
+                            )
                         )
                     );
                 }
@@ -396,6 +454,22 @@ fn spawn_listener(
             .in_current_span(),
         )
     );
+}
+
+/// Waits until the peer has acknowledged every byte written to the connection's streams, or the
+/// connection is closed.
+///
+/// Streams are not finished to learn of delivery: a client reconnects on a finished stream.
+async fn wait_for_stream_data_to_be_acknowledged(connection: &quinn::Connection) {
+    let acknowledged = async {
+        while connection.stats().unacked_stream_bytes > 0 {
+            tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+        }
+    };
+    tokio::select! {
+        () = acknowledged => {}
+        _ = connection.closed() => {}
+    }
 }
 
 fn get_protocol(connection: &quinn::Connection) -> Result<String, anyhow::Error> {
@@ -422,6 +496,7 @@ async fn handle_conn(
     monitor: TaskMonitor,
     connection_metrics_interval: Duration,
     stream_handler_factory: Arc<Box<dyn StreamHandlerFactory>>,
+    draining: CancellationToken,
 ) -> anyhow::Result<()> {
     let connection = conn.await?;
 
@@ -463,10 +538,17 @@ async fn handle_conn(
     let connection_handler: Arc<Box<dyn StreamDataHandler>> =
         Arc::new(service_builder(context.clone()));
 
-    // Keeps accepting requests until the connection closes or errors
+    // Streams still reading requests.
+    let readers = TaskTracker::new();
+
+    // Keeps accepting requests until the connection closes or errors, or the server drains
     loop {
         trace!("Waiting for stream on connection id: {connection_id}");
-        let stream = connection.accept_bi().await;
+        let stream = tokio::select! {
+            biased;
+            () = draining.cancelled() => break,
+            stream = connection.accept_bi() => stream,
+        };
 
         let (send, mut recv) = match stream {
             Err(quinn::ConnectionError::ApplicationClosed { .. }) => {
@@ -495,10 +577,17 @@ async fn handle_conn(
             use tracing::instrument::Instrument;
 
             let handler = connection_handler.clone();
+            let draining = draining.clone();
+            let reader = readers.token();
+            let connection = connection.clone();
+            let send = Arc::new(tokio::sync::Mutex::new(send));
 
             async move {
                 // Get the request off the transport
-                match handler.handle_stream(&mut recv, send).await {
+                match handler
+                    .handle_stream(&mut recv, send.clone(), &draining)
+                    .await
+                {
                     Ok(_) => {
                         debug!("Successfully handled request for connection");
                     }
@@ -510,6 +599,13 @@ async fn handle_conn(
                         }
                     }
                 }
+                drop(reader);
+                // Both halves held open until the connection closes: finishing or stopping a
+                // stream makes the client reconnect, abandoning answers still in transit.
+                if draining.is_cancelled() {
+                    connection.closed().await;
+                    drop(send);
+                }
             }
             .instrument(info_span!("handle_stream"))
         };
@@ -518,6 +614,16 @@ async fn handle_conn(
         // hands processing to core from inside the stream handler.
         lore_spawn_net!(monitor.instrument(LORE_CONTEXT.scope(execution.clone(), handle_future)));
     }
+
+    readers.close();
+    readers.wait().await;
+    while connection_handler.in_flight() > 0 {
+        tokio::time::sleep(DRAIN_POLL_INTERVAL).await;
+    }
+    wait_for_stream_data_to_be_acknowledged(&connection).await;
+    info!("Connection drained, closing");
+    connection.close(VarInt::from_u32(SHUTDOWN_CLOSE_CODE), SHUTDOWN_CLOSE_REASON);
+    Ok(())
 }
 
 #[cfg(feature = "test-util")]

@@ -10,6 +10,7 @@ use lore_proto::lore::notification::PublishRequest;
 use lore_revision::lore::RepositoryId;
 use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::USER_ID;
+use tokio::sync::watch;
 use tokio_stream::Stream;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
@@ -39,6 +40,8 @@ pub struct NotificationService {
     /// subscriber for the length of a request instead of the length of a
     /// permission question.
     authorization_timeout: Duration,
+    /// Becomes `true` when the server stops accepting connections; open subscriptions then end.
+    closing: Option<watch::Receiver<bool>>,
 }
 
 impl NotificationService {
@@ -51,6 +54,38 @@ impl NotificationService {
             sender,
             authorizer,
             authorization_timeout,
+            closing: None,
+        }
+    }
+
+    /// End every subscription with `UNAVAILABLE` once `closing` becomes `true`, so that a
+    /// subscriber reconnects to another server instead of holding this one open until it exits.
+    #[must_use]
+    pub fn closing_on(mut self, closing: watch::Receiver<bool>) -> Self {
+        self.closing = Some(closing);
+        self
+    }
+}
+
+/// Ends `events` with `UNAVAILABLE` once `closing` becomes `true`.
+fn end_on_close(
+    events: impl Stream<Item = Result<lore_proto::lore::notification::Event, Status>> + Send + 'static,
+    mut closing: watch::Receiver<bool>,
+) -> impl Stream<Item = Result<lore_proto::lore::notification::Event, Status>> + Send + 'static {
+    async_stream::stream! {
+        tokio::pin!(events);
+        loop {
+            tokio::select! {
+                biased;
+                Ok(()) = async { closing.wait_for(|&closing| closing).await.map(drop) } => {
+                    yield Err(Status::unavailable("server is shutting down"));
+                    break;
+                }
+                event = events.next() => match event {
+                    Some(event) => yield event,
+                    None => break,
+                },
+            }
         }
     }
 }
@@ -113,7 +148,11 @@ impl lore_notification::NotificationService for NotificationService {
             }
         });
 
-        Ok(Response::new(Box::pin(stream) as Self::SubscribeStream))
+        let stream: Self::SubscribeStream = match self.closing.clone() {
+            Some(closing) => Box::pin(end_on_close(stream, closing)),
+            None => Box::pin(stream),
+        };
+        Ok(Response::new(stream))
     }
 
     async fn publish(&self, _request: Request<PublishRequest>) -> Result<Response<()>, Status> {

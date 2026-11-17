@@ -4442,3 +4442,51 @@ fn connect_and_transfer_with_bbr(bbr: congestion::BbrConfig) {
     let _ = chunks.finalize();
     assert_eq!(received, msg.len());
 }
+
+// LORE: not upstream. Re-apply with `ConnectionStats::unacked_stream_bytes` when re-vendoring.
+/// Stream data counts as unacknowledged from the write, through consecutive losses, until the
+/// peer acknowledges it, on a stream that is never finished.
+#[test]
+fn unacked_stream_bytes_through_consecutive_losses() {
+    let _guard = subscribe();
+    let mut pair = Pair::default();
+    let (client_ch, server_ch) = pair.connect();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().unacked_stream_bytes,
+        0
+    );
+
+    const MSG: &[u8] = b"unacknowledged";
+    let s = pair.client_streams(client_ch).open(Dir::Bi).unwrap();
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().unacked_stream_bytes,
+        MSG.len() as u64
+    );
+
+    let datagrams = pair.client_conn_mut(client_ch).stats().udp_tx.datagrams;
+    for _ in 0..6 {
+        pair.drive_client();
+        pair.server.inbound.clear();
+        pair.time = pair.client.next_wakeup().unwrap();
+    }
+    assert!(pair.client_conn_mut(client_ch).stats().udp_tx.datagrams >= datagrams + 10);
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().unacked_stream_bytes,
+        MSG.len() as u64
+    );
+
+    pair.drive();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().unacked_stream_bytes,
+        0
+    );
+    assert_matches!(pair.server_streams(server_ch).accept(Dir::Bi), Some(stream) if stream == s);
+
+    pair.client_send(client_ch, s).write(MSG).unwrap();
+    pair.client_send(client_ch, s).reset(0u32.into()).unwrap();
+    assert_eq!(
+        pair.client_conn_mut(client_ch).stats().unacked_stream_bytes,
+        0
+    );
+}

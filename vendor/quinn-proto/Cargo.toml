@@ -1,6 +1,6 @@
 # Vendored from crates.io quinn-proto 0.11.19 (MIT OR Apache-2.0, the quinn authors).
 #
-# Vendored to carry four additions the published crate does not have, each marked with a `LORE:`
+# Vendored to carry five additions the published crate does not have, each marked with a `LORE:`
 # comment at the site:
 #
 #   - `TransportConfig::max_rtt`, an upper bound applied to each RTT sample before it reaches the
@@ -19,10 +19,13 @@
 #     `BbrConfig::max_window` caps it, never below BBR's minimum window of four packets, which now
 #     floors the configured initial window too. Upstream grew the window on every ack in STARTUP,
 #     so a sender held back by flow control, which never leaves STARTUP, grew it without limit.
+#   - `ConnectionStats::unacked_stream_bytes`, the stream data written and not yet acknowledged
+#     by the peer, sent or not. It tells a sender that every byte it wrote has been delivered
+#     without finishing the stream, which the published crate only reports per finished stream.
 #
-# `max_rtt`, `is_crypto` and `max_window` are used from production code, so dropping the
-# `[patch.crates-io]` override in the workspace root does not compile; it would also lose the BBR
-# changes without a compile error. The tree is otherwise the published crate, plus elided-lifetime
+# `max_rtt`, `is_crypto`, `max_window` and `unacked_stream_bytes` are used from production code, so
+# dropping the `[patch.crates-io]` override in the workspace root does not compile; it would also
+# lose the BBR changes without a compile error. The tree is otherwise the published crate, plus elided-lifetime
 # annotations.
 #
 # To move to a new upstream release: unpack that version's crates.io tarball over this directory,

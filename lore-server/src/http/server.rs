@@ -76,6 +76,8 @@ pub struct ServerHealth {
     pub available: AtomicBool,
     pub interval_timeout: Option<(Duration, Duration)>,
     pub store_health_check: bool,
+    /// Set once the server has been asked to shut down; `/health_check` then answers 503.
+    pub draining: Arc<AtomicBool>,
 }
 
 impl ServerHealth {
@@ -87,6 +89,7 @@ impl ServerHealth {
             available: AtomicBool::new(true),
             interval_timeout: None,
             store_health_check: false,
+            draining: Arc::default(),
         }
     }
 }
@@ -111,6 +114,8 @@ pub struct LoreHttpServerSettings {
     pub available_interval_seconds: u64,
     pub available_timeout_seconds: u64,
     pub store_health_check: bool,
+    /// Shared with the shutdown sequence, which sets it when draining starts.
+    pub draining: Arc<AtomicBool>,
     pub presign: PresignSettings,
     /// User-agent filter applied to HTTP metrics labels.
     pub user_agent_filter: Arc<UserAgentFilter>,
@@ -290,6 +295,7 @@ fn build_router(
             None
         },
         store_health_check: settings.store_health_check,
+        draining: settings.draining.clone(),
     };
 
     if settings.health_only {
@@ -363,12 +369,13 @@ impl LoreHttpServer {
     /// Starts a minimal HTTP server that only serves the `/health_check` endpoint.
     ///
     /// Used during maintenance mode so that load balancers and monitoring systems
-    /// can still reach the server. Always returns 200 OK (store health checks are
-    /// disabled since the server is intentionally in a reduced state).
+    /// can still reach the server. Returns 200 OK until `draining` is set (store health
+    /// checks are disabled since the server is intentionally in a reduced state).
     pub async fn serve_maintenance(
         host: String,
         port: i32,
         user_agent_filter: Arc<UserAgentFilter>,
+        draining: Arc<AtomicBool>,
         signal: impl Future<Output = ()> + Send + 'static,
     ) -> Result<()> {
         let addr = SocketAddr::from_str(format!("{host}:{port}").as_str())
@@ -380,6 +387,7 @@ impl LoreHttpServer {
             available: AtomicBool::new(true),
             interval_timeout: None,
             store_health_check: false,
+            draining,
         });
 
         let app = Router::new()

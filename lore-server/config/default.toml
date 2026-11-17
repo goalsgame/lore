@@ -17,6 +17,9 @@
 # take effect.
 
 [server]
+# Seconds after SIGTERM during which /health_check answers 503 while the server
+# keeps serving, so a load balancer can stop sending it new connections.
+drain_seconds = 0
 connection_close_timeout_seconds = 5
 runtime_shutdown_timeout_seconds = 25
 

@@ -143,3 +143,43 @@ async fn subscribe_stays_open_under_the_allow_all_authorizer() {
         .await
         .expect("a no-auth server's subscribe is open");
 }
+
+/// Once the server stops accepting connections, an open subscription ends with `UNAVAILABLE`
+/// so the subscriber reconnects elsewhere, and is not held open until the server exits.
+#[tokio::test]
+async fn a_subscription_ends_with_unavailable_when_the_server_closes() {
+    use tokio_stream::StreamExt as _;
+
+    let (closing_tx, closing_rx) = tokio::sync::watch::channel(false);
+    let service = NotificationService::new(
+        Arc::new(lore_server::notification::local::NotificationSender::default()),
+        Arc::new(AllowAllRepositoryAuthorizer),
+        Duration::from_secs(5),
+    )
+    .closing_on(closing_rx);
+    let request = Request::new(SubscribeRequest {
+        repository: Context::from(repository(1)).into(),
+    });
+    let mut events = service
+        .subscribe(request)
+        .await
+        .expect("subscribe is open")
+        .into_inner();
+
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), events.next())
+            .await
+            .is_err(),
+        "the subscription stays open until the server closes"
+    );
+
+    closing_tx.send(true).unwrap();
+    let ended = tokio::time::timeout(Duration::from_secs(5), events.next())
+        .await
+        .expect("closing must end the subscription");
+    assert_eq!(
+        ended.expect("one final item").unwrap_err().code(),
+        Code::Unavailable
+    );
+    assert!(events.next().await.is_none());
+}
