@@ -273,6 +273,118 @@ fn a_net_request_is_scaled_by_the_limit() {
     );
 }
 
+/// Sizing for storage connections gives the core runtime one thread fewer than the
+/// processor count, down to the floor, and the net runtime a thread for each
+/// connection, from its default up to half of the two together. A process that
+/// opens the connections takes those threads from the core runtime, so it runs as
+/// many CPU-bound threads as with one connection; one that serves them adds them.
+#[test]
+fn connections_divide_the_shared_threads_at_every_core_count() {
+    for cores in 1..=256 {
+        let defaults = default_thread_counts(cores, IO_REQUEST);
+        let one = threads_for_connections(defaults, NetConnections::Opened(1));
+        assert_eq!(
+            (one.worker, one.net),
+            ((cores - 1).max(MIN_THREADS_PER_POOL), DEFAULT_NET_THREADS),
+            "one connection on {cores} cores"
+        );
+        for connections in 1..=10 {
+            let opened = threads_for_connections(defaults, NetConnections::Opened(connections));
+            let served = threads_for_connections(defaults, NetConnections::Served(connections));
+            let case =
+                format!("{connections} connections on {cores} cores gave {opened:?}, {served:?}");
+            assert_eq!(opened.worker + opened.net, one.worker + one.net, "{case}");
+            assert!(opened.net >= DEFAULT_NET_THREADS, "{case}");
+            assert!(opened.net <= connections.max(DEFAULT_NET_THREADS), "{case}");
+            assert!(opened.worker >= opened.net, "{case}");
+            assert_eq!(
+                (served.worker, served.net),
+                (one.worker, opened.net),
+                "{case}"
+            );
+            for counts in [opened, served] {
+                assert_eq!(
+                    (counts.blocking, counts.io),
+                    (defaults.blocking, defaults.io),
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// (core, net) threads from small to large hosts, for 1, 4 and 10 opened
+/// connections and for the service's 10 served ones: few cores keep the floor, and
+/// a host with enough cores gives each connection a thread at little cost to the
+/// core runtime.
+#[test]
+fn connections_on_small_and_large_hosts() {
+    use NetConnections::Opened;
+    use NetConnections::Served;
+    let sized = |cores, connections| {
+        let counts = threads_for_connections(default_thread_counts(cores, IO_REQUEST), connections);
+        (counts.worker, counts.net)
+    };
+    for (cores, expected) in [
+        (1, [(2, 2), (2, 2), (2, 2), (2, 2)]),
+        (2, [(2, 2), (2, 2), (2, 2), (2, 2)]),
+        (4, [(3, 2), (3, 2), (3, 2), (3, 2)]),
+        (8, [(7, 2), (5, 4), (5, 4), (7, 4)]),
+        (16, [(15, 2), (13, 4), (9, 8), (15, 8)]),
+        (32, [(31, 2), (29, 4), (23, 10), (31, 10)]),
+        (128, [(127, 2), (125, 4), (119, 10), (127, 10)]),
+    ] {
+        assert_eq!(
+            [Opened(1), Opened(4), Opened(10), Served(10)]
+                .map(|connections| sized(cores, connections)),
+            expected,
+            "{cores} cores"
+        );
+    }
+}
+
+/// An explicit net request, as a serving process's one per processor or
+/// `LORE_NET_THREADS` makes, takes precedence over the connections and leaves the
+/// core runtime at one thread per processor. Without one the pools are sized for
+/// the connections, and a process that set none keeps the defaults.
+#[test]
+fn an_explicit_net_request_takes_precedence_over_the_connections() {
+    let defaults = default_thread_counts(16, IO_REQUEST);
+    assert_eq!(requested_counts(defaults, None, None), defaults);
+    assert_eq!(
+        requested_counts(defaults, Some(16), None),
+        ThreadCounts {
+            net: 16,
+            ..defaults
+        }
+    );
+    for connections in [
+        NetConnections::Opened(1),
+        NetConnections::Opened(10),
+        NetConnections::Served(10),
+    ] {
+        assert_eq!(
+            requested_counts(defaults, None, Some(connections)),
+            threads_for_connections(defaults, connections)
+        );
+        assert_eq!(
+            requested_counts(defaults, Some(16), Some(connections)),
+            ThreadCounts {
+                net: 16,
+                ..defaults
+            }
+        );
+    }
+}
+
+/// Building a runtime settles the connections, so both runtimes are sized for the
+/// same ones: connections set afterwards are refused.
+#[test]
+fn connections_are_refused_once_a_runtime_exists() {
+    let _ = net_runtime();
+    assert!(!set_net_connections(NetConnections::Opened(4)));
+}
+
 /// The limit is a ceiling on the total whatever the per-pool requests are, so
 /// no knob can raise the process above what an embedder asked for. The
 /// per-pool floor is a property of scaling down rather than of every result:
@@ -328,137 +440,4 @@ async fn guarded_task_completes() {
 
     runtime_flush_guarded().await;
     assert!(completed.load(Ordering::Acquire));
-}
-
-#[test]
-fn io_ownership_propagates_without_replacing_command_context() {
-    use lore_io::lease::IoLease;
-    let lease = IoLease::new(Arc::new(()));
-    let expected = lease.clone();
-    let context: Arc<dyn Any + Send + Sync> = Arc::new("io-owner");
-    net_runtime().block_on(LORE_CONTEXT.scope(
-        context,
-        lease.scope(async move {
-            let task = lore_base::lore_spawn!({
-                let expected = expected.clone();
-                async move {
-                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
-                    assert_eq!(context_label(), Some("io-owner"));
-                }
-            });
-            let core = lore_base::lore_spawn_core!({
-                let expected = expected.clone();
-                async move {
-                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
-                    assert_eq!(context_label(), Some("io-owner"));
-                }
-            });
-            let net = lore_base::lore_spawn_net!({
-                let expected = expected.clone();
-                async move {
-                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
-                    assert_eq!(context_label(), Some("io-owner"));
-                }
-            });
-            let (sender, receiver) = tokio::sync::oneshot::channel();
-            runtime_spawn_guarded({
-                let expected = expected.clone();
-                async move {
-                    sender
-                        .send(
-                            IoLease::current().unwrap().ptr_eq(&expected)
-                                && try_lore_context().is_none(),
-                        )
-                        .unwrap();
-                }
-            });
-            let blocking = lore_base::lore_spawn_blocking!({
-                let expected = expected.clone();
-                move || {
-                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
-                    assert_eq!(context_label(), Some("io-owner"));
-                }
-            });
-            let plain = lore_base::lore_spawn_blocking_nocontext!({
-                let expected = expected.clone();
-                move || {
-                    assert!(IoLease::current().unwrap().ptr_eq(&expected));
-                    assert!(try_lore_context().is_none());
-                }
-            });
-            task.await.unwrap();
-            core.await.unwrap();
-            blocking.await.unwrap();
-            plain.await.unwrap();
-            net.await.unwrap();
-            assert!(receiver.await.unwrap());
-        }),
-    ));
-    assert!(IoLease::current().is_none());
-}
-
-#[test]
-fn detached_connection_task_clears_ambient_ownership_and_does_not_pin_caller() {
-    use std::future::Future;
-    use std::task::Context;
-    use std::task::Poll;
-    use std::task::Waker;
-
-    use lore_io::lease::IoLease;
-    let owner = Arc::new(());
-    let weak = Arc::downgrade(&owner);
-    let lease = IoLease::new(owner);
-    let mut detached = Box::pin(lease.sync_scope(|| {
-        detached_task(std::future::poll_fn(|_context| {
-            assert!(IoLease::current().is_none());
-            Poll::<()>::Pending
-        }))
-    }));
-    drop(lease);
-    assert!(
-        weak.upgrade().is_none(),
-        "connection task must not retain scoped caller"
-    );
-    let unrelated = IoLease::new(Arc::new(()));
-    unrelated.sync_scope(|| {
-        assert!(
-            detached
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_pending()
-        );
-        assert!(IoLease::current().unwrap().ptr_eq(&unrelated));
-    });
-    let mut ordinary = Box::pin(spawned_task(std::future::poll_fn(|_context| {
-        assert!(IoLease::current().is_none());
-        Poll::Ready(())
-    })));
-    unrelated.sync_scope(|| {
-        assert!(
-            ordinary
-                .as_mut()
-                .poll(&mut Context::from_waker(Waker::noop()))
-                .is_ready()
-        );
-    });
-}
-
-#[test]
-fn bounded_shutdown_wait_keeps_io_scope_across_runtime_thread_handoff() {
-    use lore_io::lease::IoLease;
-    let lease = IoLease::new(Arc::new(()));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .unwrap();
-    runtime.block_on(async {
-        let expected = lease.clone();
-        assert!(lease.sync_scope(|| shutdown_block_on(
-            async move {
-                assert!(IoLease::current().unwrap().ptr_eq(&expected));
-            },
-            Duration::from_secs(10)
-        )));
-        assert!(IoLease::current().is_none());
-    });
 }

@@ -380,7 +380,7 @@ mod tests {
 
                 let metadata =
                     std::fs::metadata(file_path.as_path()).expect("Failed to stat test file");
-                let (expected, _size) = lore_revision::util::fs::file_mtime_and_size(&metadata);
+                let expected = lore_revision::util::fs::file_mtime(&metadata);
                 assert_ne!(expected, 0, "test file has no usable modified time");
                 assert_eq!(
                     state::file_modified_time(repository.clone(), &relative_path).await,
@@ -830,18 +830,26 @@ mod tests {
                 let collector = state::RecordedModifiedTimes::below(floor);
                 collector.record(&created.repository, &relative_path, floor - 1);
                 collector.record(&created.repository, &relative_path, floor);
-                assert_eq!(collector.entries.len(), 1, "recorded");
+                assert_eq!(
+                    collector.records.len() + collector.store.len(),
+                    1,
+                    "recorded"
+                );
                 let entry = |mtime| {
                     state::file_modified_time_entry(&created.repository, &relative_path, mtime)
                 };
                 collector.push(entry(floor - 1));
                 collector.push(entry(floor));
-                assert_eq!(collector.entries.len(), 2, "pushed");
+                assert_eq!(collector.records.len() + collector.store.len(), 2, "pushed");
                 let unbounded = state::RecordedModifiedTimes::default();
                 unbounded.push(entry(floor - 1));
                 unbounded.push(entry(floor));
                 collector.absorb(unbounded);
-                assert_eq!(collector.entries.len(), 3, "absorbed");
+                assert_eq!(
+                    collector.records.len() + collector.store.len(),
+                    3,
+                    "absorbed"
+                );
             })
             .await;
     }

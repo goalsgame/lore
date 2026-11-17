@@ -2,11 +2,14 @@
 // SPDX-License-Identifier: MIT
 use std::collections::HashMap;
 use std::fs;
+use std::num::NonZeroU64;
+use std::num::NonZeroUsize;
 use std::path::Path;
 use std::path::PathBuf;
 use std::time::Instant;
 
 use lore_revision::cluster::peer::Locality;
+use lore_revision::store::composite::ReadReplicaSelection;
 use lore_server::plugins::PluginRegistry;
 use lore_server::settings::*;
 use lore_server::store::resolve_plugin_config_with_fallback;
@@ -53,6 +56,29 @@ fn server_settings_default_the_local_store_monitor_table() {
         server.local_store_monitor.low_space_threshold_bytes,
         TEN_GIB
     );
+}
+
+/// A `remote` store opens four storage connections to its upstream unless `[server]` names another
+/// count.
+#[test]
+fn server_settings_default_four_upstream_connections() {
+    let default: ServerSettings = toml::from_str("").expect("[server] with no keys");
+    let named: ServerSettings =
+        toml::from_str("upstream_connections = 2").expect("[server] naming a count");
+
+    assert_eq!(default.upstream_connections, 4);
+    assert_eq!(named.upstream_connections, 2);
+}
+
+/// Each socket limit that `[server.uds]` does not name takes its default.
+#[test]
+fn uds_settings_default_limits_of_their_own() {
+    let uds: UdsSettings = toml::from_str("enabled = true").expect("[server.uds] with defaults");
+
+    assert_eq!(uds.credits, 4000);
+    assert_eq!(uds.credit_bytes, 256 * 1024 * 1024);
+    assert_eq!(uds.max_connections_per_socket, 64);
+    assert_eq!(uds.socket_bytes, 1024 * 1024 * 1024);
 }
 
 #[test]
@@ -279,6 +305,80 @@ fn settings_with_oidc_keys(authorizer_keys: &str, oidc_keys: &str) -> Settings {
         "#
     ))
     .expect("[server.auth.oidc] must parse")
+}
+
+/// Only an exchange issuer `jwt_issuer` doesn't list gets keys of its own.
+#[test]
+fn a_separate_exchange_issuer_is_one_jwt_issuer_does_not_list() {
+    let separate_exchange_issuer = |oidc_keys: &str| {
+        settings_with_oidc_keys(TIER_2, oidc_keys)
+            .server
+            .auth
+            .expect("[server.auth] is present")
+            .separate_exchange_issuer()
+            .map(str::to_string)
+    };
+    let template = r#"resource_template = "https://lore.example.com/partitions/{id}""#;
+
+    assert_eq!(
+        separate_exchange_issuer(&format!(
+            "{template}\ntoken_exchange_issuer = \"https://sts.example.com\""
+        )),
+        Some("https://sts.example.com".to_string())
+    );
+    for not_separate in [
+        String::new(),
+        "token_exchange_issuer = \"\"".to_string(),
+        "token_exchange_issuer = \"https://auth.example.com\"".to_string(),
+    ] {
+        assert_eq!(
+            separate_exchange_issuer(&format!("{template}\n{not_separate}")),
+            None,
+            "{not_separate}"
+        );
+    }
+
+    // During an issuer cutover the exchange issuer can be the second jwt_issuer entry, whose
+    // tokens the jwt_issuer keys verify.
+    let cutover = settings_with_auth_keys(&format!(
+        r#"
+            jwt_issuer = ["https://auth.example.com", "https://sts.example.com"]
+            jwt_audience = ["lore-service"]
+            {TIER_2}
+
+            [server.auth.oidc]
+            client_id = "lore-cli"
+            {template}
+            token_exchange_issuer = "https://sts.example.com"
+        "#
+    ))
+    .expect("must parse")
+    .server
+    .auth
+    .expect("[server.auth] is present");
+    assert_eq!(cutover.separate_exchange_issuer(), None);
+}
+
+/// The exchange issuer's keys are found through its discovery document, which only an
+/// issuer URL has.
+#[test]
+fn a_token_exchange_issuer_that_is_not_a_url_fails_validation() {
+    for issuer in ["sts", "ftp://sts.example.com"] {
+        let settings = settings_with_oidc_keys(
+            TIER_2,
+            &format!(
+                "resource_template = \"https://lore.example.com/partitions/{{id}}\"\n\
+                 token_exchange_issuer = \"{issuer}\""
+            ),
+        );
+        assert!(validate_auth_config(&settings).is_err(), "{issuer}");
+    }
+    let settings = settings_with_oidc_keys(
+        TIER_2,
+        "resource_template = \"https://lore.example.com/partitions/{id}\"\n\
+         token_exchange_issuer = \"https://sts.example.com\"",
+    );
+    assert!(validate_auth_config(&settings).is_ok());
 }
 
 #[test]
@@ -508,7 +608,7 @@ fn oidc_client_id_is_required_and_not_empty() {
 /// Minimal loadable settings with the given `[server.auth]` keys, for the
 /// startup-validation tests. `Settings` deserializes with a `'static`
 /// bound, so the assembled TOML is leaked; each test builds one.
-fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
+pub(crate) fn settings_with_auth_keys(auth_keys: &str) -> Result<Settings, toml::de::Error> {
     let config = format!(
         r#"
             [server]
@@ -588,6 +688,41 @@ fn auth_with_issuer_and_audience_passes_validation() {
     )
     .expect("a complete [server.auth] must parse");
     validate_auth_config(&settings).expect("a complete [server.auth] must validate");
+}
+
+#[test]
+fn trust_unsigned_identity_beside_server_auth_fails_validation() {
+    let mut settings = settings_with_auth_keys(
+        r#"
+            jwt_issuer = "LEGACY_AUTH_KEYWORD"
+            jwt_audience = ["lore-service"]
+
+            [environment.endpoint]
+            auth_url = "ucs-auth://auth.example.com"
+        "#,
+    )
+    .expect("a complete [server.auth] must parse");
+    settings.server.trust_unsigned_identity = true;
+    validate_auth_config(&settings)
+        .expect_err("trust_unsigned_identity with [server.auth] must fail validation");
+}
+
+#[test]
+fn trust_unsigned_identity_without_server_auth_passes_validation() {
+    let config = r#"
+        [server]
+        runtime_shutdown_timeout_seconds = 0
+        trust_unsigned_identity = true
+
+        [immutable_store]
+        mode = "local"
+
+        [mutable_store]
+        mode = "local"
+    "#;
+    let settings: Settings = toml::from_str(config).expect("must parse");
+    assert!(settings.server.trust_unsigned_identity);
+    validate_auth_config(&settings).expect("trust_unsigned_identity alone must validate");
 }
 
 /// The loader reads `user_url` from `[environment.endpoint]` for the catalog
@@ -1125,6 +1260,55 @@ fn test_hook_settings_disabled_by_default() {
             .unwrap(),
         "value"
     );
+}
+
+#[test]
+fn composite_read_replica_selection_reads_each_mode() {
+    for (config, selection) in [
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"fan_out\"",
+            ReadReplicaSelection::FanOut,
+        ),
+        (
+            "local.mode = \"local\"\nread_replica_selection = \"round_robin\"",
+            ReadReplicaSelection::RoundRobin,
+        ),
+    ] {
+        let settings: CompositeStoreSettings =
+            toml::from_str(config).expect("composite settings should deserialize");
+        assert_eq!(settings.read_replica_selection, Some(selection));
+    }
+}
+
+#[test]
+fn composite_read_replica_selection_rejects_an_unknown_mode() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nread_replica_selection = \"random\"");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_tries_are_read() {
+    let settings: CompositeStoreSettings = toml::from_str(
+        "local.mode = \"local\"\nround_robin_max_tries = 3\nround_robin_try_limit_ms = 25",
+    )
+    .expect("composite settings should deserialize");
+    assert_eq!(settings.round_robin_max_tries, NonZeroUsize::new(3));
+    assert_eq!(settings.round_robin_try_limit_ms, NonZeroU64::new(25));
+}
+
+#[test]
+fn composite_round_robin_max_tries_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_max_tries = 0");
+    assert!(result.is_err());
+}
+
+#[test]
+fn composite_round_robin_try_limit_rejects_zero() {
+    let result: Result<CompositeStoreSettings, _> =
+        toml::from_str("local.mode = \"local\"\nround_robin_try_limit_ms = 0");
+    assert!(result.is_err());
 }
 
 #[test]
@@ -2130,6 +2314,120 @@ mod deserialize_quic_internal {
             toml::from_str("").expect("[server] with no tables should deserialize");
 
         assert!(server.quic_internal.is_none());
+    }
+}
+
+mod replicated_store_settings_num_clients {
+    use super::*;
+
+    pub(super) const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(num_clients: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{num_clients}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_num_clients_is_two() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 2);
+    }
+
+    #[test]
+    fn configured_num_clients_is_kept() {
+        let settings = parse("num_clients = 4").expect("valid settings");
+
+        assert_eq!(settings.num_clients.get(), 4);
+    }
+
+    #[test]
+    fn zero_num_clients_is_rejected() {
+        let error = parse("num_clients = 0").expect_err("zero clients");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_periodic_client_refresh_secs {
+    use super::*;
+
+    #[test]
+    fn zero_refresh_period_is_rejected() {
+        let error = toml::from_str::<ReplicatedStoreSettings>(
+            &super::replicated_store_settings_num_clients::REQUIRED_KEYS.replace(
+                "periodic_client_refresh_secs = 300",
+                "periodic_client_refresh_secs = 0",
+            ),
+        )
+        .expect_err("zero refresh period");
+
+        assert!(
+            error.to_string().contains("nonzero"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+mod replicated_store_settings_initial_cwnd_bytes {
+    use lore_server::quic::initial_cwnd::DEFAULT_PEER_INITIAL_CWND_BYTES;
+    use lore_server::quic::initial_cwnd::InitialCwndBytes;
+
+    use super::*;
+
+    const REQUIRED_KEYS: &str = r#"
+        remote_url = "lore://127.0.0.1:41340"
+        periodic_client_refresh_secs = 300
+
+        [regenerate_retry]
+        initial_backoff_ms = 250
+        max_backoff_ms = 10_000
+        max_attempts = 5
+    "#;
+
+    fn parse(initial_cwnd: &str) -> Result<ReplicatedStoreSettings, toml::de::Error> {
+        toml::from_str(&format!("{initial_cwnd}\n{REQUIRED_KEYS}"))
+    }
+
+    #[test]
+    fn omitted_initial_cwnd_is_the_peer_default() {
+        let settings = parse("").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes, DEFAULT_PEER_INITIAL_CWND_BYTES);
+    }
+
+    #[test]
+    fn configured_initial_cwnd_is_kept() {
+        let settings = parse("initial_cwnd_bytes = 65536").expect("valid settings");
+
+        assert_eq!(settings.initial_cwnd_bytes.get(), 65_536);
+    }
+
+    #[test]
+    fn initial_cwnd_below_minimum_is_rejected() {
+        let error = parse(&format!(
+            "initial_cwnd_bytes = {}",
+            InitialCwndBytes::MIN - 1
+        ))
+        .expect_err("below the minimum");
+
+        assert!(
+            error.to_string().contains(&format!(
+                "initial_cwnd_bytes must be at least {}",
+                InitialCwndBytes::MIN
+            )),
+            "unexpected error: {error}"
+        );
     }
 }
 

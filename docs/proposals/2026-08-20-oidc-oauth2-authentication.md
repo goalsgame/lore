@@ -5,7 +5,7 @@ authors:
   - Hannes Muurinen
 status: Approved
 created: 2026-08-20
-updated: 2026-10-26
+updated: 2026-11-06
 discussion: https://crowd.urc.internal.epicgames.net/epic/Lore/change-request/412
 ---
 
@@ -465,7 +465,8 @@ The rest of this proposal calls the first four fields
 | --- | --- | --- |
 | `issuer` | The first `[server.auth] jwt_issuer` entry, once its discovery document names the same issuer | Issuer URL. The client fetches `<issuer>/.well-known/openid-configuration`. |
 | `client_id` | `[server.auth.oidc]` | The public client ID Lorelib presents. |
-| `scopes` | `[server.auth.oidc]` | Default scopes to request. |
+| `scopes` | `[server.auth.oidc]` | Default scopes to request at a user login. |
+| `client_credentials_scopes` | `[server.auth.oidc]` | Scopes to request with the client credentials grant. |
 | `preferred` | `[server.auth.oidc]` | Whether a client that expresses no preference should take the OIDC path. Absent or false keeps it on `auth_url` while both are advertised. |
 | `resource_template` | `[server.auth.oidc]` | How to name a partition as an [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) resource, for example `https://lore.example.com/partitions/{id}`. The standard form and the default. |
 | `scope_template` | `[server.auth.oidc]` | How to name a partition as a scope value instead, for example `partition:{id}`. For providers that reject `resource` or never see it on the exchange grant. |
@@ -541,7 +542,7 @@ leaves the other path's credentials intact. The setting retires with the gRPC pa
 | `GetAuthSession` polling | [RFC 8628](https://www.rfc-editor.org/rfc/rfc8628) token request, `grant_type=urn:ietf:params:oauth:grant-type:device_code`. Honors `interval`, `slow_down`, `expired_token`, `access_denied`. |
 | `ExchangeAPIKeyForUserToken` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange with a Lore-specific `subject_token_type` naming the API key. Keeps the user binding, which `client_credentials` cannot express. See below. |
 | `ExchangeExternalTokenForUserToken(token, token_type)` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange. `token_type` becomes a `subject_token_type` URI. |
-| (new) | `client_credentials` grant, for machine identities registered at the provider. Nothing migrates onto it. It is what a deployment on a stock provider uses for CI. |
+| (new) | `client_credentials` grant, for machine identities registered at the provider. Nothing migrates onto it. It is what a deployment on a stock provider uses for CI. It requests `client_credentials_scopes` rather than `scopes`, which can hold values only a user login may request. |
 | `ExchangeUserTokenForMultiresourceToken(resource_id[])` | [RFC 8693](https://www.rfc-editor.org/rfc/rfc8693) token exchange with `resource` ([RFC 8707](https://www.rfc-editor.org/rfc/rfc8707)) naming the partition, or the verbatim resource for non-partition callers (D2). Sent to whatever `token_exchange_issuer` names. |
 | `RefreshAuthSession` | `refresh_token` grant. Fills in `Authentication::refresh_authentication`, which currently returns `NotSupported`. |
 | `GetUserInfo`, `GetUserId`, `GetProviderUserId` | Moves off the auth path entirely, see D7. `GetProviderUserId` maps an internal ID to the upstream provider's ID. With an external issuer the provider's `sub` *is* the ID, so it has no successor. |
@@ -855,18 +856,24 @@ of it. So the server advertises the directory on the endpoint, and the client pi
 
 The directory's host must be under a domain that is found in one of the token's `aud` names.
 
-The directory operations outlive the auth service, so they get a gRPC API of their own,
-`lore.user.v1.UserService`. It has `UserGet` (IDs to users), `UserFind` (a username or a display
-name to users) and `PartitionList` (the partitions the caller holds permissions on), in the
-vocabulary of the other `lore.*.v1` APIs. `PartitionAdd` and `PartitionRemove` let the Lore server
-register the repositories it creates and deletes, which `RebacApi`'s `CreateResource` and
-`DeleteResource` at `auth_url` do on a `UrcAuthApi` deployment. The server picks the registry by
-the same rule: `user_url`, else `auth_url`, else no registration. On every path the
-server authorizes the delete before calling the registry: the creator while they can still reach
-the partition, or a caller holding `owner` or `admin` on it. The registry may refuse it too, as `DeleteResource` does for a caller
-without `admin`. A repeated `PartitionAdd` under the same name succeeds, so
-`ALREADY_EXISTS` means the partition is listed under another name, and the server refuses the
-create.
+The directory operations outlive the auth service, so they get gRPC APIs of their own, in the
+vocabulary of the other `lore.*.v1` APIs. `lore.user.v1.UserService` has `UserGet` (IDs to users)
+and `UserFind` (a username or a display name to users), which the client calls.
+`lore.user.v1.RepositoryRegistryService`, served at the same `user_url`, is called by the Lore
+server with the caller's token. It has `RepositoryList` (the repositories the caller holds
+permissions on), and `RepositoryRegister` and `RepositoryUnregister`, which register the
+repositories the server creates and deletes and record the creator as the owner, as `RebacApi`'s
+`CreateResource` and `DeleteResource` at `auth_url` do on a `UrcAuthApi` deployment. The server
+picks the registry by the same rule: `user_url`, else `auth_url`, else no registration. On every
+path the server authorizes the delete before calling the registry: the creator while they can
+still reach the repository, or a caller holding `owner` or `admin` on it. The registry may refuse
+it too, as `DeleteResource` does for a caller without `admin`. A repeated `RepositoryRegister`
+under the same name succeeds, so `ALREADY_EXISTS` means the repository is registered under another
+name, and the server refuses the create.
+
+The registry RPCs first shipped on `UserService` as `PartitionList`, `PartitionAdd` and
+`PartitionRemove`. Partitions have no names, only repositories do, and the client never calls
+them, so they moved to their own service. The old RPCs were deprecated and then removed.
 
 **The user identity is read from the token.** Lore records a user as one string, in `created_by`
 and wherever else an identity is compared. Client and server take that string from the token's
@@ -906,8 +913,8 @@ listing everything it holds, as a local server does today. That setting exists f
 alone and gates no access decision. A `UrcAuthApi` deployment gets an implementation that calls
 `LookupUserPermissions` and behaves exactly as today.
 
-A deployment advertising `user_url` gets an implementation that calls `PartitionList` on the
-`lore.user.v1.UserService` there. The answer is a stream of repository ids, which the catalog
+A deployment advertising `user_url` gets an implementation that calls `RepositoryList` on the
+`lore.user.v1.RepositoryRegistryService` there. The answer is a stream of repository ids, which the catalog
 collects and pages itself as the baseline catalog pages the store.
 
 The choice is not bound to the authorizer. `repository_catalog` in `[server.auth]` names the
@@ -972,6 +979,12 @@ that. So when `jwt_issuer` holds an https URL the server fetches
 `<jwt_issuer>/.well-known/openid-configuration`, takes `jwks_uri` from it, and goes on comparing
 `iss` against the same value. `[server.auth.jwk].endpoint` stays as the override for providers with
 non-standard discovery.
+
+A `token_exchange_issuer` that `jwt_issuer` doesn't list is a separate token service with keys of
+its own. The server discovers them the same way, from `<token_exchange_issuer>`, and verifies a token
+whose `iss` names the service against those keys only, and every other token against the
+`jwt_issuer` keys only, so neither can sign tokens in the other's name. `[server.auth.jwk].endpoint`
+applies to the `jwt_issuer` keys alone.
 
 `[server.auth]` therefore gains `permission_claim`, `implicit_actions`, `baseline_access`,
 `repository_catalog`, `repository_catalog_url`, `resource_claim`, `resource_id_claim`,
@@ -1077,7 +1090,7 @@ in `[server.auth]` but touch listing only:
 | `implicit_actions` | Tier 1 only. Actions every token holder gets, added to whatever `permission_claim` carries and to `read`, which any token implies. Defaults to `["write"]`; `[]` makes write a role, or makes the server read-only without `permission_claim`. Any action may be listed, privileged ones included; an unknown name is a configuration error. The server refuses to start with it set beside `resource_claim` or `auth_url`, where it would do nothing. |
 | `resource_claim` | Present means Tier 2, and actions are scoped by the resource beside them. Absent means the `permission_claim` actions are global, which is Tier 1. |
 | `baseline_access` | What the default `RepositoryCatalog` (D7) lists when no custom implementation is configured. `denied`, the default, lists none. `reachable` lists every repository the server holds. It gates no access decision. |
-| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `PartitionList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
+| `repository_catalog` | Which catalog (D7) answers the listing: `baseline`, per `baseline_access`; `auth_service`, a `UrcAuthApi` service's `LookupUserPermissions`; or `user_service`, `RepositoryList` at `user_url`. Absent, `user_service` when `user_url` is set, else `auth_service` when `auth_url` is set, and `baseline` otherwise. |
 | `repository_catalog_url` | The endpoint the `auth_service` catalog asks, `auth_url` by default. It receives the caller's token, so it must accept the tokens this server verifies. |
 
 A deployment that configures `[server.auth]` but no `permission_claim` leaves every authenticated

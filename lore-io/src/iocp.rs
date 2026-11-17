@@ -139,7 +139,6 @@ enum OpState {
 }
 
 struct OpShared<P> {
-    lease: Option<crate::lease::IoLease>,
     state: OpState,
     payload: Option<P>,
 }
@@ -207,21 +206,18 @@ unsafe fn complete_typed<P>(overlapped: *mut OVERLAPPED, result: std::io::Result
     // SAFETY: the caller guarantees this is the `Arc<Op<P>>` pointer submitted with the operation,
     // reclaimed exactly once, and `repr(C)` puts the overlapped at offset zero of the entry.
     let op = unsafe { Arc::from_raw(overlapped.cast_const().cast::<Op<P>>()) };
-    let (waker, lease) = {
+    let waker = {
         let mut shared = op.shared.lock();
         let previous = std::mem::replace(&mut shared.state, OpState::Completed(result));
-        let waker = match previous {
+        match previous {
             OpState::Waiting(waker) => waker,
             OpState::Abandoned => {
                 shared.payload = None;
                 None
             }
             OpState::Completed(_) | OpState::Taken => None,
-        };
-        (waker, shared.lease.take())
+        }
     };
-    // Lease destruction may reenter its owner; never run it under the operation lock.
-    drop(lease);
     if let Some(waker) = waker {
         waker.wake();
     }
@@ -676,7 +672,6 @@ impl IocpDriver {
                 complete: complete_typed::<P>,
             },
             shared: Mutex::new(OpShared {
-                lease: crate::lease::IoLease::current(),
                 state: OpState::Waiting(None),
                 payload: Some(payload),
             }),
@@ -765,6 +760,10 @@ impl IocpDriver {
         PsyncDriver.set_permissions(path, permissions).await
     }
 
+    pub(crate) async fn make_owner_writable(&self, path: PathBuf) -> std::io::Result<()> {
+        PsyncDriver.make_owner_writable(path).await
+    }
+
     pub(crate) async fn write_file_bytes(
         &self,
         path: PathBuf,
@@ -774,20 +773,16 @@ impl IocpDriver {
         PsyncDriver.write_file_bytes(path, data, durable).await
     }
 
-    pub(crate) async fn write_file_segments<B: StableBufList>(
-        &self,
-        options: std::fs::OpenOptions,
-        path: PathBuf,
-        buffers: B,
-        durable: bool,
-    ) -> std::io::Result<()> {
-        PsyncDriver
-            .write_file_segments(options, path, buffers, durable)
-            .await
-    }
-
     pub(crate) async fn metadata(&self, path: PathBuf) -> std::io::Result<std::fs::Metadata> {
         PsyncDriver.metadata(path).await
+    }
+
+    pub(crate) async fn stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.stat(path).await
+    }
+
+    pub(crate) async fn symlink_stat(&self, path: PathBuf) -> std::io::Result<crate::Stat> {
+        PsyncDriver.symlink_stat(path).await
     }
 
     pub(crate) async fn holds_name_exactly(&self, path: PathBuf) -> Option<bool> {

@@ -5,7 +5,7 @@ import os
 
 import pytest
 from lore_parsers import parse_status_json
-from test_utils import to_posix
+from test_utils import to_posix, working_tree_files
 
 from lore import Lore
 
@@ -230,3 +230,241 @@ def test_view_clone_materializes_directory_emptied_by_filter(
         "status --scan on a pristine view-filtered clone reported changes "
         f"(clone/status view mismatch): {sorted(by_path)}"
     )
+
+
+def _commit(repo: Lore, files: list[str], directories: tuple[str, ...] = ()) -> None:
+    """Commits and pushes `files`, each holding its own path, and the empty
+    `directories`."""
+    repo.write_files({path: path for path in files})
+    for path in directories:
+        repo.make_dirs(path)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_view_with_a_wildcard_reinclusion_creates_no_excluded_directory(
+    new_lore_repo, scratch_dir
+):
+    """A view whose re-inclusion opens with a wildcard, `!*/Saved/Config/`, makes a clone
+    and a layer add enter every directory the view excludes to look for what it
+    re-includes. Neither creates a directory it finds nothing in, the mount aside, a dry
+    run of the clone reports none, status reports nothing missing and a scanning stage
+    stages nothing."""
+    repo: Lore = new_lore_repo()
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    _commit(
+        repo,
+        ["Game/Saved/Config/a.ini", "Game/Saved/Logs/l.log", "Engine/Build/b.txt"],
+        ("Engine/Empty", "Game/Saved/Config/Kept"),
+    )
+    _commit(layer_repo, ["Saved/Config/a.ini", "Saved/Logs/l.log"], ("Empty",))
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write("/*\n!*/Saved/Config/\n")
+
+    target = scratch_dir("dry-run", create=True)
+    reported = repo.run(
+        ["repository", "clone", repo.remote_path, str(target), "--view", view],
+        dry_run=True,
+    ).splitlines()
+    excluded = ["Engine", "Engine/Build", "Engine/Empty", "Game/Saved/Logs"]
+    assert [path for path in excluded if path in reported] == [], reported
+
+    clone: Lore = repo.clone(view=view)
+
+    kept = [
+        "Game",
+        "Game/Saved",
+        "Game/Saved/Config",
+        "Game/Saved/Config/Kept",
+        "Game/Saved/Config/a.ini",
+    ]
+    assert working_tree_files(clone, directories=True) == kept
+    assert parse_status_json(clone.status(json=True, offline=True, scan=True)) == []
+    clone.stage(scan=True, offline=True)
+    assert parse_status_json(clone.status(json=True, offline=True)) == []
+
+    clone.layer_add("Mount", layer_repo, "/")
+
+    assert working_tree_files(clone, directories=True) == kept + [
+        "Mount",
+        "Mount/Saved",
+        "Mount/Saved/Config",
+        "Mount/Saved/Config/a.ini",
+    ]
+
+
+@pytest.mark.smoke
+def test_forced_stage_scan_commits_files_the_view_excludes(new_lore_repo, scratch_dir):
+    """A forced staging scan in a sparse clone stages new files the view excludes, status lists
+    them staged, and the commit takes their content. A clone under the same view leaves them out
+    of its working tree."""
+    repo: Lore = new_lore_repo()
+    repo.write_files({"Docs/readme.md": "readme\n", "Engine/engine.txt": "engine\n"})
+    repo.stage(scan=True)
+    repo.commit("Base", offline=True)
+    repo.push()
+
+    view_dir = scratch_dir("view", create=True)
+    view = os.path.join(view_dir, "view.txt")
+    with open(view, "w+") as view_file:
+        view_file.write("/*\n!/Docs/\n")
+    clone: Lore = repo.clone(view=view)
+    added = {
+        "top.txt": "new at the top level\n",
+        "Engine/new.txt": "new in a committed directory\n",
+        "New/new.txt": "new in a new directory\n",
+    }
+    clone.write_files(added)
+    clone.stage(".", scan=True, force=True, offline=True)
+
+    staged = {
+        to_posix(entry["path"]): entry
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+    }
+    for path in added:
+        assert staged.get(path, {}).get("flagStaged") is True, (path, staged)
+
+    clone.commit("Past the view", offline=True)
+    clone.push()
+
+    other: Lore = repo.clone(view=view)
+    for path in added:
+        assert not other.path_exists(path), path
+    repo.sync()
+    for path, content in added.items():
+        with repo.open_file(path) as committed:
+            assert committed.read() == content, path
+
+
+@pytest.mark.own_vfs("layers a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_forced_stage_scan_commits_files_the_view_excludes_below_a_link_and_a_layer(
+    new_lore_repo, scratch_dir
+):
+    """A forced staging scan stages new files the view excludes below a link and a layer whose
+    mounts the view excludes in part, status lists them staged, and the commit takes their
+    content into the repositories the mounts draw from."""
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+    layer_repo: Lore = new_lore_repo(repo.name + "_layer")
+    _commit(repo, ["Docs/readme.md"])
+    _commit(link_repo, ["Hidden/hidden.txt", "linked.txt"])
+    _commit(layer_repo, ["Hidden/hidden.txt", "layered.txt"])
+    repo.link_add("Lib", link_repo.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write("/Lib/Hidden/\n/Mount/Hidden/\n")
+    clone: Lore = repo.clone(view=view)
+    clone.layer_add("Mount", layer_repo, "/")
+    for mount in ["Lib", "Mount"]:
+        assert not clone.path_exists(f"{mount}/Hidden/hidden.txt"), mount
+
+    added = {
+        "Lib/Hidden/new.txt": (link_repo, "Hidden/new.txt", "new below the link\n"),
+        "Lib/New/new.txt": (link_repo, "New/new.txt", "in view below the link\n"),
+        "Mount/Hidden/new.txt": (layer_repo, "Hidden/new.txt", "new below the layer\n"),
+    }
+    clone.write_files({path: content for path, (_, _, content) in added.items()})
+    clone.stage(".", scan=True, force=True, offline=True)
+
+    staged = {
+        to_posix(entry["path"]): entry
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+    }
+    for path in added:
+        assert staged.get(path, {}).get("flagStaged") is True, (path, staged)
+
+    clone.commit("Past the view below a link and a layer")
+    clone.push()
+
+    for path, (source, source_path, content) in added.items():
+        source.sync()
+        with source.open_file(source_path) as committed:
+            assert committed.read() == content, path
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+def test_unstage_of_a_directory_added_below_a_link_leaves_what_the_view_excludes(
+    new_lore_repo, scratch_dir
+):
+    """An unstage of a directory added below a link takes back what the view keeps
+    in it, and leaves staged what a forced staging scan took past the view."""
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+    _commit(repo, ["Docs/readme.md"])
+    _commit(link_repo, ["linked.txt"])
+    repo.link_add("Lib", link_repo.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write("/Lib/New/Hidden/\n")
+    clone: Lore = repo.clone(view=view)
+    kept, hidden = "Lib/New/a.txt", "Lib/New/Hidden/b.txt"
+    clone.write_files({kept: "kept\n", hidden: "hidden\n"})
+    clone.stage(".", scan=True, force=True, offline=True)
+
+    def staged() -> set[str]:
+        return {
+            to_posix(entry["path"])
+            for entry in parse_status_json(clone.status(json=True, offline=True))
+            if entry.get("flagStaged")
+        }
+
+    assert {kept, hidden} <= staged()
+    clone.unstage("Lib/New", offline=True)
+    after = staged()
+    assert kept not in after, after
+    assert hidden in after, after
+
+
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
+@pytest.mark.smoke
+@pytest.mark.parametrize("unstaged", [".", "Lib"])
+def test_unstage_below_a_link_leaves_what_a_forced_stage_staged_past_the_view(
+    new_lore_repo, scratch_dir, unstaged
+):
+    """An unstage of the tree, or of a link, leaves staged what a forced staging scan took past
+    the view in the linked repository, beside nothing else staged or with a staged file in view:
+    status lists it staged, and the commit takes it into the linked repository."""
+    repo: Lore = new_lore_repo()
+    link_repo: Lore = new_lore_repo(repo.name + "_link")
+    _commit(repo, ["Docs/readme.md"])
+    _commit(link_repo, ["Hidden/hidden.txt", "linked.txt"])
+    repo.link_add("Lib", link_repo.get_id(), "/")
+    repo.commit("Add link")
+    repo.push()
+
+    view = os.path.join(scratch_dir("view", create=True), "view.txt")
+    with open(view, "w") as view_file:
+        view_file.write("/Lib/Hidden/\n")
+    clone: Lore = repo.clone(view=view)
+    hidden, content = "Lib/Hidden/new.txt", "new below the link\n"
+    files = {hidden: content}
+    if unstaged == "Lib":
+        files["Docs/new.md"] = "new in view\n"
+    clone.write_files(files)
+    clone.stage(".", scan=True, force=True)
+    clone.unstage(unstaged, offline=True)
+
+    staged = {
+        to_posix(entry["path"])
+        for entry in parse_status_json(clone.status(json=True, offline=True))
+        if entry.get("flagStaged")
+    }
+    assert hidden in staged, staged
+
+    clone.commit("Past the view below a link")
+    clone.push()
+    link_repo.sync()
+    with link_repo.open_file("Hidden/new.txt") as committed:
+        assert committed.read() == content

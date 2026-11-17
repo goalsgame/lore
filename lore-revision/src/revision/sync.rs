@@ -11,10 +11,7 @@ use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use serde::Serialize;
 
-mod transactional;
-
 use crate::branch;
-use crate::branch::BranchLatestStatus;
 use crate::branch::merge;
 use crate::branch::merge::MergeType;
 use crate::change::NodeChange;
@@ -260,7 +257,8 @@ impl Default for SyncOptions {
     }
 }
 
-/// The view the working tree is to be left materialized under, parsed from the file naming it.
+/// The view the working tree is to be left materialized under, parsed from the file naming it,
+/// and the bytes it was parsed from.
 ///
 /// `None` keeps the view the instance holds, which is every sync that carries the tree between
 /// revisions alone.
@@ -273,7 +271,9 @@ impl Default for SyncOptions {
 /// the working tree against the target state, a walk that asks one view for both sides, and a
 /// dependency set is resolved against the target revision alone, so the changes it keeps are no
 /// longer the difference between two views.
-async fn sync_load_view(options: &SyncOptions) -> Result<Option<FilterInstance>, SyncError> {
+async fn sync_load_view(
+    options: &SyncOptions,
+) -> Result<Option<(FilterInstance, Vec<u8>)>, SyncError> {
     let Some(path) = options.view.as_deref() else {
         return Ok(None);
     };
@@ -290,26 +290,50 @@ async fn sync_load_view(options: &SyncOptions) -> Result<Option<FilterInstance>,
         .into());
     }
 
-    let bytes = lore_io::IoDriver::global()
-        .read_file_bytes(path)
-        .await
-        .internal_with(|| format!("Failed to read view filter {}", path.display()))?;
-    Ok(Some(
-        filter::parse_filter(&bytes, path).forward_with::<SyncError, _>(|| {
-            format!("Failed to parse view filter {}", path.display())
-        })?,
-    ))
+    let view_file = Vec::from(
+        lore_io::IoDriver::global()
+            .read_file_bytes(path)
+            .await
+            .internal_with(|| format!("Failed to read view filter {}", path.display()))?,
+    );
+    let view = filter::parse_filter(&view_file, path).forward_with::<SyncError, _>(|| {
+        format!("Failed to parse view filter {}", path.display())
+    })?;
+    Ok(Some((view, view_file)))
 }
 
-/// Publishes the view the working tree now stands under, in the instance's own directory.
+/// Publishes `view_file`, the bytes of the view file the working tree now stands under, in the
+/// instance's own directory.
 ///
 /// Written after the tree and the anchor, so an interrupted apply leaves the instance under the
 /// view it started from: the same change set is computed again on a re-run and carries the tree the
 /// rest of the way. Published first it would leave the instance naming a view the tree only partly
 /// holds, which nothing afterwards can tell from a finished apply.
-async fn sync_store_view(repository: &Arc<RepositoryContext>) -> Result<(), SyncError> {
+///
+/// The I/O driver's atomic whole-file write publishes it: a temporary sibling, synced to disk with
+/// its parent directory, renamed over the target. A reader sees the previous view or the new one,
+/// and a failed write leaves the previous one rather than a view short of rules. A sibling left by
+/// a write stopped part way is named with [`repository::TEMP_FILE_EXTENSION`], which the ignore
+/// filter excludes and the working-tree scanners skip.
+async fn sync_store_view(
+    repository: &Arc<RepositoryContext>,
+    view_file: Vec<u8>,
+) -> Result<(), SyncError> {
     let path = repository.dot_dir_path()?.join(repository::VIEW_FILTER);
-    filter::save(&repository.filter.view, &path)
+    let mut temporary = path.as_os_str().to_owned();
+    temporary.push(repository::TEMP_FILE_EXTENSION);
+    lore_io::IoDriver::global()
+        .write_file_segments_atomic(
+            temporary,
+            &path,
+            &lore_io::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true),
+            vec![view_file],
+            true,
+            (),
+        )
         .await
         .internal_with(|| format!("Failed to write view filter {}", path.display()))?;
     Ok(())
@@ -325,18 +349,9 @@ async fn sync_store_branch_latest(
     let local_latest = branch::load_latest(repository.clone(), branch)
         .await
         .unwrap_or_default();
-    branch::store_latest(
-        repository.clone(),
-        branch,
-        local_latest,
-        revision,
-        BranchLatestStatus::Convergent,
-    )
-    .await
-    .forward::<SyncError>("Failed to store revision as current branch latest")?;
-
-    branch::store_last_sync(repository, branch, revision).await;
-    Ok(())
+    branch::store_synced_latest(&repository, branch, local_latest, revision)
+        .await
+        .forward::<SyncError>("Failed to store revision as current branch latest")
 }
 
 /// Where the branch being synced stands, for the branch latest decision.
@@ -430,10 +445,6 @@ pub(crate) async fn sync(
     token: &RepositoryWriteToken,
     options: SyncOptions,
 ) -> Result<(), SyncError> {
-    let transactional_root = repository.file_system().supports_transactional_root_hold();
-    if !transactional_root {
-        crate::fs::hold::require_revision_replacement(&repository)?;
-    }
     if repository.file_system().holds_state() {
         if !options.root_files.is_empty() {
             return Err(hold::refused("restrict a sync to a dependency set").into());
@@ -442,19 +453,18 @@ pub(crate) async fn sync(
             return Err(hold::refused("reset local changes in a sync").into());
         }
     }
-    let view = sync_load_view(&options).await?;
-    let view_change = view.is_some();
-    if transactional_root && view_change {
-        return Err(FsError::internal("Transactional root holds do not change views").into());
-    }
     let repository_current = repository.clone();
-    let repository = match view {
-        Some(view) => Arc::new(repository.with_filter_and_remote(
-            Arc::new(repository.filter.with_view(view)),
-            repository.remote().await,
-        )),
-        None => repository,
+    let (repository, view_file) = match sync_load_view(&options).await? {
+        Some((view, view_file)) => (
+            Arc::new(repository.with_filter_and_remote(
+                Arc::new(repository.filter.with_view(view)),
+                repository.remote().await,
+            )),
+            Some(view_file),
+        ),
+        None => (repository, None),
     };
+    let view_change = view_file.is_some();
 
     let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
         .await
@@ -844,12 +854,6 @@ pub(crate) async fn sync(
                 scope: merge::MergeScope::MainOnly,
                 inherit_metadata: crate::metadata::MetadataInherit::default(),
             };
-            if transactional_root {
-                return Err(FsError::internal(
-                    "Transactional root holds require an explicit target for diverged history",
-                )
-                .into());
-            }
             let revision_staged = Box::pin(merge::merge_start(
                 repository.clone(),
                 token,
@@ -880,58 +884,31 @@ pub(crate) async fn sync(
         }
     }
 
-    if transactional_root {
-        let outcome = transactional::hold(
-            &repository,
-            &state_target,
-            &options,
-            requested_branch,
-            anchor_branch,
-            view_change,
-        )
-        .await?;
-        if !matches!(
-            outcome,
-            crate::fs::filesystem_provider::RootHoldOutcome::Preview
-        ) && location == LoreBranchLocation::Remote
-            && !execution_context().globals().dry_run()
-        {
-            sync_store_branch_latest(repository.clone(), target_branch, revision).await?;
-        }
-        LoreEvent::RevisionSyncRevision(LoreRevisionSyncRevisionEventData {
-            branch: target_branch,
-            revision,
-            revision_number,
-            flag_merge: 0,
-            flag_conflict: 0,
-        })
-        .send();
-        return Ok(());
+    // The walk starts once the prefetched blocks are local, so it doesn't fetch them on demand too
+    if repository.prefetch_tree() {
+        let _ = state_target.prefetch_tree(repository.clone()).await;
     }
 
     let cache_repository = repository.clone();
     let cache_state = state_target.clone();
-    let cache_task = Some(lore_spawn!(async move {
-        // Ignore errors during caching
-        let _ = cache_state.cache_fragments(cache_repository, false).await;
-    }));
-
     let state_synced = state_target.clone();
     with_operation::<_, SyncError, _>(repository_current.file_system(), async |operation| {
-        Box::pin(realize_state(
-            repository_current.clone(),
-            repository.clone(),
-            operation.clone(),
-            state_current,
-            state_target,
-            options.clone(),
-        ))
+        let cache_task = lore_spawn!(async move {
+            // Ignore errors during caching
+            let _ = cache_state.cache_fragments(cache_repository, false).await;
+        });
+        realize_joining(
+            cache_task,
+            Box::pin(realize_state(
+                repository_current.clone(),
+                repository.clone(),
+                operation.clone(),
+                state_current,
+                state_target,
+                options.clone(),
+            )),
+        )
         .await?;
-
-        // Make sure caching has finished
-        if let Some(task) = cache_task {
-            let _ = task.await;
-        }
 
         // Safe to handle error when cache task has finished
         let modified_times = operation.take_modified_times();
@@ -986,12 +963,18 @@ pub(crate) async fn sync(
 
             modified_times.store(repository.clone()).await;
 
-            state::rebase_staged_anchor(repository.clone(), revision, force && !view_change)
-                .await
-                .forward::<SyncError>("Failed to rebase staged anchor")?;
+            state::rebase_staged_anchor(
+                repository.clone(),
+                &operation,
+                revision,
+                force && !view_change,
+                true,
+            )
+            .await
+            .forward::<SyncError>("Failed to rebase staged anchor")?;
 
-            if view_change {
-                sync_store_view(&repository).await?;
+            if let Some(view_file) = view_file {
+                sync_store_view(&repository, view_file).await?;
             }
 
             // Set the local branch LATEST to match remote if we synced to that
@@ -1198,7 +1181,7 @@ async fn sync_layers(
     } in layers
     {
         lore_debug!("Synchronizing layer {layer:?}");
-        let target_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
+        let mount_path = RelativePath::new_from_initial_path(layer.target_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
         let source_path = RelativePath::new_from_initial_path(layer.source_path.as_str())
             .forward::<SyncError>("Invalid layer path configuration")?;
@@ -1209,7 +1192,7 @@ async fn sync_layers(
         lore_info!(
             "Sync layer {} in {}",
             layer_repository_target.id,
-            target_path
+            mount_path
         );
 
         let layer_current =
@@ -1236,53 +1219,92 @@ async fn sync_layers(
             layer_target.revision_number()
         );
 
-        // TODO(mjansson): Sync disjoint layers in parallel
-        Box::pin(layer::sync(
-            layer_repository_current,
-            layer_repository_target.clone(),
-            layer_current,
-            layer_target,
-            target_path.clone(),
-            source_path.clone(),
-            options.clone(),
-        ))
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
-
         // Rebasing a layer that did not move would drop its staged content: a
         // purely staged state has no dirty children, so the rebase finds nothing
         // to carry forward and clears the pin.
-        let staged = if execution_context().globals().dry_run() || layer_revision == layer.current {
-            None
-        } else if layer.staged.is_zero() || layer.staged == layer.current {
-            Some(Hash::default())
-        } else {
-            Some(
-                state::rebase_staged_state(
-                    layer_repository_target,
-                    layer.staged,
+        let dry_run = execution_context().globals().dry_run();
+        let moved = !dry_run && layer_revision != layer.current;
+        let rebases = moved && !layer.staged.is_zero() && layer.staged != layer.current;
+
+        // TODO(mjansson): Sync disjoint layers in parallel
+        with_operation::<_, SyncError, _>(
+            layer_repository_target.file_system(),
+            async |operation| {
+                Box::pin(layer::sync_in_operation(
+                    operation.clone(),
+                    layer_repository_current,
+                    layer_repository_target.clone(),
+                    layer_current,
+                    layer_target,
+                    mount_path.clone(),
+                    source_path.clone(),
+                    options.clone(),
+                ))
+                .await
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                let modified_times = operation.take_modified_times();
+
+                layer::store_layer_current(
+                    repository_target.clone(),
+                    token,
+                    mount_path.as_str(),
+                    layer.repository,
                     layer_revision,
-                    execution_context().globals().force() && !view_moved,
+                    moved.then_some(Hash::default()),
                 )
                 .await
-                .forward::<SyncError>("Failed to rebase layer staged state")?
-                .unwrap_or_default(),
-            )
-        };
+                .forward::<SyncError>("Failed to synchornize a layer")?;
+                modified_times.store(layer_repository_target.clone()).await;
 
-        layer::store_layer_current(
-            repository_target.clone(),
-            token,
-            target_path.as_str(),
-            layer.repository,
-            layer_revision,
-            staged,
+                if rebases
+                    && let Some(staged) = state::rebase_staged_state_in(
+                        &operation,
+                        layer_repository_target.clone(),
+                        layer.staged,
+                        layer_revision,
+                        execution_context().globals().force() && !view_moved,
+                        true,
+                        Some(state::LayerPaths {
+                            source: &source_path,
+                            mount: &mount_path,
+                        }),
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to rebase layer staged state")?
+                {
+                    layer::store_layer_staged(
+                        repository_target.clone(),
+                        token,
+                        mount_path.as_str(),
+                        layer.repository,
+                        staged,
+                    )
+                    .await
+                    .forward::<SyncError>("Failed to synchornize a layer")?;
+                }
+                Ok(())
+            },
         )
-        .await
-        .forward::<SyncError>("Failed to synchornize a layer")?;
+        .await?;
     }
 
     Ok(())
+}
+
+/// Awaits `realize`, then `beside`, a task run alongside it, and answers what `realize` did.
+///
+/// The task is joined whether or not realizing fails. It holds the repository, and a sync that
+/// answered before it ended would leave the repository held once the command completes. It is
+/// joined rather than aborted: aborting would end the task but not the fetches it starts, which a
+/// dropped join set aborts without waiting for.
+#[lore_macro::test_pub]
+pub(crate) async fn realize_joining(
+    beside: tokio::task::JoinHandle<()>,
+    realize: impl Future<Output = Result<(), SyncError>>,
+) -> Result<(), SyncError> {
+    let realized = realize.await;
+    let _ = beside.await;
+    realized
 }
 
 /// Drops the times an operation collected, for a caller that does not know which revision
@@ -1316,6 +1338,10 @@ pub struct SyncVerifyArgs {
     pub operation: Arc<InstanceOperationImpl>,
     pub current: crate::state::NodeMapping,
     pub options: Arc<SyncOptions>,
+    /// Whether the verify gives the files it finds holding the incoming content the changes' own
+    /// executable bits, once every change has passed. False where a realize that verifies again
+    /// follows.
+    pub carries_modes: bool,
 }
 
 pub async fn sync_verify_filesystem(
@@ -1346,6 +1372,23 @@ pub struct SyncCompleteStats {
 pub struct SyncRealizeStats {
     pub discovery: DiscoveryStats,
     pub complete: SyncCompleteStats,
+    pub kept_moves: KeptMoves,
+}
+
+/// The moves a realize carries out without their rename, leaving the source where it stands: the
+/// rename was refused, and the destination names the source's own entry or cannot be told apart
+/// from it. Counted, with the first, for the one warning the realize ends with.
+#[derive(Default)]
+pub struct KeptMoves {
+    pub count: AtomicUsize,
+    pub first: std::sync::OnceLock<KeptMove>,
+}
+
+/// A move [`KeptMoves`] counts: where it is from and to, and why it was kept.
+pub struct KeptMove {
+    pub from: RelativePath,
+    pub to: RelativePath,
+    pub reason: String,
 }
 
 impl LoreRevisionSyncProgressEventData {

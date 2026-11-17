@@ -7,14 +7,16 @@ use std::sync::atomic::AtomicBool;
 use axum::http::StatusCode;
 use axum::routing;
 use axum_test::TestServer;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::http::server::LoreHttpServerSettings;
 use lore_server::http::server::ServerHealth;
-use lore_server::http::server::ServerState;
 use lore_server::http::server::create_router;
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 
+use crate::http::test_utils::build_test_server;
+use crate::http::test_utils::test_state;
 use crate::store::test_support::test_store_create;
 
 #[tokio::test]
@@ -22,19 +24,7 @@ async fn test_server_is_up_and_listening() {
     let (immutable_store, mutable_store, _execution) =
         test_store_create().await.expect("Failed to create stores");
 
-    // Create the server and test the request
-    let test_health = ServerHealth::new_without_availability(immutable_store.clone());
-    let test_shared_state = ServerState {
-        immutable_store,
-        mutable_store,
-        jwt_verifier: None,
-        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-        max_file_size: 100,
-        presign_config: None,
-    };
-    let settings = LoreHttpServerSettings::test_default();
-    let app = create_router(test_shared_state, test_health, &settings);
-    let test_server = TestServer::new(app).unwrap();
+    let test_server = build_test_server(immutable_store, mutable_store, None);
 
     let response = test_server.get("/health_check").await;
 
@@ -54,19 +44,15 @@ async fn test_unavailable_store_server_is_not_healthy() {
         store_health_check: true,
         draining: Arc::default(),
     };
-    let test_shared_state = ServerState {
-        immutable_store,
-        mutable_store,
-        jwt_verifier: None,
-        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-        max_file_size: 100,
-        presign_config: None,
-    };
     let settings = LoreHttpServerSettings {
         store_health_check: true,
         ..Default::default()
     };
-    let app = create_router(test_shared_state, test_health, &settings);
+    let app = create_router(
+        test_state(immutable_store, mutable_store, None),
+        test_health,
+        &settings,
+    );
     let test_server = TestServer::new(app).unwrap();
 
     let response = test_server.get("/health_check").await;
@@ -83,14 +69,7 @@ async fn a_draining_server_is_not_healthy() {
 
     let test_health = ServerHealth::new_without_availability(immutable_store.clone());
     let draining = test_health.draining.clone();
-    let test_shared_state = ServerState {
-        immutable_store,
-        mutable_store,
-        jwt_verifier: None,
-        repository_authorizer: Arc::new(AllowAllRepositoryAuthorizer),
-        max_file_size: 100,
-        presign_config: None,
-    };
+    let test_shared_state = test_state(immutable_store, mutable_store, None);
     let settings = LoreHttpServerSettings::test_default();
     let app = create_router(test_shared_state, test_health, &settings);
     let test_server = TestServer::new(app).unwrap();
@@ -126,7 +105,7 @@ async fn health_follows_the_draining_flag_in_the_settings() {
                     &settings,
                     immutable_store.clone(),
                     mutable_store.clone(),
-                    None,
+                    TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                 )
                 .unwrap();
@@ -206,7 +185,7 @@ async fn health_only_bypasses_invalid_presign_configuration() {
                 &settings,
                 immutable_store.clone(),
                 mutable_store.clone(),
-                None,
+                TokenVerification::Ignore,
                 Arc::new(AllowAllRepositoryAuthorizer),
             )
             .expect("health-only must not parse presign configuration");
@@ -221,7 +200,7 @@ async fn health_only_bypasses_invalid_presign_configuration() {
                     &settings,
                     immutable_store,
                     mutable_store,
-                    None,
+                    TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                 )
                 .is_err(),
@@ -251,7 +230,7 @@ async fn check_http_server_lifetime(health_only: bool, cancel: bool) {
                     settings,
                     immutable_store,
                     mutable_store,
-                    None,
+                    TokenVerification::Ignore,
                     Arc::new(AllowAllRepositoryAuthorizer),
                     async move {
                         let _ = shutdown_rx.await;

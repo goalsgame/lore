@@ -13,7 +13,6 @@ use crate::branch;
 use crate::errors::*;
 use crate::event;
 use crate::event::EventError;
-use crate::filter::FilterMode;
 use crate::interface::LoreArray;
 use crate::interface::LoreError;
 use crate::interface::LoreString;
@@ -23,12 +22,13 @@ use crate::lock::file::release::release;
 use crate::lock::util::LOCK_BATCH_SIZE;
 use crate::lock::util::assemble_resource_for_path;
 use crate::lock::util::fold_batch_results;
+use crate::lock::util::lock_path_node;
+use crate::lock::util::lock_tree;
 use crate::lore::execution_context;
 use crate::lore_debug;
 use crate::lore_error;
 use crate::lore_trace;
 use crate::repository::RepositoryContext;
-use crate::state;
 use crate::util::path::RelativePath;
 
 #[derive(Clone, Debug)]
@@ -120,14 +120,9 @@ pub async fn acquire(
     repository: Arc<RepositoryContext>,
     options: AcquireOptions,
 ) -> Result<(), AcquireError> {
-    let (current_revision, current_branch) = crate::instance::load_current_anchor(&repository)
+    let (state, current_branch) = lock_tree(&repository)
         .await
-        .forward::<AcquireError>("Failed to deserialize current revision anchor")?;
-    let staged_revision = crate::instance::load_staged_revision(&repository)
-        .await
-        .ok()
-        .flatten()
-        .unwrap_or(current_revision);
+        .forward::<AcquireError>("Failed to deserialize state")?;
 
     let branch = if options.branch.is_empty() {
         current_branch
@@ -145,9 +140,6 @@ pub async fn acquire(
     };
 
     let mut resources = HashMap::<String, lock::LockResource>::with_capacity(options.paths.len());
-    let state = state::State::deserialize(repository.clone(), staged_revision)
-        .await
-        .forward::<AcquireError>("Failed to deserialize state")?;
 
     lore_debug!("Inspecting {} path(s)", options.paths.len());
     let force = execution_context().globals().force();
@@ -156,20 +148,16 @@ pub async fn acquire(
             RelativePath::new_from_user_path(repository.require_path()?, path.as_str())
                 .forward_with::<AcquireError, _>(|| format!("Invalid path: {}", path.as_str()))?;
 
-        if !force
-            && repository
-                .filter
-                .emit_excludes(&relative_path, true, FilterMode::Full)
-        {
+        let Some(node) = lock_path_node(&repository, &state, &relative_path, force)
+            .await
+            .forward::<AcquireError>("checking a lock path against the filter")?
+        else {
             lore_trace!("Path excluded by filter: {}", relative_path.as_str());
             continue;
-        }
+        };
 
-        let node_link = state
-            .find_node_link(repository.clone(), relative_path.as_str())
-            .await
-            .forward_with::<AcquireError, _>(|| format!("Invalid path: {}", path.as_str()))?;
-        if !node_link.is_valid() {
+        node.forward_with::<AcquireError, _>(|| format!("Invalid path: {}", path.as_str()))?;
+        if relative_path.is_empty() {
             return Err(AcquireError::internal(format!(
                 "Invalid path: {}",
                 path.as_str()

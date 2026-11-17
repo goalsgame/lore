@@ -21,6 +21,7 @@ mod tests {
     use lore_revision::interface::LoreArray;
     use lore_revision::interface::LoreString;
     use lore_revision::lore::RepositoryId;
+    use lore_revision::node::ROOT_NODE;
     use lore_revision::repository;
     use lore_revision::repository::RepositoryContext;
     use lore_revision::stage::StageOptions;
@@ -267,5 +268,214 @@ mod tests {
             }))
             .await
             .expect("Test task failed");
+    }
+
+    /// Unstaging a staged modification of a file puts the current revision's size and mode back
+    /// into its node, while another file stays staged.
+    #[tokio::test]
+    async fn unstage_restores_a_modified_files_size_and_mode() {
+        let (immutable_store, mutable_store, execution) =
+            test_store_create().await.expect("Failed to create stores");
+        LORE_CONTEXT
+            .scope(execution, async move {
+                let instance = test_repository_create(
+                    immutable_store,
+                    mutable_store,
+                    RepositoryId::from(uuid::Uuid::now_v7()),
+                )
+                .await;
+                test_file_write(&instance.path.join("a.txt"), b"short");
+                test_file_write(&instance.path.join("b.txt"), b"other");
+                let committed = test_commit_tree(&instance, "First").await;
+                let repository = instance.repository.clone();
+                let committed_a = committed
+                    .find_node_link(repository.clone(), "a.txt")
+                    .await
+                    .expect("a.txt");
+                let committed_a = committed
+                    .node(repository.clone(), committed_a.node)
+                    .await
+                    .expect("a.txt");
+                test_file_write(&instance.path.join("a.txt"), b"a longer content");
+                test_file_write(&instance.path.join("b.txt"), b"other content");
+                file::stage::stage(
+                    repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(&instance.path)]),
+                    StageOptions {
+                        scan: true,
+                        ..StageOptions::default()
+                    },
+                )
+                .await
+                .expect("Failed to stage the changes");
+
+                unstage::unstage(
+                    repository.clone(),
+                    &instance.write_token,
+                    LoreArray::from_vec(vec![LoreString::from(
+                        instance.path.join("a.txt").as_path(),
+                    )]),
+                    UnstageOptions::default(),
+                )
+                .await
+                .expect("Failed to unstage a.txt");
+
+                let staged = lore_revision::instance::load_staged_revision(&repository)
+                    .await
+                    .expect("Failed to load the staged revision")
+                    .expect("b.txt keeps a staged revision");
+                let staged = state::State::deserialize(repository.clone(), staged)
+                    .await
+                    .expect("Failed to deserialize the staged state");
+                let link = staged
+                    .find_node_link(repository.clone(), "a.txt")
+                    .await
+                    .expect("a.txt");
+                let a = staged
+                    .node(repository.clone(), link.node)
+                    .await
+                    .expect("a.txt");
+                assert!(!a.is_staged(), "a.txt is unstaged, flags {:#x}", a.flags);
+                assert_eq!(
+                    (a.size, a.mode),
+                    (committed_a.size, committed_a.mode),
+                    "a.txt takes the current revision's size and mode back"
+                );
+            })
+            .await;
+    }
+
+    /// Unstaging a staged file a directory-only view rule names unstages it: the view is asked
+    /// about the path as the file the tree holds there. The ignore file leaves out no staged node.
+    #[tokio::test]
+    async fn unstaging_a_file_a_directory_only_view_rule_names_unstages_it() {
+        in_execution(async {
+            let (repository, tempdir) =
+                committed_repository("", &["src/Intermediate".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            test_file_write(root.join("src/Intermediate").as_path(), b"modified");
+            stage_paths(&repository, &root, &["src/Intermediate"], false, false).await;
+            assert!(
+                next_node(&repository, "src/Intermediate").await.is_staged(),
+                "the stage of src/Intermediate staged nothing"
+            );
+            test_file_write(
+                root.join(repository::DOT_LORE)
+                    .join(repository::VIEW_FILTER)
+                    .as_path(),
+                b"Intermediate/\n",
+            );
+            let viewed = Arc::new(
+                repository
+                    .to_filter_context(repository::load_filter(&root).expect("Load filter failed")),
+            );
+            unstage::unstage(
+                viewed.clone(),
+                viewed
+                    .try_write_token()
+                    .expect("The repository was opened for writing"),
+                path_arguments(&root, &["src/Intermediate"]),
+                UnstageOptions::default(),
+            )
+            .await
+            .expect("Unstage failed");
+            assert!(
+                !next_node(&viewed, "src/Intermediate").await.is_staged(),
+                "unstage left src/Intermediate staged"
+            );
+        })
+        .await;
+    }
+
+    /// Unstages `name` below `root`, and answers the nodes of that name the next commit's tree
+    /// holds below its root.
+    async fn unstage_and_list(
+        repository: &Arc<RepositoryContext>,
+        root: &Path,
+        name: &str,
+    ) -> Vec<lore_revision::node::Node> {
+        unstage::unstage(
+            repository.clone(),
+            repository
+                .try_write_token()
+                .expect("The repository was opened for writing"),
+            path_arguments(root, &[name]),
+            UnstageOptions::default(),
+        )
+        .await
+        .expect("Unstage failed");
+
+        let tree = next_tree(repository).await;
+        let mut nodes = Vec::new();
+        for id in children_named(repository, &tree, ROOT_NODE, name).await {
+            nodes.push(
+                tree.node(repository.clone(), id)
+                    .await
+                    .expect("Failed to read a node"),
+            );
+        }
+        nodes
+    }
+
+    /// Unstaging a path a directory-to-file change holds discards the file staged for add, and
+    /// leaves the directory it replaced as a dirty delete.
+    #[tokio::test]
+    async fn unstaging_a_staged_type_change_discards_the_added_file() {
+        in_execution(async {
+            let (repository, tempdir) =
+                committed_repository("", &["shared/a.txt".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            std::fs::remove_dir_all(root.join("shared")).expect("Failed to delete directory");
+            test_file_write(root.join("shared").as_path(), b"file");
+            stage_paths(&repository, &root, &["shared"], true, false).await;
+
+            let nodes = unstage_and_list(&repository, &root, "shared").await;
+            assert_eq!(nodes.len(), 1, "{nodes:?}");
+            assert!(nodes[0].is_directory(), "{nodes:?}");
+            assert!(nodes[0].is_dirty_delete(), "{nodes:?}");
+        })
+        .await;
+    }
+
+    /// Unstaging a path a file-to-directory change holds discards the directory staged for add
+    /// with its subtree, and leaves the file it replaced as a dirty delete.
+    #[tokio::test]
+    async fn unstaging_a_staged_type_change_discards_the_added_directory() {
+        in_execution(async {
+            let (repository, tempdir) = committed_repository("", &["entry".to_string()]).await;
+            let root = tempdir.to_path_buf();
+            std::fs::remove_file(root.join("entry")).expect("Failed to delete file");
+            std::fs::create_dir(root.join("entry")).expect("Failed to create directory");
+            test_file_write(root.join("entry/inner.txt").as_path(), b"inner");
+            stage_paths(&repository, &root, &["entry"], true, false).await;
+
+            let staged = next_tree(&repository).await;
+            let added = staged
+                .find_node_link(repository.clone(), "entry")
+                .await
+                .expect("No node at entry")
+                .node;
+            let added_child = staged
+                .find_node_link(repository.clone(), "entry/inner.txt")
+                .await
+                .expect("No node at entry/inner.txt")
+                .node;
+
+            let nodes = unstage_and_list(&repository, &root, "entry").await;
+            assert_eq!(nodes.len(), 1, "{nodes:?}");
+            assert!(nodes[0].is_file(), "{nodes:?}");
+            assert!(nodes[0].is_dirty_delete(), "{nodes:?}");
+
+            let tree = next_tree(&repository).await;
+            for id in [added, added_child] {
+                let node = tree
+                    .node(repository.clone(), id)
+                    .await
+                    .expect("Failed to read a node");
+                assert!(node.is_discarded(), "{id}: {node:?}");
+            }
+        })
+        .await;
     }
 }

@@ -4,14 +4,40 @@ import logging
 import os
 import re
 import shutil
+import stat
+import sys
 
 import pytest
-from error_types import LocalChanges, PathExistChildrenLinkError, PathExistLinkError
-from link_helpers import DEFAULT_LINK_MOUNT, make_parent_with_link, make_repo
+from error_types import (
+    LOCAL_MODIFICATIONS,
+    LocalChanges,
+    PathExistChildrenLinkError,
+    PathExistLinkError,
+)
+from link_helpers import (
+    DEFAULT_LINK_MOUNT,
+    DEFAULT_PARENT_FILE,
+    assert_mount_exposes,
+    link_pin,
+    make_parent_with_link,
+    make_parent_with_remount,
+    make_repo,
+    make_repo_renumbering_folder,
+)
 from lore_parsers import parse_jsonl, parse_status_json
-from test_utils import unstaged_entries
+from test_utils import (
+    get_unstage_counts,
+    has_staged_anchor,
+    registered_links,
+    status_by_path,
+    unstaged_entries,
+)
 
 from lore import Lore
+
+pytestmark = pytest.mark.own_vfs(
+    "links a repository, which a virtual clone does not hold"
+)
 
 logger = logging.getLogger(__name__)
 
@@ -1070,6 +1096,55 @@ def test_link_add_remove(new_lore_repo):
     assert main_repo.compare_file(main_repo, expected_file2), (
         "Re-materialized file 2 content should match"
     )
+    entries = status_by_path(main_repo)
+    assert entries == {}, (
+        f"Expected the unstaged removal to leave nothing staged or dirty, got: {entries}"
+    )
+    assert not has_staged_anchor(main_repo), (
+        "Expected the unstaged removal to leave no staged state"
+    )
+
+
+@pytest.mark.smoke
+def test_link_unstage_of_a_nested_link_removal_leaves_nothing(new_lore_repo):
+    """Unstaging the removal of a committed link below a directory restores the link and leaves
+    no directory above it dirty, so no staged state is left."""
+    parent_repo, _ = make_parent_with_link(new_lore_repo)
+    parent_repo.link_remove(DEFAULT_LINK_MOUNT)
+
+    parent_repo.unstage(DEFAULT_LINK_MOUNT)
+
+    entries = status_by_path(parent_repo)
+    assert entries == {}, f"Expected nothing staged or dirty, got: {entries}"
+    assert not has_staged_anchor(parent_repo), (
+        "Expected the unstaged removal to leave no staged state"
+    )
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("mount", ["lib", DEFAULT_LINK_MOUNT])
+def test_link_unstage_of_a_link_removal_beside_a_dirty_file_keeps_only_the_file(
+    new_lore_repo, mount
+):
+    """Unstaging the removal of a committed link while another file is dirty restores the link,
+    counts it as an unstaged directory, and stores the staged state, which then holds the dirty
+    file alone."""
+    parent_repo, _ = make_parent_with_link(new_lore_repo, link_path=mount)
+    parent_repo.write_files({DEFAULT_PARENT_FILE: "edited\n"})
+    parent_repo.dirty(DEFAULT_PARENT_FILE)
+    parent_repo.link_remove(mount)
+
+    counts = get_unstage_counts(parent_repo.unstage(mount, json=True))
+    assert counts["directoryUnstagedCount"] == 1, counts
+
+    entries = status_by_path(parent_repo)
+    assert entries.keys() == {DEFAULT_PARENT_FILE}, (
+        f"Expected only {DEFAULT_PARENT_FILE} left, got: {entries}"
+    )
+    assert entries[DEFAULT_PARENT_FILE]["flagDirty"], entries
+    assert not entries[DEFAULT_PARENT_FILE]["flagStaged"], entries
+    assert registered_links(parent_repo).keys() == {mount}
+    assert_mount_exposes(parent_repo, mount, "/", ["linked.txt"])
 
 
 @pytest.mark.smoke
@@ -1228,40 +1303,86 @@ def test_link_update_subdirectory_source(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_stage_move_on_mount_is_refused(new_lore_repo):
-    """Renaming a link mount is refused, and the link survives the attempt.
+def test_link_update_keeps_the_mount_where_node_ids_shift(new_lore_repo):
+    """Updating a subtree link's pin keeps it on the same path, wherever the new revision numbers it.
 
-    `stage move` does not perform the rename itself, so the on-disk move has to
-    happen first; without it the command fails on the missing destination with a
-    generic os error and never reaches any node checks.
-
-    The refusal is not link-aware: it is the generic non-directory guard, which
-    fires because a mount is not a directory node — the same message a plain
-    tracked file produces when moved onto a directory. So the message is not
-    asserted here, and it will change if renaming a mount is ever implemented. The
-    load-bearing assertions are the link registry checks below: the mount is still
-    registered at its original path, and the rename was not recorded.
+    A revision numbers its nodes afresh, so the node the mount stood at can name another folder.
     """
-    parent, link_repo = make_parent_with_link(new_lore_repo)
+    link_path = "linked/repo"
+    source_repo, pin_one, pin_two = make_repo_renumbering_folder(new_lore_repo)
 
-    parent.move(DEFAULT_LINK_MOUNT, "vendor/renamed")
-    output = parent.stage_move(DEFAULT_LINK_MOUNT, "vendor/renamed", check=False)
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "sub", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
 
-    assert "[Error]" in output, (
-        f"Renaming a link mount should not succeed, got: {output}"
+    repo.link_update(link_path, pin=pin_two)
+    repo.commit("Update the pin")
+    repo.push()
+
+    assert_mount_exposes(repo, link_path, "sub", ["a.txt"])
+    clone = repo.clone()
+    assert_mount_exposes(clone, link_path, "sub", ["a.txt"])
+    with clone.open_file(f"{link_path}/a.txt") as f:
+        assert f.read() == "two\n", "the mount should expose the updated revision"
+
+
+@pytest.mark.smoke
+def test_link_update_replaces_a_directory_with_a_file(new_lore_repo):
+    """A pin move that turns a directory into a file leaves the file in place.
+
+    The directory is deleted before the file is written, so clearing the directories the move
+    emptied must spare a path it writes again.
+    """
+    link_path = "linked/repo"
+    source_repo = make_repo(new_lore_repo, {"foo/inner.txt": "inner\n"})
+    pin_one = source_repo.branch_info().local_latest
+    source_repo.rmtree("foo")
+    source_repo.stage(scan=True)
+    source_repo.commit("Drop the directory")
+    source_repo.push()
+    source_repo.write_commit_push("Add a file in its place", {"foo": "file\n"})
+    pin_two = source_repo.branch_info().local_latest
+
+    repo = make_repo(new_lore_repo, {"main-file.txt": "initial content\n"})
+    repo.link_add(link_path, source_repo.get_id(), "/", pin=pin_one)
+    repo.commit("Add link")
+    repo.push()
+
+    repo.link_update(link_path, pin=pin_two)
+
+    with repo.open_file(f"{link_path}/foo") as f:
+        assert f.read() == "file\n", "the mount should hold the file the new pin has"
+
+
+@pytest.mark.smoke
+def test_link_remount_realized_by_branch_switch(new_lore_repo):
+    """A remount commits, and switching across it materializes the subtree each branch exposes.
+
+    Narrowed from the root, so the subtree the mount lands on sits in a directory the wider mount
+    also exposed and the realize carries its content out only after attempting to delete it.
+    """
+    link_path = "linked/repo"
+    source_path = "sub"
+    repo, _source_repo = make_parent_with_remount(
+        new_lore_repo,
+        {
+            "root-file.txt": "root source content\n",
+            f"{source_path}/link-file.txt": "subtree source content\n",
+        },
+        "/",
+        source_path,
+        link_path,
+    )
+    assert_mount_exposes(
+        repo.clone(branch="feature-branch"), link_path, source_path, ["link-file.txt"]
     )
 
-    # The link is intact and still registered at its original path.
-    links = parent.link_list()
-    assert link_repo.get_id() in links, (
-        f"Link should survive a refused stage move: {links}"
-    )
-    assert (
-        DEFAULT_LINK_MOUNT in links or DEFAULT_LINK_MOUNT.replace("/", "\\") in links
-    ), f"Link path should be unchanged after a refused stage move: {links}"
-    assert "vendor/renamed" not in links and "vendor\\renamed" not in links, (
-        f"The rename should not be recorded against the link: {links}"
-    )
+    repo.branch_switch("main")
+    assert_mount_exposes(repo, link_path, "/", ["root-file.txt", source_path])
+
+    repo.branch_switch("feature-branch")
+    assert_mount_exposes(repo, link_path, source_path, ["link-file.txt"])
 
 
 @pytest.mark.smoke
@@ -1456,23 +1577,254 @@ def test_link_move_realizes_at_the_mount(new_lore_repo):
 
 
 @pytest.mark.smoke
-def test_link_stage_move_inside_a_link_is_refused(new_lore_repo):
-    """Staging a move of a path inside a link is refused rather than acted on.
-
-    Resolving the path crosses the link, so the node it answers with is numbered by the linked
-    repository's state and names nothing in the parent's. The move reads and relinks it in the
-    parent, so it has to stop at the boundary, as the destination side already does.
-    """
-    link_path = "vendor/b"
-    parent_repo, _link_repo = make_parent_with_link(
-        new_lore_repo, link_path, {"dir/f1.txt": "content\n"}
+def test_link_update_takes_a_case_variant_of_a_file_the_update_deletes(new_lore_repo):
+    """A file spelled in another case holding the pinned content goes with its directory."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
     )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
 
-    moved_from = f"{link_path}/dir/f1.txt"
-    moved_to = f"{link_path}/dir/f2.txt"
-    parent_repo.move(moved_from, moved_to)
+    parent_repo.move(f"{link_path}/deep/inner.txt", f"{link_path}/deep/Inner.txt")
+    parent_repo.link_update(link_path)
 
-    output = parent_repo.stage_move(moved_from, moved_to, check=False)
-    assert "Links not yet implemented" in output, (
-        f"A move across a link boundary should be refused, got: {output}"
+    assert not parent_repo.path_exists(f"{link_path}/deep")
+
+
+@pytest.mark.smoke
+def test_link_update_keeps_a_modified_case_variant_of_a_file_the_update_deletes(
+    new_lore_repo,
+):
+    """A file spelled in another case holding other content than the pinned file is local work."""
+    link_path = "libs/shared"
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo, link_path, {"deep/inner.txt": "pinned\n", "keep.txt": "keep\n"}
     )
+    link_repo.rmtree("deep")
+    link_repo.stage(scan=True)
+    link_repo.commit()
+    link_repo.push()
+
+    variant = f"{link_path}/deep/Inner.txt"
+    parent_repo.move(f"{link_path}/deep/inner.txt", variant)
+    parent_repo.write_files({variant: "locally edited\n"})
+    with pytest.raises(LocalChanges):
+        parent_repo.link_update(link_path)
+
+    with parent_repo.open_file(variant) as f:
+        assert f.read() == "locally edited\n"
+
+
+def _make_parent_with_pin_move(new_lore_repo) -> tuple[Lore, Lore, str, str]:
+    """Returns (parent_repo, link_repo, pin_one, pin_two): the parent links the linked repository
+    at `pin_one` and ignores `*.log`. `pin_two` modifies `mod.txt` and `tracked.log`, deletes
+    `gone.txt` and the directory `olddir`, moves `moved/from.txt` to `moved/to.txt` with other
+    content and `moved/plain.txt` to `moved/plain-to.txt` as it is, adds `added.txt` and
+    `added.log`, and leaves `keep.txt` as it is."""
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={
+            "keep.txt": "keep\n",
+            "mod.txt": "one\n",
+            "tracked.log": "one\n",
+            "gone.txt": "one\n",
+            "olddir/x.txt": "one\n",
+            "moved/from.txt": "one\n",
+            "moved/plain.txt": "plain\n",
+        },
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n", ".loreignore": "*.log\n"},
+    )
+    pin_one = link_repo.branch_info().local_latest
+    for source, destination in [
+        ("moved/from.txt", "moved/to.txt"),
+        ("moved/plain.txt", "moved/plain-to.txt"),
+    ]:
+        link_repo.move(source, destination)
+        link_repo.stage_move(source, destination)
+    link_repo.remove_file("gone.txt")
+    link_repo.rmtree("olddir")
+    link_repo.write_files(
+        {
+            "mod.txt": "two\n",
+            "tracked.log": "two\n",
+            "moved/to.txt": "two\n",
+            "added.txt": "two\n",
+            "added.log": "two\n",
+        }
+    )
+    link_repo.stage(scan=True)
+    link_repo.commit("Pin two")
+    link_repo.push()
+    return parent_repo, link_repo, pin_one, link_repo.branch_info().local_latest
+
+
+def _stage_in_parent(parent_repo: Lore):
+    """Stages a file of the parent's own, outside the link."""
+    parent_repo.write_files({"staged.txt": "staged\n"})
+    parent_repo.stage("staged.txt")
+
+
+STAGED_PARENT = pytest.mark.parametrize(
+    "staged_parent", [False, True], ids=["nothing staged", "parent staged"]
+)
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "variant",
+    [None, "keep.txt", "mod.txt"],
+    ids=[
+        "as pinned",
+        "a case variant of a file the update leaves alone",
+        "a case variant of a file the update modifies",
+    ],
+)
+def test_link_update_of_a_link_without_local_changes(
+    new_lore_repo, staged_parent, variant
+):
+    """A link with no local change updates, whatever the parent has staged. A file spelled in
+    another case holding the pinned content is no local change: on a file system that folds case
+    it is the pinned file, and on one that does not, the update writes the pinned spelling beside
+    it."""
+    parent_repo, link_repo, _, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    if variant:
+        parent_repo.move(
+            f"{DEFAULT_LINK_MOUNT}/{variant}",
+            f"{DEFAULT_LINK_MOUNT}/{variant.upper()}",
+        )
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_two
+    for path in ["moved/to.txt", "mod.txt"]:
+        with parent_repo.open_file(f"{DEFAULT_LINK_MOUNT}/{path}") as f:
+            assert f.read() == "two\n", "the mount should hold the revision updated to"
+    if staged_parent:
+        assert status_by_path(parent_repo)["staged.txt"].get("flagStaged") is True, (
+            "the update should keep what the parent has staged"
+        )
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "edited",
+    [
+        "mod.txt",
+        "gone.txt",
+        "moved/from.txt",
+        "moved/plain.txt",
+        "tracked.log",
+        "added.txt",
+        "added.log",
+    ],
+    ids=[
+        "a file the update modifies",
+        "a file the update deletes",
+        "a file the update moves and modifies",
+        "a file the update moves",
+        "a file the update modifies that the ignore file names",
+        "an untracked file where the update adds one",
+        "an untracked file the ignore file names where the update adds one",
+    ],
+)
+def test_link_update_refuses_a_local_change_it_would_overwrite(
+    new_lore_repo, staged_parent, edited
+):
+    """A local change the new pin would overwrite or delete refuses the update, whatever the
+    parent has staged and whatever the ignore file names, and the change and the pin stay as
+    they were."""
+    parent_repo, link_repo, pin_one, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    edited_path = f"{DEFAULT_LINK_MOUNT}/{edited}"
+    parent_repo.write_files({edited_path: "locally edited\n"})
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    with pytest.raises(LocalChanges) as refused:
+        parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert refused.value.returncode == LOCAL_MODIFICATIONS, refused.value
+    with parent_repo.open_file(edited_path) as f:
+        assert f.read() == "locally edited\n", "the refused update should keep the edit"
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_one
+
+
+@pytest.mark.smoke
+@pytest.mark.skipif(sys.platform == "win32", reason="Windows holds no executable bit")
+def test_link_update_refused_for_a_local_change_leaves_the_bits(new_lore_repo):
+    """An update refused for a local change it would overwrite changes no executable bit in the
+    link: a file the new pin gives the bit, whose content the working tree holds, keeps its
+    mode. With the change reset, the update gives it the bit."""
+    parent_repo, link_repo = make_parent_with_link(
+        new_lore_repo,
+        link_files={"mod.txt": "one\n", "tool.sh": "tool\n"},
+        parent_files={DEFAULT_PARENT_FILE: "baseline\n"},
+    )
+    link_repo.write_files({"mod.txt": "two\n"})
+    os.chmod(os.path.join(link_repo.path, "tool.sh"), 0o755)
+    link_repo.stage(["mod.txt", "tool.sh"])
+    link_repo.commit("Pin two")
+    link_repo.push()
+    pin_two = link_repo.branch_info().local_latest
+    parent_repo.write_files({f"{DEFAULT_LINK_MOUNT}/mod.txt": "locally edited\n"})
+    tool = os.path.join(parent_repo.path, DEFAULT_LINK_MOUNT, "tool.sh")
+
+    with pytest.raises(LocalChanges):
+        parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+    mode = os.stat(tool).st_mode
+    assert not mode & stat.S_IXUSR, f"{mode:o}"
+
+    parent_repo.reset(f"{DEFAULT_LINK_MOUNT}/mod.txt", purge=True)
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+    mode = os.stat(tool).st_mode
+    assert mode & stat.S_IXUSR, f"{mode:o}"
+
+
+@pytest.mark.smoke
+@STAGED_PARENT
+@pytest.mark.parametrize(
+    "local",
+    [
+        "keep.txt",
+        "untracked.txt",
+        "olddir/untracked.txt",
+        pytest.param(
+            "MOD.txt",
+            marks=pytest.mark.skipif(
+                sys.platform != "linux", reason="Requires case-sensitive filesystem"
+            ),
+        ),
+    ],
+    ids=[
+        "an edit to a file the update leaves alone",
+        "an untracked file",
+        "an untracked file in a directory the update deletes",
+        "an edit to a case variant of a file the update modifies",
+    ],
+)
+def test_link_update_keeps_a_local_change_it_leaves_alone(
+    new_lore_repo, staged_parent, local
+):
+    """A local change the new pin neither overwrites nor deletes stays as it is through the
+    update, whatever the parent has staged."""
+    parent_repo, link_repo, _, pin_two = _make_parent_with_pin_move(new_lore_repo)
+    if local == "MOD.txt":
+        parent_repo.move(
+            f"{DEFAULT_LINK_MOUNT}/mod.txt", f"{DEFAULT_LINK_MOUNT}/MOD.txt"
+        )
+    local_path = f"{DEFAULT_LINK_MOUNT}/{local}"
+    parent_repo.write_files({local_path: "locally edited\n"})
+    if staged_parent:
+        _stage_in_parent(parent_repo)
+
+    parent_repo.link_update(DEFAULT_LINK_MOUNT, pin=pin_two)
+
+    assert link_pin(parent_repo, link_repo.get_id()) == pin_two
+    with parent_repo.open_file(local_path) as f:
+        assert f.read() == "locally edited\n", "the update should keep the local change"

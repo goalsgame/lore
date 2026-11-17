@@ -3,21 +3,17 @@
 use std::sync::Arc;
 
 use lore_base::runtime::LORE_CONTEXT;
-use lore_base::types::Context;
 use lore_base::types::Hash;
 use lore_proto::lore::repository::v1::RepositoryDeleteRequest;
 use lore_proto::lore::repository::v1::RepositoryDeleteResponse;
 use lore_revision::branch;
-use lore_revision::lore::RepositoryId;
 use lore_revision::lore::execution_context;
 use lore_revision::repository;
 use lore_revision::repository::RepositoryContext;
 use lore_telemetry::InstrumentProvider;
-use tokio_stream::StreamExt;
 use tonic::Request;
 use tonic::Response;
 use tonic::Status;
-use tracing::debug;
 use tracing::info;
 
 use super::record::build_repository;
@@ -30,6 +26,7 @@ use crate::grpc::extract_authorization_header;
 use crate::grpc::extract_correlation_id;
 use crate::grpc::get_user_id;
 use crate::grpc::may_administer_repository;
+use crate::grpc::requested_repository_id;
 use crate::util::setup_execution;
 
 /// `lore.repository.v1.RepositoryService.RepositoryDelete` handler.
@@ -52,7 +49,7 @@ pub async fn handler(
     let authorization = extract_authorization_header(&request);
     let (_metadata, extensions, req) = request.into_parts();
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
     let execution = setup_execution(module_path!(), correlation_id, user_id);
     let repository = Arc::new(RepositoryContext::new_server_context(
         immutable_store,
@@ -97,40 +94,7 @@ pub async fn handler(
             // already torn down above, so this purge is past the point of no
             // return. A retryable status would invite a retry that only finds
             // the repository gone, leaving these keys orphaned.
-            if let Ok(mut branch_stream) = branch::list(repository.clone()).await {
-                let mut branch_list = vec![];
-                while let Some(branch) = branch_stream.next().await {
-                    branch_list.push(branch);
-                }
-
-                for branch in branch_list {
-                    if let Ok(branch_metadata) = branch::metadata(repository.clone(), branch).await
-                    {
-                        let name = branch::name(&branch_metadata).unwrap_or_default();
-                        if !name.is_empty() {
-                            let _ = branch::delete_name_to_id(repository.clone(), name)
-                                .await
-                                .inspect_err(|err| {
-                                    debug!(
-                                        "Branch delete failed to remove name to ID mapping: {err}"
-                                    );
-                                });
-                        }
-                    }
-
-                    let _ = branch::mutable_delete(repository.clone(), branch::LATEST, branch)
-                        .await
-                        .inspect_err(|err| {
-                            debug!("Branch delete failed to remove HEAD pointer: {err}");
-                        });
-
-                    let _ = branch::mutable_delete(repository.clone(), branch::METADATA, branch)
-                        .await
-                        .inspect_err(|err| {
-                            debug!("Branch delete failed to remove metadata pointer: {err}");
-                        });
-                }
-            }
+            branch::purge_mapped_branches(repository.clone()).await;
 
             info!(
                 "Deleted repository {} with ID {}",

@@ -4,11 +4,15 @@ pub mod auth;
 pub mod connection;
 pub mod error;
 pub mod grpc;
+pub mod local_socket;
 pub mod quic;
 pub mod session;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod tls;
 pub mod traits;
 pub mod types;
+pub mod uds;
 pub mod util;
 
 use std::sync::OnceLock;

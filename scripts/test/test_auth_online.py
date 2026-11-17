@@ -33,7 +33,7 @@ from types import SimpleNamespace
 
 import grpc
 import pytest
-from error_types import LoreException
+from error_types import LoreException, NotAuthenticatedError
 from grpc_probe import REVISION_INFO, STORAGE_QUERY, call, repository_metadata
 from protobuf_wire import (
     encode_bytes_field,
@@ -41,6 +41,7 @@ from protobuf_wire import (
     field_message,
     parse_fields,
 )
+from lore_parsers import parse_jsonl
 from lore_server import (
     _kill_server_by_pid,
     allocate_free_port,
@@ -334,7 +335,8 @@ def provision_owner(auth_env, make_actor, label: str, user: MockUser, api_key=No
 def test_interactive_login_authenticates(auth_env, make_actor):
     """`auth login --no-browser` prints the login URL the auth service handed
     out, completes the device-grant flow (StartAuthSession + GetAuthSession
-    polling), and reports success."""
+    polling), and reports success. A login with `--reuse-session` keeps that
+    login; one without starts another."""
     mock = auth_env.mock
     login_token = mock.mint_token(USER1)
     script_interactive_login(mock, USER1, login_token, "session-login-test")
@@ -355,6 +357,25 @@ def test_interactive_login_authenticates(auth_env, make_actor):
     listing = repo.run(urc_args=["auth", "list"])
     assert USER1.user_id in listing
     assert USER1.preferred_username in listing
+
+    output = repo.run(
+        urc_args=[
+            "auth",
+            "login",
+            auth_env.remote_url,
+            "--no-browser",
+            "--reuse-session",
+        ]
+    )
+    assert "Login at:" not in output
+    assert "Authentication successful" in output
+    assert mock.calls["StartAuthSession"] == 1, (
+        "a login reusing a valid session must not start another"
+    )
+
+    output = login_interactive(repo, auth_env.remote_url)
+    assert "Login at:" in output
+    assert mock.calls["StartAuthSession"] == 2
 
 
 @pytest.mark.smoke
@@ -377,20 +398,38 @@ def test_api_key_login_authenticates_second_user(auth_env, make_actor):
 
 @pytest.mark.smoke
 def test_unknown_api_key_is_rejected(auth_env, make_actor):
-    """No rule matches an unknown key, so the exchange is refused."""
+    """No rule matches an unknown key, so the exchange is refused as
+    `NotAuthenticated`."""
     actor = make_actor("intruder")
     repo = actor.make_repo()
 
-    with pytest.raises(LoreException):
+    with pytest.raises(NotAuthenticatedError) as refused:
         login_api_key(repo, auth_env.remote_url, "not-a-real-key")
+    assert refused.value.returncode == 16, refused.value
 
 
 @pytest.mark.smoke
 def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_actor):
     """Repository create registers the rebac resource under the creator's
-    credential; delete removes it. Asserted from the requests the stub saw."""
+    credential; delete removes it. Asserted from the requests the stub saw.
+    The auth service hands out no refresh token, so the login reports none,
+    and `auth info` reports the login, without its token unless asked, beside
+    the user info it always reports."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
+
+    login = owner.repo.auth_user_token_event()
+    assert login["token"] == owner.login_token
+    assert login["refreshExpires"] == 0
+    assert login["refreshable"] is False
+    assert login["sessionValid"] is True
+
+    output = owner.repo.run(["auth", "info"], json=True)
+    [metadata] = parse_jsonl(output, "authUserToken")
+    assert metadata["token"] == ""
+    assert metadata["sessionValid"] is True
+    [user_info] = parse_jsonl(output, "authUserInfo")
+    assert user_info["id"] == USER1.user_id
 
     creations = mock.requests_for("CreateResource")
     assert [c["resource_id"] for c in creations] == [owner.resource_id]
@@ -406,6 +445,7 @@ def test_repository_create_and_delete_manage_the_auth_resource(auth_env, make_ac
     assert deletions[0]["bearer"] == owner.login_token
 
 
+@pytest.mark.own_vfs("counts the token exchanges a push makes, where a virtual clone's mount exchanged its token when it connected")
 @pytest.mark.smoke
 def test_remote_write_uses_token_exchange_and_online_permission_checks(
     auth_env, make_actor
@@ -1012,6 +1052,7 @@ def test_cross_partition_copy_requires_a_source_grant(auth_env):
 LINKER_API_KEY = "linker-api-key"
 
 
+@pytest.mark.own_vfs("links a repository, which a virtual clone does not hold")
 @pytest.mark.smoke
 def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor):
     """A revision tree walk follows a link into another partition only when
@@ -1066,7 +1107,7 @@ def test_cross_partition_link_read_follows_the_token_claim(auth_env, make_actor)
             node.path
             for node in revision_tree(
                 target, repository_id, signature, authorization=token
-            )
+            ).nodes
         }
 
     granted = tree_paths(both)
@@ -1239,8 +1280,8 @@ def test_cli_push_and_sync_follow_the_grant(auth_env, make_actor):
 def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     """`lore notification subscribe` under the online rules: a granted
     member's subscription is accepted and receives the owner's lock events
-    until its listen window closes; once revoked, the subscribe bails out
-    early with an error instead of holding a stream open."""
+    until its listen window closes; once revoked, the subscribe fails at once
+    as `NotAuthorized` instead of holding a stream open."""
     mock = auth_env.mock
     owner = provision_owner(auth_env, make_actor, "user1", USER1)
     commit_file(owner.repo, "watched.txt", "watched content")
@@ -1274,12 +1315,13 @@ def test_cli_notification_subscribe_follows_the_grant(auth_env, make_actor):
     # its empty `resources` claim, refuses the body-declared partition, and
     # the CLI bails out instead of listening.
     unscoped = mock.mint_token(USER2, resources=[])
-    with pytest.raises(LoreException):
+    with pytest.raises(LoreException) as refused:
         member.repo.run(
             ["notification", "subscribe", "3"],
             identity_token=unscoped,
             access_token=unscoped,
         )
+    assert refused.value.returncode == 17, refused.value
 
 
 # ---------------------------------------------------------------------------

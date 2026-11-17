@@ -21,9 +21,11 @@
 
 use std::time::Instant;
 
+use lore_base::test_util::TempFile;
 use lore_revision::filter::Filter;
 use lore_revision::filter::FilterMode;
 use lore_revision::filter::FilterStates;
+use lore_revision::util::path::RelativePath;
 use lore_revision::util::path::RelativePathBuf;
 
 #[path = "support/filter_workload.rs"]
@@ -36,11 +38,16 @@ use workload::tree;
 /// The filter as a repository holds one: the hundred-line rule set in the ignore
 /// slot, view empty.
 fn build() -> Filter {
+    build_from(&rules())
+}
+
+/// A filter holding `rules` in the ignore slot.
+fn build_from(rules: &[String]) -> Filter {
     let mut filter = Filter::default();
-    for rule in rules() {
+    for rule in rules {
         match rule.strip_prefix('!') {
             Some(rest) => filter.ignore.add_inclusion(rest).expect("inclusion"),
-            None => filter.ignore.add_exclusion(&rule).expect("exclusion"),
+            None => filter.ignore.add_exclusion(rule).expect("exclusion"),
         }
     }
     filter
@@ -213,7 +220,7 @@ fn descend_large_tree() {
         "tree: {} nodes ({directories} directories, {} files), {} filter lines",
         nodes.len(),
         nodes.len() - directories,
-        build().ignore.lines.len()
+        build().ignore.len()
     );
 
     const ROUNDS: usize = 2;
@@ -244,6 +251,132 @@ fn descend_large_tree() {
         let a = report("whole path", ROUNDS, whole.queries, whole_time);
         let b = report("threaded", ROUNDS, threaded.queries, threaded_time);
         println!("  speedup {:.2}x", a / b);
+    }
+}
+
+/// Descending the same tree under rule sets whose re-inclusion leads with a
+/// wildcard component: the `.loreignore` of an Unreal project, and a view
+/// re-including one directory of every project.
+///
+/// A walk enters an excluded directory only where a re-inclusion can match
+/// below it, so the nodes visited are what the re-inclusion index decides.
+#[test]
+#[ignore = "benchmark: run on demand with --ignored"]
+fn descend_large_tree_under_wildcard_led_reinclusions() {
+    let nodes = tree(12 * scale(), 4 * scale());
+    const ROUNDS: usize = 4;
+
+    for rules in [
+        &["Saved/", "!*/Saved/Config/"][..],
+        &["/*", "!/*/Content/Maps/"][..],
+    ] {
+        let rules: Vec<String> = rules.iter().map(|rule| (*rule).to_owned()).collect();
+        println!("\n{rules:?}, memo cold each walk:");
+        for (label, walk) in [
+            (
+                "whole path",
+                walk_whole_paths as fn(&Filter, &[TreeNode], FilterMode) -> WalkResult,
+            ),
+            ("threaded", walk_threaded),
+        ] {
+            let mut total = std::time::Duration::ZERO;
+            let mut last = None;
+            for _ in 0..ROUNDS {
+                let filter = build_from(&rules);
+                let start = Instant::now();
+                last = Some(walk(&filter, &nodes, FilterMode::Ignore));
+                total += start.elapsed();
+            }
+            let result = last.expect("at least one round");
+            println!(
+                "  visited {} nodes, kept {} files",
+                result.queries, result.files
+            );
+            report(label, ROUNDS, result.queries, total);
+        }
+    }
+}
+
+/// Every file in `nodes`, by its path.
+fn file_paths(nodes: &[TreeNode]) -> Vec<String> {
+    fn collect(nodes: &[TreeNode], at: usize, path: &mut RelativePathBuf, out: &mut Vec<String>) {
+        for &child in &nodes[at].children {
+            let child = child as usize;
+            path.push(&nodes[child].name);
+            if nodes[child].is_dir {
+                collect(nodes, child, path, out);
+            } else {
+                out.push(path.as_str().to_owned());
+            }
+            path.pop();
+        }
+    }
+
+    let mut out = Vec::new();
+    collect(nodes, 0, &mut RelativePathBuf::new(), &mut out);
+    out
+}
+
+/// Descending the same tree under the filters a repository builds from files
+/// and from a diff: two ignore files as `load` reads them, with the exclusions
+/// it appends, and the view `revision::diff3` scopes a merge's target walk to,
+/// `**` and a path inclusion for each of up to 10,000 changed files.
+#[test]
+#[ignore = "benchmark: run on demand with --ignored"]
+fn descend_large_tree_under_loaded_and_path_filters() {
+    let nodes = tree(12 * scale(), 4 * scale());
+    const ROUNDS: usize = 4;
+
+    let mut filters = Vec::new();
+    for (label, rules) in [
+        ("the hundred-line ignore file", rules()),
+        (
+            "an Unreal ignore file",
+            vec!["Saved/".to_owned(), "!*/Saved/Config/".to_owned()],
+        ),
+    ] {
+        let file = TempFile::with_contents("filter-descend-bench-", rules.join("\n").as_bytes());
+        let absent = file.path().with_extension("absent");
+        let filter = lore_revision::filter::load(file.path(), absent).expect("load");
+        filters.push((label, filter, FilterMode::Ignore));
+    }
+    let files = file_paths(&nodes);
+    let mut changed = Filter::default();
+    changed.view.add_exclusion("**").expect("exclusion");
+    for path in files.iter().step_by(files.len().div_ceil(10_000).max(1)) {
+        changed
+            .view
+            .add_path_inclusion(&RelativePath::new_from_initial_path(path).expect("path"));
+    }
+    filters.push(("a diff's view", changed, FilterMode::View));
+
+    for (label, filter, mode) in &filters {
+        println!(
+            "\n{label}, {} lines, memo cold each walk:",
+            filter.ignore.len() + filter.view.len()
+        );
+        for (strategy, walk) in [
+            (
+                "whole path",
+                walk_whole_paths as fn(&Filter, &[TreeNode], FilterMode) -> WalkResult,
+            ),
+            ("threaded", walk_threaded),
+        ] {
+            let mut total = std::time::Duration::ZERO;
+            let mut last = None;
+            for _ in 0..ROUNDS {
+                let cold = filter.with_view(filter.view.clone());
+                let start = Instant::now();
+                last = Some(walk(&cold, &nodes, *mode));
+                total += start.elapsed();
+            }
+            let result = last.expect("at least one round");
+            println!(
+                "  visited {} nodes, kept {} files",
+                result.queries, result.files
+            );
+            report(strategy, ROUNDS, result.queries, total);
+        }
     }
 }
 

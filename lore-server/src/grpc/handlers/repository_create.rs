@@ -35,6 +35,7 @@ use crate::grpc::get_verified_token;
 use crate::grpc::get_write_token;
 use crate::grpc::hook_error_to_status;
 use crate::grpc::none_or_status;
+use crate::grpc::requested_repository_id;
 use crate::grpc::warn_error_to_status;
 use crate::hooks::HookContext;
 use crate::hooks::HookDispatcher;
@@ -59,7 +60,7 @@ pub async fn handler(
     let authorization = extract_authorization_header(&request);
     let req = request.into_inner();
 
-    let id: RepositoryId = Context::from(req.id).into();
+    let id = requested_repository_id(&req.id)?;
 
     let execution = setup_execution(module_path!(), correlation_id.clone(), user_id.clone());
 

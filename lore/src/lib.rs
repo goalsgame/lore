@@ -15,8 +15,6 @@ pub mod layer;
 pub mod link;
 pub mod lock;
 pub mod log;
-pub mod mount;
-pub mod mount_working;
 pub mod notification;
 pub mod remote;
 pub mod repository;
@@ -26,52 +24,30 @@ pub mod service;
 pub mod shared_store;
 pub mod storage;
 mod util;
-#[cfg(unix)]
-pub mod working_mount;
 
 use interface::LoreString;
+pub use lore_base::allocator::memory_stats_requested;
+pub use lore_base::allocator::memory_summary;
 pub use lore_base::lore_spawn;
 pub use lore_base::lore_spawn_blocking;
+use lore_base::runtime::NetConnections;
 pub use lore_base::version::LORE_LIBRARY_VERSION;
 /// Whole crate rather than a prelude: `#[error_set]` expands to paths rooted at the crate, so a
 /// consumer aliases this into scope as `lore_error_set`.
 pub use lore_error_set as error_set;
+pub use lore_revision::global::AuthSettings;
+pub use lore_revision::global::load_auth_settings;
 
 /// Time allowed for each wait shutdown drives from a synchronous caller: the drains before the
 /// runtime shutdown, whose timeout in `lore_revision::interface::shutdown` it matches, and the
 /// reads of calls cut short after it.
 const SHUTDOWN_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// A library shutdown that did not complete.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum ShutdownError {
-    #[error("the library has already entered terminal shutdown")]
-    AlreadyShutDown,
-    #[error("another library shutdown attempt is in progress")]
-    InProgress,
-    #[cfg(unix)]
-    #[error(
-        "timed out waiting for the owned service to retire; library resources are retained and shutdown may be retried"
-    )]
-    ServiceTimedOut,
-    #[cfg(unix)]
-    #[error(
-        "the owned service could not retire: {0}; library resources are retained and shutdown may be retried"
-    )]
-    ServiceRetained(String),
-    #[cfg(unix)]
-    #[error("service start admission is unavailable: {0}; library resources are retained")]
-    AdmissionUnavailable(&'static str),
-}
-
-/// Shuts the library down, returning `true` only when this call completes teardown.
+/// Shuts the library down, returning whether this call was the one that did it.
 ///
-/// Returns `false` when shutdown is already terminal, another attempt is in
-/// progress, or an owned Unix service could not retire within its bound. A
-/// service preflight failure retains the runtimes, connections and allocator;
-/// shutdown may be retried after the service can finish retiring.
-/// A panic during service start publication makes the next shutdown attempt
-/// return `false` before a retry can inspect the retained service run.
+/// Only the first caller runs the teardown. Every other gets `false`, so a
+/// concurrent caller can report the library as already shut down rather than
+/// racing a second teardown against the first.
 ///
 /// Claiming the shutdown also closes admission, so calls that arrive while the
 /// drains below are still running fail instead of being admitted onto runtimes
@@ -80,33 +56,9 @@ pub enum ShutdownError {
 /// Safe only once every call has completed. Calls still executing are cancelled at best effort: one
 /// not stopped in time may use the memory passed to it after this returns.
 pub fn shutdown() -> bool {
-    match try_shutdown() {
-        Ok(()) => true,
-        Err(reason) => {
-            lore_base::lore_warn!("Library shutdown did not complete: {reason}");
-            false
-        }
-    }
-}
-
-/// Attempts shutdown with an explicit reason when teardown cannot complete.
-///
-/// Has the same call-completion requirements as [`shutdown`]. On Unix, owned
-/// service retirement completes before global runtime admission is closed.
-pub fn try_shutdown() -> Result<(), ShutdownError> {
-    #[cfg(unix)]
-    {
-        service::shutdown::try_shutdown(SHUTDOWN_WAIT, teardown)
-    }
-    #[cfg(not(unix))]
-    {
-        teardown()
-    }
-}
-
-fn teardown() -> Result<(), ShutdownError> {
     if !lore_base::runtime::claim_runtime_shutdown() {
-        return Err(ShutdownError::AlreadyShutDown);
+        lore_base::lore_warn!("Shutdown was already called");
+        return false;
     }
 
     // Garbage collection stops alongside the drains rather than before them, so neither
@@ -142,7 +94,7 @@ fn teardown() -> Result<(), ShutdownError> {
     // hold that child unreaped for however long it outlives its Lore use.
     remote::service_process::collect_exited_services();
 
-    Ok(())
+    true
 }
 
 pub fn runtime() -> tokio::runtime::Handle {
@@ -167,6 +119,20 @@ pub fn will_use_service() -> bool {
     remote::service_process::service_in_use_blocking()
 }
 
+/// Records that this program's own executable runs the Lore service when started with
+/// `service run`. Where no executable is named and no service is running, starting the service
+/// and a command only the service may carry out, such as one that makes a virtual clone, then
+/// start one from this executable.
+///
+/// A program whose executable does not run the service that way must not call this: a command
+/// would start that program in place of a service. Without this call, a service is started only
+/// from the executable named in `LORE_SERVICE_EXECUTABLE` or the global config's
+/// `[service] executable`. Relaying a command to the service starts one only from that named
+/// executable, whether or not this is called.
+pub fn serve_from_this_executable() {
+    remote::service_process::serve_from_this_executable();
+}
+
 /// Sizes this process's thread pools for relaying its calls to the service, when
 /// that is what it will do. A no-op otherwise, and a no-op once a runtime exists.
 ///
@@ -184,6 +150,43 @@ pub fn size_threads_for_relaying() {
     lore_base::runtime::runtime_with_settings(
         Some(lore_base::runtime::TokioSettings::relay_only()),
     );
+}
+
+/// Sizes this process's thread pools for a command that opens `connections` storage
+/// connections to its remote, 0 for the default of one: a network thread for each connection, up
+/// to half of the async and network threads together, taken from the async threads. A process
+/// that names the machine server's socket opens one, whatever it asks for. A configured network
+/// thread count takes precedence. Returns false, and changes nothing, once a runtime exists, as in
+/// a process that relays its calls, or once a count was set.
+///
+/// Call it before the first Lore operation, and before building a runtime of your own.
+pub fn size_threads_for_connections(connections: u32) -> bool {
+    size_threads_for(NetConnections::Opened(
+        lore_transport::connection::storage_connection_count(connections as usize),
+    ))
+}
+
+/// Sizes this process's thread pools for running the service: as many network threads as
+/// [`size_threads_for_connections`] gives the most storage connections a command opens to a
+/// remote, one for a service that names the machine server's socket, added to the async threads
+/// rather than taken from them. The service carries the commands of many callers at once, and
+/// can't know in advance how many connections they will ask for.
+///
+/// Call it before the first Lore operation, and before building a runtime of your own.
+pub fn size_threads_for_service() -> bool {
+    size_threads_for(NetConnections::Served(
+        lore_transport::connection::storage_connection_count(
+            lore_transport::connection::MAX_STORAGE_CONNECTIONS,
+        ),
+    ))
+}
+
+fn size_threads_for(connections: NetConnections) -> bool {
+    let sized = lore_base::runtime::set_net_connections(connections);
+    if !sized {
+        lore_base::lore_debug!("Thread pools already sized; not sizing them for {connections:?}");
+    }
+    sized
 }
 
 pub fn log_file_path() -> LoreString {

@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Cow;
+use std::hash::BuildHasherDefault;
 use std::path::Path;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 
 use bitflags::bitflags;
 use dashmap::DashMap;
+use lore_base::types::PassThroughHasher;
 use lore_error_set::prelude::*;
 use serde::Serialize;
+use smallvec::SmallVec;
 
 use crate::bitflagsops;
 use crate::errors::InvalidArguments;
@@ -32,7 +35,8 @@ pub struct Filter {
     memo: AncestorMemo,
 }
 
-/// One filter's rules, with the indexes that answer subtree questions about them.
+/// One filter's rules, with the indexes that answer subtree questions about them
+/// and narrow the lines a step visits.
 ///
 /// The footprint is load-bearing. [`Filter`] holds two of these by value and a
 /// whole-path query reads across both, so a field costs several percent of that
@@ -44,7 +48,10 @@ pub struct FilterInstance {
     /// Match lines in authored order. Every authored rule contributes exactly
     /// one line, except a path-form inclusion, which also contributes the
     /// subtree companion described on [`add_inclusion`](Self::add_inclusion).
-    pub lines: Vec<FilterLine>,
+    /// A path added by [`add_path_inclusion`](Self::add_path_inclusion)
+    /// contributes a line and its companion. Every line enters through
+    /// [`push_line`](Self::push_line), which keeps `prefixes` in step with it.
+    lines: Vec<FilterLine>,
     /// Answers whether any inclusion can land below a directory, which is what
     /// decides descent into an excluded one. Built as the lines are added.
     reinclude: RuleIndex,
@@ -52,6 +59,10 @@ pub struct FilterInstance {
     /// an included directory holds anything this filter could exclude. See
     /// [`covers_subtree`](Self::covers_subtree).
     exclude: RuleIndex,
+    /// The lines by their leading literal components once there are
+    /// [`INDEXED_LINES`] of them, which spares [`step`](Self::step) the lines
+    /// listed under components other than the path's.
+    prefixes: Option<Box<LinePrefixes>>,
 }
 
 /// One glob and the two facts about the authored rule that the glob text cannot
@@ -73,17 +84,42 @@ pub struct FilterLine {
     negated: bool,
     directory: bool,
     filename: bool,
-    /// Emitted by [`FilterInstance::add_inclusion`] rather than authored, so
-    /// [`save`] leaves it out. Read nowhere else.
-    generated: bool,
     /// Fewest path components this line can match, so a prefix shorter than that
     /// is skipped without running the glob. A whole-path query folds over every
     /// ancestor, and most lines cannot possibly match the shallow ones.
     min_depth: u32,
-    /// The glob holds no metacharacter, so matching it is a string comparison
-    /// rather than a glob evaluation. Most lines in a real filter are literal
-    /// paths or names, and this runs for every line on every path a walk visits.
+    /// The glob is compared to the path as text rather than evaluated as a
+    /// glob. Most lines in a real filter are literal paths or names, and this
+    /// runs for every line on every path a walk visits.
     literal: bool,
+}
+
+impl FilterLine {
+    /// Whether the glob matches `path`, or `name` for a name rule, by
+    /// comparison where the line is literal.
+    fn hits(&self, path: &str, name: &str) -> bool {
+        let text = if self.filename { name } else { path };
+        if self.literal {
+            self.glob == text
+        } else {
+            glob_match::glob_match(self.glob.as_str(), text)
+        }
+    }
+}
+
+impl FilterInstance {
+    /// Whether both hold the same authored rules in the same order, and so answer every path
+    /// the same way. The indexes are derived from the lines, so comparing lines is enough.
+    pub fn same_rules(&self, other: &FilterInstance) -> bool {
+        self.lines.len() == other.lines.len()
+            && self.lines.iter().zip(&other.lines).all(|(a, b)| {
+                a.glob == b.glob
+                    && a.negated == b.negated
+                    && a.directory == b.directory
+                    && a.filename == b.filename
+                    && a.literal == b.literal
+            })
+    }
 }
 
 #[error_set]
@@ -96,9 +132,11 @@ pub enum FilterError {
 ///
 /// `decided_at` names the line that produced the verdict, and floors two
 /// searches: [`FilterInstance::step`] skips the lines before it, so a rule that
-/// already lost at an excluded ancestor cannot win below it, and
-/// `ReincludeIndex::below` ignores re-inclusions before it, so a rule that lost
-/// cannot force a descent either.
+/// already lost at an excluded ancestor cannot win below it, and the
+/// re-inclusion index's `RuleIndex::below` ignores re-inclusions before it, so
+/// a rule that lost cannot force a descent either. For an excluded directory a
+/// re-inclusion can reach below, it is the last line that excludes the
+/// directory, since every re-inclusion authored before that line lost there.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterState {
     excluded: bool,
@@ -115,6 +153,39 @@ impl FilterState {
     /// Whether the path this state describes is excluded.
     pub fn excluded(&self) -> bool {
         self.excluded
+    }
+
+    /// A state carrying only whether the path is excluded, decided at no
+    /// particular line (as `ROOT` is).
+    ///
+    /// For a caller that persisted just the excluded bit and needs a
+    /// `FilterState` back to hand a walk. Resuming a walk from an excluded
+    /// result takes every line from the top, where the original decision took
+    /// only those from the line that decided it, so a re-inclusion authored
+    /// before that line, which lost there, re-includes below it. A caller that
+    /// can keep the line resumes with [`decided`](Self::decided).
+    pub fn excluded_from(excluded: bool) -> Self {
+        Self {
+            excluded,
+            decided_at: 0,
+        }
+    }
+
+    /// A state carrying whether the path is excluded and the line that decided
+    /// it, as [`decided_at`](Self::decided_at) answered, for a caller that
+    /// persisted both: a walk resumed from it reaches the verdicts the original
+    /// walk would have.
+    pub fn decided(excluded: bool, decided_at: u32) -> Self {
+        Self {
+            excluded,
+            decided_at,
+        }
+    }
+
+    /// The line that decided the verdict, which floors the lines a walk below
+    /// an excluded path takes.
+    pub fn decided_at(&self) -> u32 {
+        self.decided_at
     }
 }
 
@@ -220,14 +291,14 @@ pub fn load(
     ignore_path: impl AsRef<Path>,
     view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
-    from_instances(load_filter(ignore_path)?, load_filter(view_path)?)
+    with_ignore(load_filter(ignore_path)?, view_path)
 }
 
-/// Assemble parsed ignore and view rules with the repository's reserved-path
-/// and temporary-file exclusions.
-pub fn from_instances(
+/// The filter of `ignore`, the rules of a repository's ignore file, with the exclusions every
+/// repository holds and the view at `view_path`.
+fn with_ignore(
     mut ignore: FilterInstance,
-    view: FilterInstance,
+    view_path: impl AsRef<Path>,
 ) -> Result<Filter, FilterError> {
     ignore.add_exclusion(DOT_URC)?;
     ignore.add_exclusion(DOT_LORE)?;
@@ -236,11 +307,71 @@ pub fn from_instances(
     }
     ignore.add_exclusion(&format!("*{TEMP_FILE_EXTENSION}"))?;
 
+    let view = load_filter(view_path)?;
+
     Ok(Filter {
         ignore,
         view,
         memo: AncestorMemo::default(),
     })
+}
+
+/// [`load`], with the exclusions in the instance's own ignore file at
+/// `instance_ignore_path` after the rules of the repository's.
+///
+/// The instance's file is read as [`load_filter`] reads one: a file that cannot
+/// be read adds no rules, and one that cannot be decoded is an error. Its rules
+/// can only exclude: a `!` re-inclusion is skipped with a warning naming the line,
+/// so the file never brings back what the repository ignores.
+pub fn load_with_instance_ignore(
+    ignore_path: impl AsRef<Path>,
+    instance_ignore_path: impl AsRef<Path>,
+    view_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
+    with_instance_ignore(load(ignore_path, view_path)?, instance_ignore_path)
+}
+
+/// [`load_with_instance_ignore`] with the repository's ignore file read already: `ignore` holds
+/// its bytes and the path they came from, for the error message, and `None` where it has none.
+pub fn load_with_instance_ignore_from(
+    ignore: Option<(&[u8], &Path)>,
+    instance_ignore_path: impl AsRef<Path>,
+    view_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
+    let rules = match ignore {
+        Some((bytes, path)) => parse_filter(bytes, path)?,
+        None => FilterInstance::default(),
+    };
+    with_instance_ignore(with_ignore(rules, view_path)?, instance_ignore_path)
+}
+
+/// `filter` with the exclusions in the instance's own ignore file at `instance_ignore_path` after
+/// its own, as [`load_with_instance_ignore`] reads them.
+fn with_instance_ignore(
+    mut filter: Filter,
+    instance_ignore_path: impl AsRef<Path>,
+) -> Result<Filter, FilterError> {
+    let path = instance_ignore_path.as_ref();
+    let Ok(bytes) = std::fs::read(path) else {
+        return Ok(filter);
+    };
+    let text = decode_filter(&bytes, path)?;
+    for (line, negated, glob) in authored_rules(&text) {
+        if negated {
+            lore_warn!(
+                "Skipping line {line} of {}, !{glob}: an instance's ignore rules cannot re-include",
+                path.display()
+            );
+            continue;
+        }
+        filter
+            .ignore
+            .add_exclusion(glob)
+            .map_err(|error| InvalidArguments {
+                reason: format!("{}: line {line}: {error}", path.display()),
+            })?;
+    }
+    Ok(filter)
 }
 
 pub fn load_view(view_path: impl AsRef<Path>) -> Result<Filter, FilterError> {
@@ -268,6 +399,9 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
 /// Parses the authored rules in `bytes`, one per line. `path` names the file
 /// they came from, for the error message.
 ///
+/// One leading `!` makes a rule a re-inclusion, as in git, and the rest of the
+/// rule is its glob: `!!a` re-includes the name `!a`.
+///
 /// A file that can be read but not understood is an error, and the whole file is
 /// refused rather than the offending line skipped — a filter missing a rule
 /// excludes less than the file asks for, and the caller has no way to tell that
@@ -277,29 +411,11 @@ pub fn load_filter(path: impl AsRef<Path>) -> Result<FilterInstance, FilterError
 /// and a UTF-16 file has to be transcoded before it has lines at all;
 /// [`decode_text_for_parsing`] names the encodings accepted.
 pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterError> {
-    let text = decode_text_for_parsing(bytes).map_err(|error| InvalidArguments {
-        reason: format!("{}: {}", path.display(), error.reason),
-    })?;
+    let text = decode_filter(bytes, path)?;
     let mut filter = FilterInstance::default();
     let mut has_include = false;
     let mut has_exclude = false;
-    for line in text.lines() {
-        let mut glob = line.trim();
-        if glob.is_empty() || glob.starts_with('#') {
-            continue;
-        }
-
-        let mut negated = false;
-        while glob.starts_with('!') {
-            negated = !negated;
-            glob = &glob[1..];
-        }
-
-        // Allow exclamation marks in path/file names through escape backslash
-        if glob.starts_with("\\!") {
-            glob = &glob[1..];
-        }
-
+    for (_, negated, glob) in authored_rules(&text) {
         if negated {
             filter.add_inclusion(glob)?;
             has_include = true;
@@ -317,67 +433,34 @@ pub fn parse_filter(bytes: &[u8], path: &Path) -> Result<FilterInstance, FilterE
     Ok(filter)
 }
 
-/// Writes the authored rules back out, in order, as UTF-8 with no byte-order
-/// mark whatever encoding they were read from.
-///
-/// Reconstructed from the compiled lines: a name rule is written as it stands, a
-/// rooted single-component rule regains its leading separator, and a
-/// directory-only rule its trailing one. An authored `**/foo` comes back as
-/// `foo`, which gitignore defines as the same rule.
-///
-/// A reader sees either the previous rules or the new ones, and a save that
-/// fails leaves the previous ones.
-///
-/// The whole file is built in memory, so it costs one write rather than one per
-/// rule, and the I/O driver's atomic whole-file write publishes it: a temporary
-/// sibling, synced to disk with its parent directory, renamed over the target.
-/// Opening the target itself would truncate it at the open, so a write that then
-/// failed part way, on a full filesystem for instance, would leave a prefix of
-/// the new rules or nothing at all. A filter short a rule excludes less than the
-/// file asked for and nothing downstream can tell, which is the same reason
-/// [`load_filter`] refuses a file it cannot decode whole.
-///
-/// A save whose write, sync or rename fails removes the sibling, and one stopped
-/// part way leaves it. Nothing reports it while it exists: it is named with
-/// [`TEMP_FILE_EXTENSION`], which the ignore filter excludes and the
-/// working-tree scanners skip.
-pub async fn save(filter: &FilterInstance, path: impl AsRef<Path>) -> std::io::Result<()> {
-    let path = path.as_ref();
-    let mut out = String::new();
-    for line in filter.lines.iter().filter(|line| !line.generated) {
-        if line.negated {
-            out.push('!');
-        }
-        if !line.filename && !line.glob.contains('/') {
-            out.push('/');
-        }
-        out.push_str(&line.glob);
-        if line.directory {
-            out.push('/');
-        }
-        out.push('\n');
-    }
-    lore_io::IoDriver::global()
-        .write_file_segments_atomic(
-            temp_sibling(path),
-            path,
-            &lore_io::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true),
-            vec![out.into_bytes()],
-            true,
-            (),
-        )
-        .await
+/// Decodes the bytes of a filter file, naming `path` in the error.
+fn decode_filter<'a>(bytes: &'a [u8], path: &Path) -> Result<Cow<'a, str>, FilterError> {
+    Ok(
+        decode_text_for_parsing(bytes).map_err(|error| InvalidArguments {
+            reason: format!("{}: {}", path.display(), error.reason),
+        })?,
+    )
 }
 
-/// The temporary file [`save`] builds the new contents of `path` in, beside it
-/// in the same directory so the rename onto it stays within one filesystem.
-fn temp_sibling(path: &Path) -> PathBuf {
-    let mut temp = path.as_os_str().to_owned();
-    temp.push(TEMP_FILE_EXTENSION);
-    PathBuf::from(temp)
+/// The rules authored in a filter file's text: the 1-based line number of each,
+/// whether a leading `!` makes it a re-inclusion, and its glob. Blank lines and
+/// `#` comments are skipped.
+fn authored_rules(text: &str) -> impl Iterator<Item = (usize, bool, &str)> {
+    text.lines().enumerate().filter_map(|(index, line)| {
+        let mut glob = line.trim();
+        if glob.is_empty() || glob.starts_with('#') {
+            return None;
+        }
+
+        let negated = glob.starts_with('!');
+        glob = &glob[usize::from(negated)..];
+
+        // Allow exclamation marks in path/file names through escape backslash
+        if glob.starts_with("\\!") {
+            glob = &glob[1..];
+        }
+        Some((index + 1, negated, glob))
+    })
 }
 
 /// How many components a non-empty relative path has.
@@ -385,11 +468,8 @@ fn component_count(path: &str) -> u32 {
     path.bytes().filter(|byte| *byte == b'/').count() as u32 + 1
 }
 
-/// How deep a query about `path` stands, which bounds which rules can reach
-/// below it. The repository root arrives empty and names no component.
-///
-/// This is the `depth` [`Filter::covers_subtree`] is asked with. A walk that
-/// descends a component at a time counts instead, and pays nothing for it.
+/// How many components `path` has, which is none for the empty path that names
+/// the repository root.
 pub(crate) fn query_depth(path: &str) -> u32 {
     if path.is_empty() {
         0
@@ -404,20 +484,92 @@ pub(crate) fn query_depth(path: &str) -> u32 {
 /// would not. So does an unpaired `]`, which the engine treats as a literal:
 /// pairing it with its `[` costs more than letting the glob take the slower
 /// path.
+#[lore_macro::test_pub]
 fn is_literal(glob: &str) -> bool {
-    !glob.contains(['*', '?', '[', ']', '\\'])
+    !glob
+        .bytes()
+        .any(|byte| matches!(byte, b'*' | b'?' | b'[' | b']' | b'\\'))
 }
 
-/// Whether a single path component holds a glob metacharacter, so no literal
-/// text can stand in for it.
+/// The glob `<text>/**`, with a backslash before every character of `text`
+/// the matcher reads as syntax, so it matches everything below `text` alone.
+fn escaped_subtree(text: &str) -> String {
+    let mut subtree = String::with_capacity(text.len() + 3);
+    let mut start = 0;
+    for (index, byte) in text.bytes().enumerate() {
+        if matches!(byte, b'*' | b'?' | b'[' | b']' | b'{' | b'}' | b',' | b'\\') {
+            subtree.push_str(&text[start..index]);
+            subtree.push('\\');
+            start = index;
+        }
+    }
+    subtree.push_str(&text[start..]);
+    subtree.push_str("/**");
+    subtree
+}
+
+/// Whether `stars` is two or more `*` and nothing else, which git reads as one
+/// globstar.
+fn is_globstar(stars: &str) -> bool {
+    stars.len() > 1 && stars.bytes().all(|byte| byte == b'*')
+}
+
+/// How a [`RuleIndex`] compares one component of a glob with one path
+/// component. A text edge sorts before a pattern edge.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ComponentKind {
+    /// The component holds no metacharacter, so it matches only its own text.
+    Text,
+    /// The matcher evaluates the component on its own. None of `*`, `?` and a
+    /// bracket expression matches a separator, so it matches one path component
+    /// as it does within the whole glob.
+    Pattern,
+}
+
+/// How a [`RuleIndex`] compares one component of a glob with a path component,
+/// or `None` where it cannot.
 ///
-/// A brace group counts. An alternative inside one may hold a separator, so
-/// neither the group's text nor what follows it names a component. A
-/// [`RuleIndex`] enumerates the alternatives rather than stop here, and this is
-/// what answers for the forms it declines to enumerate: a rule compared as text,
-/// an escaped brace, and one with more alternatives than the cap.
-fn has_wildcard(component: &str) -> bool {
-    component.contains(['*', '?', '[', '{'])
+/// A globstar matches any number of components. A brace group may hold a
+/// separator in an alternative, and a rule compared as text holds its braces as
+/// text. A [`RuleIndex`] enumerates the alternatives rather than stop here, and
+/// this is what answers for the forms it declines to enumerate: a rule compared
+/// as text, an escaped brace, and one with more alternatives than the cap.
+///
+/// A component ending in an unpaired backslash escapes the separator after it:
+/// `a\/b` names `a/b`, not a component `a\`. And where `brackets` says a bracket
+/// expression may hold a separator, which it matches none of, the text's
+/// components from the first `[` on need not be the path's.
+fn component_kind(component: &str, brackets: bool) -> Option<ComponentKind> {
+    if is_globstar(component) {
+        return None;
+    }
+    let mut kind = ComponentKind::Text;
+    let mut escaping = false;
+    for byte in component.bytes() {
+        match byte {
+            b'{' => return None,
+            b'[' if brackets => return None,
+            b'*' | b'?' | b'[' | b']' => kind = ComponentKind::Pattern,
+            b'\\' => {
+                kind = ComponentKind::Pattern;
+                escaping = !escaping;
+                continue;
+            }
+            _ => {}
+        }
+        escaping = false;
+    }
+    (!escaping).then_some(kind)
+}
+
+/// Whether a `/` lies between the first `[` and the last `]` in `glob`, so a
+/// bracket expression may hold it. One matches no separator, so `x[a/b]y`
+/// matches `xay`.
+fn bracket_holds_separator(glob: &str) -> bool {
+    glob.find('[').is_some_and(|open| {
+        glob.rfind(']')
+            .is_some_and(|close| open < close && glob[open..close].contains('/'))
+    })
 }
 
 /// The first brace group in `glob`, as the offsets of its `{` and its matching
@@ -586,8 +738,8 @@ impl RuleReach {
 /// two-way groups reach it; a rule written by hand carries a handful.
 const MAX_ALTERNATIVES: usize = 64;
 
-/// Literal-prefix index over the lines of one polarity, answering whether any of
-/// them can match below a directory without evaluating a glob.
+/// Component index over the lines of one polarity, answering whether any of
+/// them can match below a directory without evaluating a whole glob.
 ///
 /// A walk needs that answer for every directory it meets. Over the inclusions it
 /// decides whether to descend into an excluded directory anyway; over the
@@ -597,12 +749,13 @@ const MAX_ALTERNATIVES: usize = 64;
 /// paths carries up to `SOURCE_FILTER_THRESHOLD` of them.
 ///
 /// Two independent bounds keep a rule out of an answer, and a rule escapes the
-/// index only by escaping both. The trie bounds *where* it can match: only the
-/// wildcard-free leading components of a glob can be indexed, so one whose first
-/// component holds a wildcard is recorded in `unanchored` and reaches any path.
-/// The [`RuleReach`] depth bounds *how deep*: the `/*` that opens a filter
-/// written as "exclude the top, then re-include what is wanted" compiles to
-/// `*`, which is unanchored and so reaches every path, but which cannot match
+/// index only by escaping both. The trie bounds *where* it can match: each edge
+/// is a leading component of a glob, compared with one path component as the
+/// matcher compares it, so `*/saved/config` reaches below `game/saved` and not
+/// below `game/saved/logs`. It follows a glob up to the first component it
+/// cannot compare, such as a `**` or a brace group, below which the rule
+/// reaches any path. The [`RuleReach`] depth bounds *how deep*, and so bounds
+/// such a rule too: `/{a,b}`, which compares its braces as text, cannot match
 /// below the first level.
 ///
 /// Over-approximating costs traversal, under-approximating drops content, so
@@ -610,54 +763,96 @@ const MAX_ALTERNATIVES: usize = 64;
 #[derive(Clone, Debug, Default)]
 struct RuleIndex {
     root: RuleNode,
-    /// Rules no prefix can rule out, because the first component of the glob
-    /// holds a wildcard or the rule is matched against a name at any depth.
-    unanchored: RuleReach,
+    /// Rules no leading component can rule out: a name rule, matched at any
+    /// depth, and a glob whose first component the index cannot compare.
+    unprefixed: RuleReach,
 }
 
 #[derive(Clone, Debug, Default)]
 struct RuleNode {
-    /// Component to child. Shallow and narrow in practice, so a `Vec` beats a
-    /// map: lookup is a handful of string compares with no hashing.
-    children: Vec<(String, RuleNode)>,
+    /// Component to child: the text components sorted by their text, then the
+    /// patterns. A walk finds the one text that matches through
+    /// [`text`](Self::text), as adding a rule does, and tries every pattern. A
+    /// `Vec` rather than a map: a lookup is a few compares with no hashing.
+    children: Vec<(Component, RuleNode)>,
     /// Rules sitting strictly below this node.
     below: RuleReach,
-    /// Rules with a wildcard tail starting here, which could match anything at
-    /// or below this node.
+    /// Rules whose next component the index cannot compare, such as a `**`, so
+    /// they could match anything below this node.
     wildcard_tail: RuleReach,
 }
 
-/// Passes a `u64` key straight through.
-///
-/// The key is already an xxh3 digest of a path, so hashing it again would be a
-/// second pass over the only thing the map looks at.
-#[derive(Clone, Copy, Default)]
-struct DigestHasher(u64);
+/// A leading component of an indexed glob, compared with one path component as
+/// `kind` says.
+#[derive(Clone, Debug)]
+struct Component {
+    glob: String,
+    kind: ComponentKind,
+}
 
-impl std::hash::Hasher for DigestHasher {
-    fn finish(&self) -> u64 {
-        self.0
+impl RuleNode {
+    /// Records `reach` as below this node, and returns the child for the
+    /// component `glob` compared as `kind`, added if it is not there.
+    ///
+    /// The kind is part of the edge: `[x]` as text and `[x]` as a pattern match
+    /// different names, so they lead to different children.
+    fn child(&mut self, glob: &str, kind: ComponentKind, reach: RuleReach) -> &mut RuleNode {
+        self.below.widen(reach);
+        let found = match kind {
+            ComponentKind::Pattern => self
+                .patterns()
+                .position(|(edge, _)| edge.glob == glob)
+                .map(|from_last| self.children.len() - 1 - from_last)
+                .ok_or(self.children.len()),
+            ComponentKind::Text => self.text(glob).ok_or_else(|| {
+                self.children.partition_point(|(edge, _)| {
+                    (edge.kind, edge.glob.as_str()) < (ComponentKind::Text, glob)
+                })
+            }),
+        };
+        let position = found.unwrap_or_else(|position| {
+            let edge = Component {
+                glob: glob.to_owned(),
+                kind,
+            };
+            self.children.insert(position, (edge, RuleNode::default()));
+            position
+        });
+        &mut self.children[position].1
     }
 
-    fn write(&mut self, _: &[u8]) {
-        debug_assert!(false, "the ancestor memo is keyed by u64 alone");
+    /// The pattern edges, which follow every text edge, from the last.
+    fn patterns(&self) -> impl Iterator<Item = &(Component, RuleNode)> {
+        self.children
+            .iter()
+            .rev()
+            .take_while(|(edge, _)| edge.kind == ComponentKind::Pattern)
     }
 
-    fn write_u64(&mut self, value: u64) {
-        self.0 = value;
+    /// The index of the text edge for `name`. A node of at most
+    /// [`SCANNED_CHILDREN`] edges is scanned and a wider one searched, which is
+    /// the cheaper of the two at either width.
+    fn text(&self, name: &str) -> Option<usize> {
+        if self.children.len() <= SCANNED_CHILDREN {
+            return self
+                .children
+                .iter()
+                .position(|(edge, _)| edge.kind == ComponentKind::Text && edge.glob == name);
+        }
+        self.children
+            .binary_search_by(|(edge, _)| {
+                (edge.kind, edge.glob.as_str()).cmp(&(ComponentKind::Text, name))
+            })
+            .ok()
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct DigestHashBuilder;
-
-impl std::hash::BuildHasher for DigestHashBuilder {
-    type Hasher = DigestHasher;
-
-    fn build_hasher(&self) -> DigestHasher {
-        DigestHasher(0)
-    }
-}
+/// Most edges [`RuleNode::text`] scans for a text component; a wider node is
+/// searched. An equality scan compares an edge's text only where its length
+/// matches, which on a narrow node costs less than a binary search's ordered
+/// comparisons.
+#[lore_macro::test_pub]
+const SCANNED_CHILDREN: usize = 16;
 
 /// A folded ancestor chain: where the fold got to, and how deep it went.
 #[derive(Clone, Copy, Debug)]
@@ -690,7 +885,7 @@ struct Ancestor {
 /// overlap; a query only ever loads, and stores when it finds a mismatch.
 #[derive(Clone, Debug, Default)]
 struct AncestorMemo {
-    entries: Arc<DashMap<u64, Ancestor, DigestHashBuilder>>,
+    entries: Arc<DashMap<u64, Ancestor, BuildHasherDefault<PassThroughHasher>>>,
     lines: Arc<AtomicU64>,
 }
 
@@ -716,12 +911,12 @@ impl RuleIndex {
     /// [`MAX_ALTERNATIVES`], beyond which the rule is recorded at its group
     /// instead and reaches everything below that point.
     ///
-    /// A caller passes `false` for a rule holding no group, and for one
-    /// [`FilterInstance::step`] compares as text rather than evaluating as a
-    /// glob: that rule's own text is the only thing it matches, so enumerating
-    /// would record paths it never names and leave out the one it does.
+    /// A caller passes `false` for a rule [`FilterInstance::step`] compares as
+    /// text rather than evaluating as a glob: that rule's own text is the only
+    /// thing it matches, so enumerating would record paths it never names and
+    /// leave out the one it does.
     fn insert(&mut self, glob: &str, expand: bool, line: usize, depth: u32) {
-        if !expand {
+        if !expand || first_brace_group(glob).is_none() {
             self.insert_form(glob, line, depth);
             return;
         }
@@ -730,7 +925,11 @@ impl RuleIndex {
         let mut enumerated = 0;
         while let Some(form) = pending.pop() {
             let Some((open, close)) = first_brace_group(&form) else {
-                self.insert_form(&form, line, FilterInstance::depth_range(&form, false).1);
+                self.insert_form(
+                    &form,
+                    line,
+                    FilterInstance::depth_range(&form, false, false).1,
+                );
                 enumerated += 1;
                 continue;
             };
@@ -752,39 +951,47 @@ impl RuleIndex {
     /// enumerates them.
     ///
     /// Each node on the way down gains the rule as something below it -- at least
-    /// the next component, maybe deeper. A wildcard component ends the descent and
-    /// marks the node it stops at, because no literal text stands in for it. A
-    /// glob that is literal throughout names its final node and marks nothing
-    /// below it.
+    /// the next component, maybe deeper. A component the index cannot compare
+    /// ends the descent and marks the node it stops at, because the rule could
+    /// match anything below it. A glob compared throughout names its final node
+    /// and marks nothing below it.
     fn insert_form(&mut self, glob: &str, line: usize, depth: u32) {
         let reach = RuleReach::rule(line, depth);
+        let brackets = bracket_holds_separator(glob);
         let mut node = &mut self.root;
         for (index, component) in glob.split('/').enumerate() {
-            if has_wildcard(component) {
+            let Some(kind) = component_kind(component, brackets) else {
                 if index == 0 {
-                    self.unanchored.widen(reach);
+                    self.unprefixed.widen(reach);
                 }
                 node.wildcard_tail.widen(reach);
                 return;
-            }
-            node.below.widen(reach);
-            let position = node
-                .children
-                .iter()
-                .position(|(name, _)| name == component)
-                .unwrap_or_else(|| {
-                    node.children
-                        .push((component.to_owned(), RuleNode::default()));
-                    node.children.len() - 1
-                });
-            node = &mut node.children[position].1;
+            };
+            node = node.child(component, kind, reach);
         }
+    }
+
+    /// Records the rule on line `line`, which matches everything strictly below
+    /// `path` at any depth. Every component of `path` is text, whatever it
+    /// holds.
+    fn insert_subtree(&mut self, path: &str, line: usize) {
+        let reach = RuleReach::rule(line, u32::MAX);
+        let mut node = &mut self.root;
+        for component in path.split('/') {
+            node = node.child(component, ComponentKind::Text, reach);
+        }
+        node.wildcard_tail.widen(reach);
     }
 
     /// Records the rule on line `line` as one no prefix bounds, so it reaches any
     /// path. `depth` bounds it as in [`insert`](Self::insert).
-    fn insert_unanchored(&mut self, line: usize, depth: u32) {
-        self.unanchored.widen(RuleReach::rule(line, depth));
+    fn insert_unprefixed(&mut self, line: usize, depth: u32) {
+        self.unprefixed.widen(RuleReach::rule(line, depth));
+    }
+
+    /// One past the last line of a rule the index records; zero for none.
+    fn lines(&self) -> u32 {
+        self.root.below.lines.max(self.unprefixed.lines)
     }
 
     /// Whether a rule on line `floor` or later can match a path strictly below
@@ -798,36 +1005,229 @@ impl RuleIndex {
     /// every line still applies passes `0` -- see
     /// [`FilterInstance::covers_subtree`].
     ///
-    /// Returns early when nothing in the index is late enough or deep enough to
-    /// matter, and when the walk falls off the indexed branches.
+    /// Each component of `path` is compared with the edges out of the node the
+    /// walk stands on, and may match more than one, so the walk follows each.
+    /// It reads no more of a rule than its components up to the first it cannot
+    /// compare, and returns early when nothing in the index is late enough or
+    /// deep enough to matter, and when it falls off the indexed branches.
     ///
     /// An empty `path` is the repository root, which names no component and
     /// holds everything: any rule the index carries at all lands below it.
     fn below(&self, path: &str, floor: u32, depth: u32) -> bool {
-        if self.unanchored.reaches(floor, depth) {
-            return true;
-        }
-        let mut node = &self.root;
-        if !node.below.reaches(floor, depth) {
-            return false;
-        }
-        if path.is_empty() {
-            return true;
-        }
-        for component in path.split('/') {
+        self.unprefixed.reaches(floor, depth)
+            || (self.root.below.reaches(floor, depth) && self.root.reaches(path, floor, depth))
+    }
+}
+
+impl RuleNode {
+    /// Whether a rule recorded at or below this node can match a path strictly
+    /// below the queried one. `rest` is the part of that path below this node.
+    /// See [`RuleIndex::below`].
+    ///
+    /// Follows the one text edge that matches in a loop, and each pattern edge
+    /// that matches in a call of its own.
+    fn reaches(&self, mut rest: &str, floor: u32, depth: u32) -> bool {
+        let mut node = self;
+        while !rest.is_empty() {
             if node.wildcard_tail.reaches(floor, depth) {
                 return true;
             }
-            match node
-                .children
-                .iter()
-                .find(|(name, _)| name.as_str() == component)
-            {
-                Some((_, child)) => node = child,
+            let (name, tail) = rest.split_once('/').unwrap_or((rest, ""));
+            rest = tail;
+            for (edge, child) in node.patterns() {
+                if (edge.glob == "*" || glob_match::glob_match(&edge.glob, name))
+                    && child.reaches(rest, floor, depth)
+                {
+                    return true;
+                }
+            }
+            match node.text(name) {
+                Some(index) => node = &node.children[index].1,
                 None => return false,
             }
         }
         node.below.reaches(floor, depth) || node.wildcard_tail.reaches(floor, depth)
+    }
+}
+
+/// Most leading components [`LinePrefixes`] lists a line under. A line with a
+/// longer literal prefix is listed under its first ones, which bounds the lists
+/// one step merges.
+const MAX_PREFIX_COMPONENTS: usize = 7;
+
+/// Fewest lines a filter indexes in [`LinePrefixes`]. A step over fewer scans
+/// every line.
+#[lore_macro::test_pub]
+const INDEXED_LINES: usize = 1000;
+
+/// The lines of one filter by their leading literal components.
+///
+/// A glob whose leading components are text, such as `engine/binaries` in
+/// `engine/binaries/*.pdb`, matches only paths that start with those
+/// components: the matcher compares text byte for byte, and a `/` outside a
+/// bracket expression matches one separator. Such a line is listed at the node
+/// those components lead to, so a step visits it only for a path that starts
+/// with them. A name rule, and a glob whose first component the index cannot
+/// compare as text, is listed at the root and visited for every path.
+///
+/// Lines are added in authored order, so every list ascends, and a step merges
+/// the lists along a path back into authored order. The nodes form an arena,
+/// with the root at index 0. The edges' text shares one buffer and a node keeps
+/// up to four lines inline, so a node holding no more than four lines and no
+/// children allocates nothing of its own.
+#[derive(Clone, Debug)]
+struct LinePrefixes {
+    nodes: Vec<PrefixNode>,
+    /// The text of every edge, each a range of it.
+    text: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct PrefixNode {
+    /// Edges to the children, sorted by their text.
+    children: Vec<PrefixEdge>,
+    /// Lines whose leading literal components, at most
+    /// [`MAX_PREFIX_COMPONENTS`] of them, lead to this node, ascending. The root
+    /// holds the lines with none, name rules among them.
+    lines: SmallVec<[u32; 4]>,
+}
+
+/// An edge from a [`PrefixNode`]: the range of [`LinePrefixes::text`] its
+/// component spans, and the child it leads to.
+#[derive(Clone, Copy, Debug)]
+struct PrefixEdge {
+    start: u32,
+    end: u32,
+    child: u32,
+}
+
+impl LinePrefixes {
+    /// An index holding the root alone.
+    fn new() -> Self {
+        Self {
+            nodes: vec![PrefixNode::default()],
+            text: Vec::new(),
+        }
+    }
+
+    /// Lists `line`, the line numbered `number`.
+    ///
+    /// The literal prefix ends at the first component holding `*`, `?`, `[`,
+    /// `]`, `\` or `{`, which [`component_kind`] reads as other than text.
+    fn insert(&mut self, line: &FilterLine, number: usize) {
+        let mut node = 0;
+        if !line.filename {
+            for component in line.glob.split('/').take(MAX_PREFIX_COMPONENTS) {
+                if component_kind(component, false) != Some(ComponentKind::Text) {
+                    break;
+                }
+                node = self.child(node, component.as_bytes());
+            }
+        }
+        self.nodes[node].lines.push(number as u32);
+    }
+
+    /// The edge out of `node` for `component`: `Ok` with its index, or `Err` with
+    /// the index it sorts at.
+    fn edge(&self, node: &PrefixNode, component: &[u8]) -> Result<usize, usize> {
+        node.children.binary_search_by(|edge| {
+            self.text[edge.start as usize..edge.end as usize].cmp(component)
+        })
+    }
+
+    /// The child of node `parent` for `component`, added if it is not there.
+    fn child(&mut self, parent: usize, component: &[u8]) -> usize {
+        match self.edge(&self.nodes[parent], component) {
+            Ok(index) => self.nodes[parent].children[index].child as usize,
+            Err(index) => {
+                let start = self.text.len() as u32;
+                self.text.extend_from_slice(component);
+                let child = self.nodes.len();
+                self.nodes.push(PrefixNode::default());
+                let edge = PrefixEdge {
+                    start,
+                    end: self.text.len() as u32,
+                    child: child as u32,
+                };
+                self.nodes[parent].children.insert(index, edge);
+                child
+            }
+        }
+    }
+
+    /// The lines numbered `floor` or later listed at the root and at each node
+    /// `path`'s leading components lead to, one ascending list per node that
+    /// holds any, and how many lists there are. Always inlined, since
+    /// [`visit`](Self::visit) runs for every step of an indexed filter.
+    #[inline(always)]
+    fn lists(&self, path: &str, floor: usize) -> ([&[u32]; MAX_PREFIX_COMPONENTS + 1], usize) {
+        let mut node = &self.nodes[0];
+        let mut lists: [&[u32]; MAX_PREFIX_COMPONENTS + 1] = [&[]; MAX_PREFIX_COMPONENTS + 1];
+        let mut count = 0;
+        let mut components = path.split('/');
+        loop {
+            let start = node.lines.partition_point(|&line| (line as usize) < floor);
+            if start < node.lines.len() {
+                lists[count] = &node.lines[start..];
+                count += 1;
+            }
+            let Some(component) = components.next() else {
+                break;
+            };
+            let Ok(index) = self.edge(node, component.as_bytes()) else {
+                break;
+            };
+            node = &self.nodes[node.children[index].child as usize];
+        }
+        (lists, count)
+    }
+
+    /// Calls `each` in ascending order with every line numbered `floor` or later
+    /// that is listed at the root or at a node `path`'s leading components lead
+    /// to, which includes every line that can match `path`.
+    fn visit(&self, path: &str, floor: usize, mut each: impl FnMut(usize)) {
+        let (mut lists, count) = self.lists(path, floor);
+        let lists = &mut lists[..count];
+        loop {
+            let mut next: Option<(usize, u32)> = None;
+            for (index, list) in lists.iter().enumerate() {
+                if let Some(&line) = list.first()
+                    && next.is_none_or(|(_, lowest)| line < lowest)
+                {
+                    next = Some((index, line));
+                }
+            }
+            let Some((index, line)) = next else {
+                return;
+            };
+            lists[index] = &lists[index][1..];
+            each(line as usize);
+        }
+    }
+
+    /// The last of the lines [`visit`](Self::visit) would visit that `accepts`
+    /// takes, found by searching each list from its end.
+    fn last(
+        &self,
+        path: &str,
+        floor: usize,
+        mut accepts: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let (lists, count) = self.lists(path, floor);
+        let mut last = None;
+        for list in &lists[..count] {
+            for &line in list.iter().rev() {
+                let line = line as usize;
+                if last.is_some_and(|found| line <= found) {
+                    break;
+                }
+                if accepts(line) {
+                    last = Some(line);
+                    break;
+                }
+            }
+        }
+        last
     }
 }
 
@@ -841,61 +1241,90 @@ impl FilterInstance {
     /// content in or out depending on how it happened to be written.
     ///
     /// A rule with no separator applies at any depth and is matched against the
-    /// path's last component. `**/name` means the same thing -- gitignore
-    /// documents `**/foo` as "the same as pattern `foo`" -- so the prefix is
-    /// stripped and the rule becomes a name rule, which keeps the commonest
-    /// patterns off `**` and its separator-crossing backtrack.
+    /// path's last component. `**/name` and `/**/name` mean the same thing --
+    /// gitignore documents `**/foo` as "the same as pattern `foo`" -- so the
+    /// prefix is stripped and the rule becomes a name rule, which keeps the
+    /// commonest patterns off `**` and its separator-crossing backtrack.
     ///
     /// `**/a/b` is not the same as `a/b`: it names `b` directly under any `a`, so
     /// it keeps the prefix and is matched against the whole path. A bare `**`
     /// names no component at all and is matched against the whole path too.
+    ///
+    /// A component of two or more `*` is a globstar, as in git, and compiles to
+    /// `**`, so every reader of the compiled glob meets one spelling of it. Git
+    /// reads one followed by an escaped `/` as a globstar matching at least one
+    /// component, so `a/**\/b` compiles to `a/*/**/b` rather than `a/**/*/b`:
+    /// the matcher can miss a match where a `**` is followed by a component
+    /// holding a wildcard, and confirms none in a glob holding an escape or a
+    /// brace group.
     #[lore_macro::test_pub]
     fn compile(glob: &str) -> (String, bool, bool) {
         let leading_separator = glob.starts_with('/');
         let ending_separator = glob.ends_with('/');
         let mut glob = glob.trim_matches('/').to_lowercase();
-
-        if !leading_separator
-            && let Some(rest) = glob.strip_prefix("**/")
-            && !rest.contains('/')
-            && !rest.is_empty()
-        {
-            glob = rest.to_owned();
+        if glob.contains("***") || glob.contains("**\\/") {
+            let mut components = glob.split('/').peekable();
+            let mut spelled = Vec::new();
+            while let Some(component) = components.next() {
+                let stars = match component.strip_suffix('\\') {
+                    Some(stars) if components.peek().is_some() => stars,
+                    _ => component,
+                };
+                spelled.push(if !is_globstar(stars) {
+                    component
+                } else if stars.len() < component.len() {
+                    "*/**"
+                } else {
+                    "**"
+                });
+            }
+            glob = spelled.join("/");
         }
 
-        let filename = !leading_separator && !glob.contains('/') && glob != "**";
+        let stripped = glob
+            .strip_prefix("**/")
+            .is_some_and(|rest| !rest.is_empty() && !rest.contains('/'));
+        if stripped {
+            glob.drain(..3);
+        }
+
+        let filename = glob != "**" && (stripped || (!leading_separator && !glob.contains('/')));
         (glob, filename, ending_separator)
     }
 
     /// How many path components `glob` can match: fewest, and most or
     /// [`u32::MAX`] where nothing bounds it. A name rule is matched against the
-    /// last component alone, so it applies at any depth.
+    /// last component alone, so it applies at any depth. `braced` says the
+    /// matcher evaluates the glob's brace groups rather than reading them as text.
     ///
-    /// The lower bound lets [`step`](Self::step) skip a line against a prefix
-    /// too short for it to match: each component consumes one, except a `**`
-    /// that is not the last, which may absorb nothing, so `a/**/b` can match
-    /// `a/b` while `a/**` does not match `a`.
+    /// Both bounds count the components of the text split at `/`. The lower
+    /// bound lets [`step`](Self::step) skip a line against a prefix with fewer
+    /// components: it counts every component except a `**` that is not the last,
+    /// which may absorb nothing, so `a/**/b` can match `a/b` while `a/**` does
+    /// not match `a`. It is 1 where a `/` in the text may match no separator:
+    /// when the text between the first `[` and the last `]` holds one, since a
+    /// bracket expression matches no separator, so `x[a/b]y` matches `xay`, and
+    /// when a brace group the matcher evaluates holds one, since an alternative
+    /// may hold fewer than the group, so `{a,b/c}*` matches `ax`. Every other `/`
+    /// matches exactly one separator.
     ///
     /// The upper bound is what a [`RuleIndex`] records, so that a rule unable to
-    /// reach below a directory does not force a walk into it -- without it the
-    /// `*` that a leading `/*` compiles to would reach every path. A `**`
-    /// consumes one component or more, so a glob holding one is unbounded.
-    ///
-    /// Sound because of the matcher's own arithmetic: every component other than
-    /// `**` consumes exactly one path component, since `*` and `?` do not cross
-    /// a separator. It is an over-estimate under every construct the matcher
-    /// supports, which is the direction that has to hold -- brace alternation
-    /// picks a subset of the glob's separators, and classes and escapes only
-    /// make a `/` stop separating, so no expansion has more components than the
-    /// glob text. Over-estimating costs traversal; under-estimating drops
+    /// reach below a directory does not force a walk into it -- without it a
+    /// rule the index stops following at its first component, such as `/{a,b}`
+    /// compared as text, would reach every path. It is the count, or unbounded
+    /// where a component is exactly `**`, the one construct the matcher lets
+    /// match a separator that no `/` in the glob stands for.
+    /// `*`, `?` and a bracket expression never match one, and a `**` sharing its
+    /// component with other text is two `*`. A `/` outside a bracket expression
+    /// matches one separator, escaped or not, a `/` inside one matches none, and
+    /// a brace group matches the separators of one alternative. So no path the
+    /// glob matches has more components than the text, which is the direction
+    /// that has to hold: over-estimating costs traversal, under-estimating drops
     /// content.
     ///
-    /// Both bounds come from one pass because both callers want both, and
-    /// `filter_from_source_changes` builds a filter per three-way diff with up
-    /// to `SOURCE_FILTER_THRESHOLD` rules in it, so a second scan per rule is
-    /// paid there.
+    /// Both bounds come from one pass because both callers want both.
     #[lore_macro::test_pub]
-    fn depth_range(glob: &str, filename: bool) -> (u32, u32) {
+    fn depth_range(glob: &str, filename: bool, braced: bool) -> (u32, u32) {
         if filename {
             return (1, u32::MAX);
         }
@@ -910,10 +1339,50 @@ impl FilterInstance {
             previous_was_globstar = component == "**";
             unbounded |= previous_was_globstar;
         }
-        (
-            (total - optional).max(1),
-            if unbounded { u32::MAX } else { total },
-        )
+        let mut fewest = if bracket_holds_separator(glob) {
+            1
+        } else {
+            (total - optional).max(1)
+        };
+        if braced && fewest > 1 {
+            let mut rest = glob;
+            while let Some((open, close)) = first_brace_group(rest) {
+                if rest[open..close].contains('/') {
+                    fewest = 1;
+                    break;
+                }
+                rest = &rest[close + 1..];
+            }
+        }
+        (fewest, if unbounded { u32::MAX } else { total })
+    }
+
+    /// How many lines the filter holds: one per authored rule, and one more for
+    /// each subtree companion.
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    /// Whether the filter holds no lines, so it excludes nothing.
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Appends `line`, and lists it by its leading literal components once the
+    /// filter holds [`INDEXED_LINES`] lines, listing all of them on reaching it.
+    fn push_line(&mut self, line: FilterLine) {
+        self.lines.push(line);
+        let count = self.lines.len();
+        if count < INDEXED_LINES {
+            return;
+        }
+        let first = if count == INDEXED_LINES { 0 } else { count - 1 };
+        let prefixes = self
+            .prefixes
+            .get_or_insert_with(|| Box::new(LinePrefixes::new()));
+        for (number, line) in self.lines.iter().enumerate().skip(first) {
+            prefixes.insert(line, number);
+        }
     }
 
     /// Appends an exclusion.
@@ -931,21 +1400,20 @@ impl FilterInstance {
     /// a filter that excludes half of it.
     pub fn add_exclusion(&mut self, glob: &str) -> Result<(), FilterError> {
         let (glob, filename, ending_separator) = Self::compile(glob);
-        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
+        let expand = !filename && !literal && glob.contains('{');
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename, expand);
         if filename {
-            self.exclude.insert_unanchored(self.lines.len(), depth_max);
+            self.exclude.insert_unprefixed(self.lines.len(), depth_max);
         } else {
-            let expand = !literal && glob.contains('{');
             self.exclude
                 .insert(&glob, expand, self.lines.len(), depth_max);
         }
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             glob,
             negated: false,
             directory: ending_separator,
             filename,
-            generated: false,
             min_depth,
             literal,
         });
@@ -963,6 +1431,10 @@ impl FilterInstance {
     /// The companion is never directory-only, whatever the authored rule was:
     /// `engine/` excludes what is under it, so `!engine/` re-includes it.
     ///
+    /// The companion is always evaluated as a glob, so for a rule compared as
+    /// text that holds a `{` it escapes every `{`, `}` and `,`: `!a{b,c}`
+    /// re-includes what lies below `a{b,c}`, not below `ab`.
+    ///
     /// Only a path rule gets a companion, and only a path rule enters the
     /// re-inclusion index. A name rule is skipped by [`step`](Self::step) below an
     /// excluded directory, so `!keep.txt` neither re-opens a pruned subtree nor
@@ -971,75 +1443,129 @@ impl FilterInstance {
     ///
     /// # Errors
     ///
-    /// A `**`-prefixed inclusion naming more than one component, such as
-    /// `!**/a/b`. No prefix bounds where it could match, so honouring it would
-    /// send a walk into every excluded directory in the repository. `!**/name`
-    /// compiles to `!name` and is accepted.
+    /// A path inclusion whose first authored component is a globstar, however
+    /// it is written: `!**/a/b`, `!/**/a/b`, `!**`, `!/**`, `!***` or `!**\/a`.
+    /// Such a rule matches from every directory in the repository, so the walk
+    /// would have to enter each excluded one to look. `!**/name` and `!/**/name`
+    /// compile to the name rule `!name` and are accepted, and so is `!**b/c`,
+    /// whose `**b` is no globstar. A rule with another first component is
+    /// accepted however far it reaches, such as `!*/**/c`.
     pub fn add_inclusion(&mut self, raw: &str) -> Result<(), FilterError> {
         let (glob, filename, ending_separator) = Self::compile(raw);
-        if raw.starts_with("**") && !filename {
+        let mut components = raw.trim_matches('/').split('/');
+        let first = components.next().unwrap_or_default();
+        let stars = first
+            .strip_suffix('\\')
+            .filter(|_| components.next().is_some())
+            .unwrap_or(first);
+        if !filename && is_globstar(stars) {
             return Err(FilterError::internal(
-                "filter inclusions cannot start with ** as that will force traversal of the entire revision tree",
+                "filter inclusions cannot start with a ** component as that will force traversal of the entire revision tree",
             ));
         }
 
-        let subtree = (!filename && !glob.ends_with('*')).then(|| format!("{glob}/**"));
-
-        let (min_depth, depth_max) = Self::depth_range(&glob, filename);
         let literal = is_literal(&glob);
         // A name rule is neither indexed nor given a companion, so it pays no scan.
         let braced = !filename && glob.contains('{');
+        let expand = braced && !literal;
+        let subtree = (!filename && !glob.ends_with('*')).then(|| {
+            if braced && literal {
+                escaped_subtree(&glob)
+            } else {
+                format!("{glob}/**")
+            }
+        });
+
+        let (min_depth, depth_max) = Self::depth_range(&glob, filename, expand);
         if !filename {
             self.reinclude
-                .insert(&glob, braced && !literal, self.lines.len(), depth_max);
+                .insert(&glob, expand, self.lines.len(), depth_max);
         }
-        self.lines.push(FilterLine {
+        self.push_line(FilterLine {
             min_depth,
             literal,
             glob,
             negated: true,
             directory: ending_separator,
             filename,
-            generated: false,
         });
 
         if let Some(subtree) = subtree {
-            let (min_depth, depth_max) = Self::depth_range(&subtree, false);
+            let (min_depth, depth_max) = Self::depth_range(&subtree, false, expand);
             self.reinclude
-                .insert(&subtree, braced, self.lines.len(), depth_max);
-            self.lines.push(FilterLine {
+                .insert(&subtree, expand, self.lines.len(), depth_max);
+            self.push_line(FilterLine {
                 min_depth,
                 literal: false,
                 glob: subtree,
                 negated: true,
                 directory: false,
                 filename: false,
-                generated: true,
             });
         }
 
         Ok(())
     }
 
+    /// Appends a re-inclusion of `path` and everything below it, whatever
+    /// characters it holds.
+    ///
+    /// `path` is compared as text against the whole path, never evaluated as a
+    /// glob nor matched as a name, so a top-level path names itself alone. It
+    /// gets a subtree companion, as a path rule does on
+    /// [`add_inclusion`](Self::add_inclusion), with every character of `path`
+    /// the matcher reads as syntax escaped.
+    ///
+    /// The re-inclusion index records the companion alone, with every component
+    /// of `path` as text. It reaches every node the line for `path` itself
+    /// does, so a walk descends towards `path` and below it, and nowhere else.
+    pub fn add_path_inclusion(&mut self, path: &RelativePath) {
+        let glob = path.as_lowercase_str();
+        let depth = component_count(glob);
+        self.reinclude.insert_subtree(glob, self.lines.len() + 1);
+        self.push_line(FilterLine {
+            glob: glob.to_owned(),
+            negated: true,
+            min_depth: depth,
+            literal: true,
+            ..FilterLine::default()
+        });
+        self.push_line(FilterLine {
+            glob: escaped_subtree(glob),
+            negated: true,
+            min_depth: depth + 1,
+            ..FilterLine::default()
+        });
+    }
+
     /// Advances the walk one level: the verdict for `path`, given the verdict
     /// for its parent.
     ///
     /// Lines are applied in order and a later match overrides an earlier one.
-    /// Two things narrow the scan:
+    /// These narrow the scan:
     ///
+    /// - In a filter of [`INDEXED_LINES`] lines or more, only the lines
+    ///   [`LinePrefixes`] lists for `match_path` are visited: a line whose
+    ///   leading literal components differ from the path's cannot match it.
     /// - An inclusion can only clear `excluded` and an exclusion can only set
-    ///   it, so a line whose effect equals the current state could at most match
-    ///   to no effect, and is skipped before the glob.
+    ///   it, so a line whose effect equals the current state could change only
+    ///   the floor, and is skipped before the glob.
     /// - A name rule is skipped when the parent is excluded: it cannot reach into
     ///   a directory a walk would have pruned.
     /// - A line needing more components than `depth` cannot match and is skipped.
-    /// - When the parent is excluded, lines before the one that excluded it are
-    ///   skipped. A tree walk stops at an excluded directory, so a rule that
-    ///   already lost there must not win below it -- that is what keeps
+    /// - When the parent is excluded, lines before the parent's floor are
+    ///   skipped: for a directory a re-inclusion can reach below, the last line
+    ///   that excluded it. A tree walk stops at an excluded directory, so a rule
+    ///   that already lost there must not win below it -- that is what keeps
     ///   `!/src` + `/src/*` from re-including `src/drop/y` through the `src/**`
     ///   companion. When the parent is *included* nothing was pruned, so every
     ///   line applies and an unanchored `*.tmp` still bites inside a re-included
     ///   subtree.
+    ///
+    /// For an excluded directory that a re-inclusion can reach below and an
+    /// exclusion follows the floor, [`last_exclusion`](Self::last_exclusion)
+    /// then finds the last of the exclusions skipped as changing only the floor,
+    /// which floors the steps below it.
     fn step(
         &self,
         parent: FilterState,
@@ -1060,47 +1586,84 @@ impl FilterInstance {
         );
         let pruned = parent.excluded;
         let mut state = parent;
-        for (offset, line) in self.lines[floor..].iter().enumerate() {
+        let mut apply = |number: usize, line: &FilterLine| {
             if line.negated != state.excluded {
-                continue;
+                return;
             }
             if line.directory && !is_directory {
-                continue;
+                return;
             }
             if pruned && line.negated && line.filename {
-                continue;
+                return;
             }
             if line.min_depth > depth {
-                continue;
+                return;
             }
-            let to_match = if line.filename {
-                match_name
-            } else {
-                match_path
-            };
-            let hit = if line.literal {
-                line.glob == to_match
-            } else {
-                glob_match::glob_match(line.glob.as_str(), to_match)
-            };
-            if hit {
+            if line.hits(match_path, match_name) {
                 state = FilterState {
                     excluded: !line.negated,
-                    decided_at: (floor + offset) as u32,
+                    decided_at: number as u32,
                 };
             }
+        };
+        match &self.prefixes {
+            None => {
+                for (offset, line) in self.lines[floor..].iter().enumerate() {
+                    apply(floor + offset, line);
+                }
+            }
+            Some(prefixes) => prefixes.visit(match_path, floor, |number| {
+                apply(number, &self.lines[number]);
+            }),
+        }
+        if is_directory
+            && state.excluded
+            && self.exclude.lines() > state.decided_at.saturating_add(1)
+        {
+            state.decided_at = self.last_exclusion(match_path, match_name, depth, state.decided_at);
         }
         state
     }
 
+    /// The last exclusion after line `from` that matches the directory
+    /// `match_path`, where a re-inclusion can reach below it, or `from` where
+    /// none does or none can.
+    ///
+    /// Meaningful only for a directory; it floors the steps below it. Kept cold
+    /// and out of [`step`](Self::step), which runs for every node a walk
+    /// visits and reaches this only for an excluded directory.
+    #[cold]
+    #[inline(never)]
+    fn last_exclusion(&self, match_path: &str, match_name: &str, depth: u32, from: u32) -> u32 {
+        if !self.reinclude.below(match_path, from, depth) {
+            return from;
+        }
+        let start = from as usize + 1;
+        let excludes = |line: &FilterLine| {
+            !line.negated && line.min_depth <= depth && line.hits(match_path, match_name)
+        };
+        match &self.prefixes {
+            None => self
+                .lines
+                .get(start..)
+                .and_then(|lines| lines.iter().rposition(excludes))
+                .map_or(from, |offset| (start + offset) as u32),
+            Some(prefixes) => prefixes
+                .last(match_path, start, |number| excludes(&self.lines[number]))
+                .map_or(from, |number| number as u32),
+        }
+    }
+
     /// The exclusion verdict for `path`, given its parent's.
     ///
-    /// The walk form of [`excludes`](Self::excludes): one pass over the lines
-    /// rather than one per ancestor, because the caller already holds the
+    /// The threaded form of [`excludes`](Self::excludes): one pass over the
+    /// lines rather than one per ancestor, because the caller already holds the
     /// parent's verdict. Read the answer with
     /// [`FilterState::excluded`], and pass the returned state to
     /// [`should_descend`](Self::should_descend) and to the children below it.
-    pub fn child_exclusion_state(
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn child_exclusion_state(
         &self,
         parent: FilterState,
         path: &impl FilterPath,
@@ -1123,15 +1686,16 @@ impl FilterInstance {
     /// it.
     ///
     /// Folds down the path's own ancestors, which is what a walk would have
-    /// done. A path named on the command line, replayed from a change list or
-    /// resolved from a clone dependency has to reproduce that, or it gets an
-    /// answer about the pattern rather than about the path.
-    pub fn exclusion_state(&self, path: &impl FilterPath, is_directory: bool) -> FilterState {
+    /// done.
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn exclusion_state(&self, path: &impl FilterPath, is_directory: bool) -> FilterState {
         self.exclusion_state_settled(path, is_directory).0
     }
 
-    /// [`exclusion_state`](Self::exclusion_state), also reporting whether the
-    /// fold ended on a prefix that settles its whole subtree.
+    /// The exclusion verdict for a path that arrives whole, folded down its own
+    /// ancestors, and whether the fold ended on a prefix that settles its whole
+    /// subtree.
     ///
     /// The fold already asks that of every prefix to know when to stop, so a
     /// caller wanting the answer for `path` itself takes it from here rather than
@@ -1149,7 +1713,7 @@ impl FilterInstance {
             path_prefixes(path.as_lowercase_str(), is_directory)
         {
             state = self.step(state, prefix, name, prefix_is_directory, depth);
-            if self.settles_subtree(state, prefix) {
+            if self.settles_subtree(state, prefix, depth) {
                 return (state, true);
             }
         }
@@ -1157,17 +1721,18 @@ impl FilterInstance {
     }
 
     /// Whether `state` excludes `path` and no rule can re-include anything below
-    /// it, so every descendant is excluded too.
-    ///
-    /// A walk stops descending here, a fold stops folding here, and
-    /// [`excludes_subtree`](Self::excludes_subtree) reports it. `path` is the
-    /// lowercase form `state` was produced for.
-    ///
-    /// The query depth is `0`, so every indexed inclusion clears the depth
-    /// bound however shallow its own rule. This side is deliberately unbounded
-    /// in depth: tightening it would prune walks that reach content today.
-    fn settles_subtree(&self, state: FilterState, path: &str) -> bool {
-        state.excluded && !self.reinclude.below(path, state.decided_at, 0)
+    /// it, so every descendant is excluded too. `path` is the lowercase form
+    /// `state` was produced for, and `depth` is how many components it has.
+    fn settles_subtree(&self, state: FilterState, path: &str, depth: u32) -> bool {
+        if !state.excluded {
+            return false;
+        }
+        debug_assert_eq!(
+            depth,
+            query_depth(path),
+            "a depth that is not {path:?}'s own reports a subtree as settled that is not"
+        );
+        !self.reinclude.below(path, state.decided_at, depth)
     }
 
     /// Whether `state` includes `path` and no rule can exclude anything below
@@ -1210,7 +1775,7 @@ impl FilterInstance {
     ) -> bool {
         let state = self.step(parent, match_path, match_name, is_directory, depth);
         if subtree {
-            self.settles_subtree(state, match_path)
+            self.settles_subtree(state, match_path, depth)
         } else {
             state.excluded
         }
@@ -1219,36 +1784,45 @@ impl FilterInstance {
     /// Whether `path` is excluded by this slot alone, its ancestors accounted for.
     ///
     /// Folds the ancestors on every call. [`Filter::excludes`] answers the same
-    /// question across both slots and folds a directory once, so it is what a
-    /// caller wants; this is the single-slot form, and the unmemoized one the
-    /// filter tests hold the memoized answers against.
-    pub fn excludes(&self, path: &impl FilterPath, is_directory: bool) -> bool {
+    /// question across both slots and folds a directory once; this is the
+    /// single-slot form, and the unmemoized one the filter tests hold the
+    /// memoized answers against.
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn excludes(&self, path: &impl FilterPath, is_directory: bool) -> bool {
         self.exclusion_state(path, is_directory).excluded
     }
 
-    /// Whether a walk standing at `path` should descend into it.
+    /// Whether this slot lets a walk standing at `path` descend into it.
     ///
     /// An excluded directory is still descended when a rule could re-include
     /// something below it; the contents stay excluded unless such a rule
     /// actually matches them. Git prunes there instead and documents
     /// re-inclusion below an excluded directory as impossible -- one of the
     /// departures `tests/filter_gitignore.rs` enumerates and asserts.
-    pub fn should_descend(&self, state: FilterState, path: &impl FilterPath) -> bool {
-        if path.is_empty() || path.as_str() == "." {
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn should_descend(&self, state: FilterState, path: &impl FilterPath) -> bool {
+        if !state.excluded || path.is_empty() || path.as_str() == "." {
             return true;
         }
-        !self.settles_subtree(state, path.as_lowercase_str())
+        let lowercase = path.as_lowercase_str();
+        !self.settles_subtree(state, lowercase, component_count(lowercase))
     }
 
-    /// Whether every path below `path` is excluded, at any depth.
-    ///
-    /// The negation of [`should_descend`](Self::should_descend) for an excluded
-    /// directory: nothing below can be re-included, so nothing below is in.
+    /// Whether `path` is excluded and no rule can re-include anything below it,
+    /// so every path below it is excluded too.
     pub fn excludes_subtree(&self, path: &RelativePath) -> bool {
         if path.is_empty() || path.as_str() == "." {
             return false;
         }
         self.exclusion_state_settled(path, true).1
+    }
+
+    /// Whether a rule can re-include something below a directory this filter excludes, so a
+    /// walk can enter one.
+    pub fn reincludes(&self) -> bool {
+        self.reinclude.below("", 0, 0)
     }
 }
 
@@ -1276,9 +1850,79 @@ bitflags! {
         const Ignore = 0b1;
         const View = 0b10;
         const Full = 0b11;
+        /// The ignore slot does not exclude a node the tree tracks: the ignore rules govern only
+        /// what is new to the tree. The slot is still stepped, so an untracked child of a
+        /// tracked, ignored directory is ignored. A walk clears the bit for each node the tree
+        /// does not hold; see [`FilterMode::at`].
+        const KeepTracked = 0b1000;
+        /// The view slot does not exclude a node that holds a staged change at or below it. The
+        /// slot is still stepped, and the bit is cleared for each node the tree does not hold, as
+        /// [`KeepTracked`](Self::KeepTracked) is, and for each node that holds nothing staged; see
+        /// [`FilterMode::at_staged`].
+        const KeepStagedInView = 0b10000;
     }
 }
 bitflagsops!(FilterMode, u16);
+
+impl FilterMode {
+    /// The mode for local state: the view, and the ignore rules for what the tree does not hold.
+    ///
+    /// A comparison of trees holds nothing untracked, so it asks [`at`](Self::at) whether
+    /// something is staged or marked dirty at or below a node instead: a subtree with nothing
+    /// changed in it has nothing to report, and an ignored one is pruned without being entered.
+    pub const TRACKED: Self = Self::Full.union(Self::KeepTracked);
+
+    /// The mode for the changes a stage holds: [`TRACKED`](Self::TRACKED), and the view, which
+    /// excludes nothing staged.
+    ///
+    /// A comparison of trees in this mode also asks [`at_staged`](Self::at_staged) whether
+    /// something is staged at or below a node, so a subtree past the view with nothing staged in
+    /// it is pruned without being entered.
+    pub const CHANGES: Self = Self::TRACKED.union(Self::KeepStagedInView);
+
+    /// The bits that keep a slot from excluding a tracked node.
+    const KEEPS: Self = Self::KeepTracked.union(Self::KeepStagedInView);
+
+    /// The mode a walk through `self` asks about a node in, `tracked` saying whether the node is
+    /// one the tree tracks.
+    pub fn at(self, tracked: bool) -> Self {
+        if tracked {
+            self
+        } else {
+            self.difference(Self::KEEPS)
+        }
+    }
+
+    /// The mode a walk through `self` asks about a node in, `staged` saying whether the node holds
+    /// a staged change at or below it.
+    pub fn at_staged(self, staged: bool) -> Self {
+        if staged {
+            self
+        } else {
+            self.difference(Self::KeepStagedInView)
+        }
+    }
+
+    /// The slots a walk through `self` asks about a deletion that a path missing from the working
+    /// tree drives: the view alone where the walk is forced, since a forced walk passes the ignore
+    /// file and the working tree lacks what the view excludes without its having been deleted, and
+    /// `self` otherwise.
+    pub fn absence(self, force: bool) -> Self {
+        if force { Self::View } else { self }
+    }
+
+    /// The slots that exclude.
+    fn excluding(self) -> Self {
+        let mut slots = self;
+        if self.contains(Self::KeepTracked) {
+            slots.remove(Self::Ignore);
+        }
+        if self.contains(Self::KeepStagedInView) {
+            slots.remove(Self::View);
+        }
+        slots
+    }
+}
 
 /// How far a query's verdict reaches.
 ///
@@ -1286,7 +1930,7 @@ bitflagsops!(FilterMode, u16);
 /// and still hold content a later rule re-includes, and then the answer depends
 /// on which question was asked.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum Scope {
+pub(crate) enum Scope {
     /// The path itself. Says nothing about what sits below it.
     Node,
     /// The path and everything below it, which is what a walk has to know
@@ -1306,6 +1950,38 @@ impl FilterStates {
         ignore: FilterState::ROOT,
         view: FilterState::ROOT,
     };
+
+    /// These states with each slot outside `mode` at its root state.
+    fn only(self, mode: FilterMode) -> Self {
+        Self {
+            ignore: if mode.contains(FilterMode::Ignore) {
+                self.ignore
+            } else {
+                FilterState::ROOT
+            },
+            view: if mode.contains(FilterMode::View) {
+                self.view
+            } else {
+                FilterState::ROOT
+            },
+        }
+    }
+
+    /// Whether the path these states describe is itself excluded, for the slots in `mode`.
+    pub fn excluded(self, mode: FilterMode) -> bool {
+        self.reason(mode).is_some()
+    }
+
+    /// The slot in `mode` that excludes the path these states describe, ignore ahead of view.
+    fn reason(self, mode: FilterMode) -> Option<FilterReason> {
+        if mode.contains(FilterMode::Ignore) && self.ignore.excluded {
+            Some(FilterReason::Ignore)
+        } else if mode.contains(FilterMode::View) && self.view.excluded {
+            Some(FilterReason::View)
+        } else {
+            None
+        }
+    }
 }
 
 impl Filter {
@@ -1336,37 +2012,21 @@ impl Filter {
     /// The exclusion verdict for `path` in both slots, given its parent's, plus
     /// why it is excluded if it is.
     ///
-    /// The walk form of [`excludes`](Self::excludes); see
+    /// The threaded form of [`excludes`](Self::excludes); see
     /// [`FilterInstance::child_exclusion_state`].
     ///
     /// Ignore is reported before view at the same depth, which is the order a
     /// walk would have hit them.
-    pub fn child_exclusion_states(
+    #[cfg(feature = "test-util")]
+    #[lore_macro::test_pub]
+    fn child_exclusion_states(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, Option<FilterReason>) {
-        let mut states = parent;
-        let mut reason = None;
-        if mode.contains(FilterMode::Ignore) {
-            states.ignore = self
-                .ignore
-                .child_exclusion_state(parent.ignore, path, is_directory);
-            if states.ignore.excluded {
-                reason = Some(FilterReason::Ignore);
-            }
-        }
-        if mode.contains(FilterMode::View) {
-            states.view = self
-                .view
-                .child_exclusion_state(parent.view, path, is_directory);
-            if reason.is_none() && states.view.excluded {
-                reason = Some(FilterReason::View);
-            }
-        }
-        (states, reason)
+        self.child_exclude_reason(parent, path, is_directory, mode, Scope::Node)
     }
 
     /// Whether a walk should descend into `path`, for the slots in `mode`.
@@ -1380,50 +2040,134 @@ impl Filter {
         path: &impl FilterPath,
         mode: FilterMode,
     ) -> bool {
-        self.descend_reason(states, path, mode).is_none()
+        self.descends(states, path.as_lowercase_str(), mode)
     }
 
-    /// The slot that stops a walk at `path`, or `None` when it descends.
-    ///
-    /// Ignore is consulted before view, which is the order
-    /// [`exclude_reason`](Self::exclude_reason) reports a path both slots
-    /// exclude in.
-    fn descend_reason(
+    /// [`should_descend`](Self::should_descend) for the lowercase path `states` were produced
+    /// for.
+    fn descends(&self, states: FilterStates, lowercase: &str, mode: FilterMode) -> bool {
+        let mode = mode.excluding();
+        if !states.excluded(mode) || lowercase.is_empty() || lowercase == "." {
+            return true;
+        }
+        self.descend_reason(states, lowercase, component_count(lowercase), mode)
+            .is_none()
+    }
+
+    /// Whether the filter leaves out `path` whatever it holds, as a walk does not descend into
+    /// its parent, whose verdict is `parent`, emitting a [`LoreEvent::FilterExclude`] where it
+    /// does. A path its parent leaves open is answered `false`: what it holds decides.
+    pub fn emit_excludes_any_kind(
         &self,
-        states: FilterStates,
+        parent: FilterStates,
         path: &impl FilterPath,
         mode: FilterMode,
-    ) -> Option<FilterReason> {
-        if mode.contains(FilterMode::Ignore) && !self.ignore.should_descend(states.ignore, path) {
-            return Some(FilterReason::Ignore);
-        }
-        if mode.contains(FilterMode::View) && !self.view.should_descend(states.view, path) {
-            return Some(FilterReason::View);
-        }
-        None
+    ) -> bool {
+        !self.descends(parent, path.split_lowercase().0, mode)
+            && self.child_emit_excludes(parent, path, true, mode).1
     }
 
-    /// One step of a walk: the states `path`'s children inherit, and why the
-    /// walk drops `path` with everything under it -- `None` to keep it and, for
-    /// a directory, to descend into it.
-    ///
-    /// The threaded form of [`exclude_reason`](Self::exclude_reason) at
-    /// [`Scope::Tree`]. The caller holds the parent's states, so no ancestor is
-    /// folded and the subtree half is one index lookup rather than a second pass
-    /// over the lines.
-    fn child_exclude_reason(
+    /// The mode a walk asks about `path` in, from `parent`: `mode` where `tracked` answers that the
+    /// tree tracks the node there, and `mode` without its keep bits otherwise ([`FilterMode::at`]).
+    /// `tracked` is awaited only where `mode` carries a keep bit and the filter would leave the
+    /// node out, so a walk reads nothing more for a node it keeps.
+    pub async fn tracked_mode<E, F>(
         &self,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
-    ) -> (FilterStates, Option<FilterReason>) {
-        let (states, reason) = self.child_exclusion_states(parent, path, is_directory, mode);
-        // A file has no subtree, so both scopes ask the same question of one.
-        if !is_directory {
-            return (states, reason);
+        tracked: impl FnOnce() -> F,
+    ) -> Result<FilterMode, E>
+    where
+        F: std::future::Future<Output = Result<bool, E>>,
+    {
+        let untracked = mode.at(false);
+        if !mode.intersects(FilterMode::KEEPS)
+            || !self
+                .child_excludes_tree(parent, path, is_directory, untracked)
+                .1
+        {
+            return Ok(untracked);
         }
-        let reason = self.descend_reason(states, path, mode);
+        // Boxed: a cold path, which unboxed would sit in every walk future that asks.
+        Ok(mode.at(Box::pin(tracked()).await?))
+    }
+
+    /// [`emit_excludes_any_kind`](Self::emit_excludes_any_kind) without the event.
+    pub fn excludes_any_kind(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        mode: FilterMode,
+    ) -> bool {
+        !self.descends(parent, path.split_lowercase().0, mode)
+            && self.child_excludes_tree(parent, path, true, mode).1
+    }
+
+    /// The slot that stops a walk at `path`, or `None` when it descends. `path`
+    /// is the lowercase form `states` were produced for, and `depth` is how many
+    /// components it has.
+    ///
+    /// Ignore is consulted before view.
+    fn descend_reason(
+        &self,
+        states: FilterStates,
+        path: &str,
+        depth: u32,
+        mode: FilterMode,
+    ) -> Option<FilterReason> {
+        if mode.contains(FilterMode::Ignore)
+            && self.ignore.settles_subtree(states.ignore, path, depth)
+        {
+            return Some(FilterReason::Ignore);
+        }
+        if mode.contains(FilterMode::View) && self.view.settles_subtree(states.view, path, depth) {
+            return Some(FilterReason::View);
+        }
+        None
+    }
+
+    /// One step of a walk: the states `path`'s children inherit, and why `path`
+    /// is excluded at `scope` -- `None` to keep it and, for a directory at
+    /// [`Scope::Tree`], to descend into it.
+    ///
+    /// The threaded form of [`exclude_reason`](Self::exclude_reason). The caller
+    /// holds the parent's states, so no ancestor is folded and the subtree half
+    /// is one index lookup rather than a second pass over the lines.
+    ///
+    /// A file has no subtree, so it is answered the same at either scope.
+    pub(crate) fn child_exclude_reason(
+        &self,
+        parent: FilterStates,
+        path: &impl FilterPath,
+        is_directory: bool,
+        mode: FilterMode,
+        scope: Scope,
+    ) -> (FilterStates, Option<FilterReason>) {
+        if self.is_empty(mode) || path.is_empty() || path.as_str() == "." {
+            return (parent, None);
+        }
+        let lowercase = path.as_lowercase_str();
+        let name = path.name_lowercase();
+        let depth = component_count(lowercase);
+        let mut states = parent;
+        if mode.contains(FilterMode::Ignore) && !self.ignore.lines.is_empty() {
+            states.ignore = self
+                .ignore
+                .step(parent.ignore, lowercase, name, is_directory, depth);
+        }
+        if mode.contains(FilterMode::View) && !self.view.lines.is_empty() {
+            states.view = self
+                .view
+                .step(parent.view, lowercase, name, is_directory, depth);
+        }
+        let mode = mode.excluding();
+        let reason = if scope == Scope::Tree && is_directory {
+            self.descend_reason(states, lowercase, depth, mode)
+        } else {
+            states.reason(mode)
+        };
         (states, reason)
     }
 
@@ -1436,7 +2180,8 @@ impl Filter {
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        let (states, reason) =
+            self.child_exclude_reason(parent, path, is_directory, mode, Scope::Tree);
         (states, reason.is_some())
     }
 
@@ -1450,15 +2195,14 @@ impl Filter {
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        let (states, reason) = self.child_exclude_reason(parent, path, is_directory, mode);
+        let (states, reason) =
+            self.child_exclude_reason(parent, path, is_directory, mode, Scope::Tree);
         (states, Self::emit(path, reason))
     }
 
-    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts
-    /// the walk past the filter.
-    ///
-    /// See [`child_emit_excludes_unless_forced`](Self::child_emit_excludes_unless_forced)
-    /// for why a forced walk is answered without asking the filter.
+    /// [`child_excludes_tree`](Self::child_excludes_tree) unless `force` puts the walk past the
+    /// filter, where it leaves out nothing and hands back [`FilterStates::ROOT`] without reading
+    /// the lines.
     pub fn child_excludes_tree_unless_forced(
         &self,
         force: bool,
@@ -1473,27 +2217,29 @@ impl Filter {
         self.child_excludes_tree(parent, path, is_directory, mode)
     }
 
-    /// [`child_emit_excludes`](Self::child_emit_excludes) unless `force` puts
-    /// the walk past the filter.
-    ///
-    /// A forced operation drops nothing, so it must report nothing as excluded
-    /// either, and it needs no verdict at all: `force` is one flag on the
-    /// operation -- `ExecutionContext::globals` or `DirtyWalkOptions` -- so
-    /// every step below is forced too and none of them reads one. The walk is
-    /// answered without touching the lines, and the state handed back is
-    /// [`FilterStates::ROOT`] rather than a verdict nothing will consult.
-    pub fn child_emit_excludes_unless_forced(
+    /// [`child_emit_excludes`](Self::child_emit_excludes) for the slots in `mode`, unless `force`
+    /// puts the walk past the filter. A forced step leaves out nothing and emits nothing, and the
+    /// states it hands back step only the slots in `stepped`, at a directory, with every other
+    /// slot at its root state. A file, which has nothing below it, takes [`FilterStates::ROOT`].
+    /// With `stepped` empty, a forced step reads none of the lines.
+    pub fn child_emit_unless_forced(
         &self,
         force: bool,
+        stepped: FilterMode,
         parent: FilterStates,
         path: &impl FilterPath,
         is_directory: bool,
         mode: FilterMode,
     ) -> (FilterStates, bool) {
-        if force {
+        if !force {
+            return self.child_emit_excludes(parent, path, is_directory, mode);
+        }
+        if !is_directory {
             return (FilterStates::ROOT, false);
         }
-        self.child_emit_excludes(parent, path, is_directory, mode)
+        let (states, _) =
+            self.child_exclude_reason(parent.only(stepped), path, true, stepped, Scope::Node);
+        (states, false)
     }
 
     /// The folded verdicts at the directory `path`, seeding a walk that starts
@@ -1547,6 +2293,11 @@ impl Filter {
     /// Ignore is consulted before view at each of those two points, so a path
     /// both slots exclude reports `Ignore`. A slot that settles at the parent is
     /// reported ahead of one that only excludes at the leaf.
+    ///
+    /// [`FilterMode::KeepTracked`] keeps the ancestors past the ignore slot as
+    /// well as the leaf, since every ancestor of a tracked path is tracked, and
+    /// [`FilterMode::KeepStagedInView`] past the view slot, since every ancestor of a staged
+    /// node is staged.
     fn exclude_reason(
         &self,
         path: &impl FilterPath,
@@ -1554,6 +2305,7 @@ impl Filter {
         mode: FilterMode,
         scope: Scope,
     ) -> Option<FilterReason> {
+        let mode = mode.excluding();
         if self.is_empty(mode) {
             return None;
         }
@@ -1563,16 +2315,8 @@ impl Filter {
         }
         let (parent, name) = path.split_lowercase();
         let ancestor = self.ancestor(parent);
-
-        if mode.contains(FilterMode::Ignore)
-            && self.ignore.settles_subtree(ancestor.states.ignore, parent)
-        {
-            return Some(FilterReason::Ignore);
-        }
-        if mode.contains(FilterMode::View)
-            && self.view.settles_subtree(ancestor.states.view, parent)
-        {
-            return Some(FilterReason::View);
+        if let Some(reason) = self.descend_reason(ancestor.states, parent, ancestor.depth, mode) {
+            return Some(reason);
         }
 
         // A file has no subtree, so both scopes ask the same question of one.
@@ -1667,7 +2411,7 @@ impl Filter {
 
     /// Whether a walk can drop `path` without looking inside it.
     ///
-    /// For a file this is [`excludes`](Self::excludes). For a directory it is
+    /// For a file this is whether `path` itself is excluded. For a directory it is
     /// the stricter question [`excludes_subtree`](Self::excludes_subtree) asks:
     /// an excluded directory is still kept when a rule could re-include
     /// something below it, because the walk has to descend and the node has to
@@ -1746,7 +2490,7 @@ impl Filter {
 
     /// Reports the path that was asked about, not the ancestor that matched: it
     /// is what the caller named, and the ancestor is only available lowercased.
-    fn emit(path: &impl FilterPath, reason: Option<FilterReason>) -> bool {
+    pub(crate) fn emit(path: &impl FilterPath, reason: Option<FilterReason>) -> bool {
         match reason {
             Some(reason) => {
                 LoreEvent::FilterExclude(LoreFilterExcludeEventData {

@@ -9,6 +9,7 @@ use bytes::Bytes;
 use lore_revision::lore::RepositoryId;
 use lore_server::auth::jwt::AuthorizationToken;
 use lore_server::auth::jwt::ResourcePermission;
+use lore_server::auth::jwt::TokenVerification;
 use lore_server::authnz::repository_authorizer::ALLOW_ALL_ACTIONS;
 use lore_server::authnz::repository_authorizer::AllowAllRepositoryAuthorizer;
 use lore_server::authnz::repository_authorizer::AuthClientAuthorizer;
@@ -33,7 +34,7 @@ async fn service() -> StorageService {
     // The legacy tier answers an access token from its `resources` claim, so
     // the URL is never reached.
     StorageService::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AuthClientAuthorizer::new(
             "https://auth.invalid".to_string(),
         )),
@@ -163,7 +164,7 @@ async fn connect_without_a_verifier_stores_the_allow_all_grants() {
     let (immutable_store, mutable_store, _execution) =
         test_store_create().await.expect("Failed to create stores");
     let service = StorageService::new(
-        Arc::new(None),
+        Arc::new(TokenVerification::Ignore),
         Arc::new(AllowAllRepositoryAuthorizer),
         immutable_store.clone(),
         immutable_store,
@@ -217,56 +218,4 @@ async fn a_healing_verify_needs_write() {
     assert!(!refused(
         &service.run_request_handler(writer, verify(1)).await
     ));
-}
-
-mod token_expiry {
-    use std::sync::Arc;
-    use std::time::SystemTime;
-    use std::time::UNIX_EPOCH;
-
-    use lore_server::auth::jwt::AuthorizationToken;
-    use lore_server::protocol::attribute_map::AttributeMap;
-    use lore_server::protocol::storage::messages::MessageHandleError;
-    use lore_server::quic::storage_service::reject_expired_connection;
-
-    fn context_with_token_expiring_at(expires: u64) -> Arc<AttributeMap> {
-        let context = Arc::new(AttributeMap::default());
-        context.insert(AuthorizationToken {
-            user_id: "test-user".to_string(),
-            expires,
-            ..Default::default()
-        });
-        context
-    }
-
-    fn now() -> u64 {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("clock")
-            .as_secs()
-    }
-
-    /// A connection keeps serving for as long as it is held open, so expiry has
-    /// to be rechecked per request rather than only at `Connect`.
-    #[test]
-    fn refuses_a_token_that_has_expired() {
-        let context = context_with_token_expiring_at(now() - 60);
-        assert!(matches!(
-            reject_expired_connection(&context),
-            Err(MessageHandleError::AuthorizationFailure(_))
-        ));
-    }
-
-    #[test]
-    fn allows_a_token_that_has_not_expired() {
-        let context = context_with_token_expiring_at(now() + 600);
-        assert!(reject_expired_connection(&context).is_ok());
-    }
-
-    /// No token means no verifier was configured; `Connect` already decided that.
-    #[test]
-    fn allows_a_connection_carrying_no_token() {
-        let context = Arc::new(AttributeMap::default());
-        assert!(reject_expired_connection(&context).is_ok());
-    }
 }

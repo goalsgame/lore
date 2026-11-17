@@ -3,12 +3,14 @@
 mod aws_store_test;
 mod common;
 mod dynamodb_test;
+mod fuse_remote_test;
 mod hashicorp;
 mod locks_test;
 mod presign_test;
 mod remote_store_test;
 mod replicated_store_test;
 mod replication_service_test;
+mod revision_graph;
 mod revision_tree_test;
 mod shared_store_test;
 mod storage_copy_on_write_test;

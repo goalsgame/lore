@@ -37,7 +37,6 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use futures::FutureExt;
 use lore_base::allocator::GrowVec;
 use lore_error_set::Internal;
 use lore_error_set::prelude::*;
@@ -64,6 +63,7 @@ use zerocopy::IntoBytes;
 
 use crate::Address;
 use crate::Context;
+use crate::FlushOptions;
 use crate::Fragment;
 use crate::FragmentFlags;
 use crate::FragmentReference;
@@ -439,10 +439,11 @@ pub struct ImmutableStoreGroup {
     pub pending_level: std::sync::atomic::AtomicUsize,
     /// Forces the bucket-file writes for this group to be serial.
     ///
-    /// `flush_all` holds it for a whole group flush so that the fan-out check, the
-    /// `committed_level` read that selects the commit path, and the writes are one
-    /// atomic unit. Every other writer (the delayed flush, the evictor, the
-    /// compactor, the packfile upgrade) takes it only around its own bucket write.
+    /// `flush_all` holds it for the whole group flush, making the fan-out check, the
+    /// `committed_level` read that selects the commit path, and the writes one atomic unit. A
+    /// delayed flush that writes the whole group does the same. Otherwise, writers (the delayed
+    /// flush, the evictor, the compactor, the packfile upgrade) take it only around their own
+    /// bucket writes.
     ///
     /// Without it, an overlapping flush can observe a half-finished level transition
     /// and take the regular path while a two-phase commit is still pending. The
@@ -452,7 +453,7 @@ pub struct ImmutableStoreGroup {
     /// Locking the rename alone would not help: the snapshot it publishes is taken
     /// before the rename, so the two paths must not interleave at all.
     ///
-    /// Scope is deliberately narrow outside `flush_all` because
+    /// Scope is deliberately narrow outside the whole-group flushes because
     /// `compact_group_packfiles` calls `evict_group_sized`, and a `tokio::sync::Mutex`
     /// is not reentrant - a per-function guard would self-deadlock.
     pub flush_lock: Arc<Mutex<()>>,
@@ -461,8 +462,6 @@ pub struct ImmutableStoreGroup {
     pub writes: Arc<crate::local::fan_out::GroupWrites>,
     pub packstore: crate::PackStore,
     pub flush: Mutex<JoinSet<()>>,
-    /// Wakes the currently scheduled sweep when an explicit flush drains it.
-    pub flush_now: Arc<tokio::sync::Notify>,
     /// Whether a delayed flush is due for this group and has not yet begun its sweep.
     ///
     /// A writer that flags a bucket schedules a sweep only when it is the one to set this,
@@ -609,6 +608,8 @@ pub struct LocalImmutableStoreFailureGenerator {
     miss_fragment_writes: HashSet<Hash>,
     /// Hashes whose first write fails, from `LORE_REFUSE_FRAGMENT_WRITES`.
     refuse_fragment_writes: parking_lot::Mutex<HashSet<Hash>>,
+    /// Whether every copy returns `SlowDown`, set by `LORE_THROTTLE_COPIES=1`.
+    throttle_copies: bool,
 }
 
 #[cfg(feature = "failure_generator")]
@@ -737,6 +738,14 @@ pub struct ImmutableStoreSettings {
     pub flush_background: bool,
     /// Flush delay in seconds
     pub flush_delay_seconds: u64,
+    /// Defers writing buckets changed by a capacity eviction pass to each group's delayed flush.
+    /// Flushes are spread across one flush delay. This requires `flush_background` and applies
+    /// only to passes that do not sync; compaction's size-driven eviction still writes as it goes.
+    /// With this setting, every delayed flush with changes writes the whole group if it is below
+    /// the full bucket layout, fanning it out where needed. Unwritten buckets hold the store's
+    /// flock until they are written, so this suits a process that holds its store for its entire
+    /// lifetime. The default is `false`.
+    pub defer_eviction_flush: bool,
     /// Eviction target capacity as a percentage of the max capacity (0-100)
     pub target_capacity_percentage: usize,
     /// Compaction target size as a percentage of the max size (0-100)
@@ -768,6 +777,7 @@ impl Default for ImmutableStoreSettings {
             isolate_partitions: false,
             flush_background: false,
             flush_delay_seconds: DEFAULT_FLUSH_DELAY_SECONDS,
+            defer_eviction_flush: false,
             target_capacity_percentage: 70,
             target_size_percentage: 70,
             compaction_parallel_groups: 8,
@@ -1308,11 +1318,11 @@ impl ImmutableStoreBucket {
         Ok(BucketFile::empty())
     }
 
-    /// Write the bucket to a temporary file renamed over `path`, so that a process stopped during
-    /// the write leaves the file it last wrote. The bucket is copied and its lock released before
-    /// the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are synced
-    /// between the copy and the write, so that the file points only at payload bytes stored, and
-    /// the file is synced before the rename and its directory after. Without, the file records the
+    /// Write the bucket to `path` as `options` asks, see
+    /// [`crate::local::fan_out::write_bucket_file`]. The bucket is copied and its lock released
+    /// before the write, see [`ImmutableBucketWrite`]. With `sync_data`, the group's packfiles are
+    /// synced between the copy and the write, so that the file points only at payload bytes
+    /// stored, and the file is synced and its directory after. Without, the file records the
     /// sizes of the packfiles a crash could leave shorter than an entry pointing into them, see
     /// [`crate::PackStore::unsettled_sizes`], or, when it cannot, see [`recordable_sizes`], the
     /// packfiles are synced as with `sync_data`.
@@ -1322,7 +1332,7 @@ impl ImmutableStoreBucket {
         bucket_index: usize,
         path: PathBuf,
         changed: bool,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         // A failed write re-arms the flag it claimed, so a bucket flushed only for its access
         // stamps stays a stamp rather than becoming a change that keeps the store claimed.
@@ -1352,7 +1362,7 @@ impl ImmutableStoreBucket {
         // The sizes are held across one await, with no future around it: held across more, or a
         // larger one, they would make this the largest state of the future.
         let mut recorded = false;
-        if !sync_data {
+        if !options.sync_data {
             let mut sizes = [PackfileSize::default(); 1 + TRAILER_SIZES];
             let unsettled = group.packstore.unsettled_sizes(&mut sizes).await;
             if let Some(sizes) = recordable_sizes(&sizes, unsettled) {
@@ -1380,17 +1390,15 @@ impl ImmutableStoreBucket {
         let completion = crate::local::fan_out::write_share(&group.writes);
         #[cfg(feature = "test-util")]
         let completion = crate::test_util::park_store_write(completion).await;
-        lore_io::IoDriver::global()
-            .write_file_segments_atomic(
-                crate::local::fan_out::temporary_path(&path),
-                path,
-                &file_options,
-                contents,
-                sync_data,
-                completion,
-            )
-            .await
-            .internal("Failed to serialize storage bucket")?;
+        crate::local::fan_out::write_bucket_file(
+            path,
+            &file_options,
+            contents,
+            options,
+            completion,
+        )
+        .await
+        .internal("Failed to serialize storage bucket")?;
         failure_guard.success();
 
         Ok(())
@@ -1448,7 +1456,7 @@ impl ImmutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         // An emptied bucket is written out like any other. Skipping it would leave the file it
         // was last written to on disk, and reopening the store would load the entries back.
@@ -1478,7 +1486,7 @@ impl ImmutableStoreBucket {
 
         let path = format_bucket_path(path, group_index, bucket_index);
 
-        Self::serialize_files(bucket, group, bucket_index, path, was_dirty, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, path, was_dirty, options).await
     }
 
     /// Serialize the bucket to its `.new` twin during a fan-out commit. Differs from the regular
@@ -1496,7 +1504,7 @@ impl ImmutableStoreBucket {
         path: &Path,
         group_index: usize,
         bucket_index: usize,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         let _lock = bucket.serialize_lock.clone().lock_owned().await;
 
@@ -1510,7 +1518,7 @@ impl ImmutableStoreBucket {
             PathBuf::from(p)
         };
 
-        Self::serialize_files(bucket, group, bucket_index, new_path, true, sync_data).await
+        Self::serialize_files(bucket, group, bucket_index, new_path, true, options).await
     }
 }
 
@@ -1611,8 +1619,22 @@ impl ImmutableStoreGroup {
         !self.fan_out_uncommitted() && !(0..self.dirty.len()).any(|bucket| self.needs_flush(bucket))
     }
 
-    /// Writes out the group's flagged buckets after `delay` seconds, each after rolling forward a
-    /// fan-out commit the group left pending and committing a level marker it has yet to write.
+    /// Whether a delayed flush must write the whole group when the store defers eviction writes.
+    /// The group may still need to fan out, or its fan-out may be awaiting commit, blocking all
+    /// single-bucket writes. Both cases require a whole-group flush. Read under the flush lock so
+    /// the result stays valid.
+    fn needs_whole_group_flush(&self) -> bool {
+        crate::local::fan_out::can_fan_out(self.bucket_count.load(atomic::Ordering::Relaxed))
+            || self.fan_out_uncommitted()
+    }
+
+    /// Writes out the group's flagged buckets after `delay`. Before writing each bucket, rolls
+    /// forward a fan-out commit the group left pending and commits a level marker the group has
+    /// yet to write.
+    ///
+    /// On a store that defers its eviction writes, a group with changes is written in full when it
+    /// may still need to fan out or its fan-out awaits commit. Writing the whole group can change
+    /// its layout on disk.
     ///
     /// **Claimed before anything is written, with a guard of its own, and only as far as the
     /// work needs**: to write for changes, to read for access stamps alone. This wakes long
@@ -1623,16 +1645,14 @@ impl ImmutableStoreGroup {
     /// whether or not a span covers it, and its drop releases the flock once the pass has left
     /// nothing flagged.
     #[lore_macro::test_pub]
-    async fn flush_delayed(weak_ref: Weak<LocalImmutableStore>, group_index: usize, delay: u64) {
-        let Some(wake) = weak_ref
-            .upgrade()
-            .map(|store| store.group[group_index].flush_now.clone())
-        else {
-            return;
-        };
-        tokio::select! {
-            () = tokio::time::sleep(Duration::from_secs(delay)) => {},
-            () = wake.notified() => {},
+    async fn flush_delayed(
+        weak_ref: Weak<LocalImmutableStore>,
+        group_index: usize,
+        delay: Duration,
+    ) {
+        // Even a zero sleep waits for the timer's next millisecond tick.
+        if !delay.is_zero() {
+            tokio::time::sleep(delay).await;
         }
         #[cfg(feature = "test-util")]
         let _task = crate::test_util::store_task(crate::test_util::StoreTask::DelayedFlush);
@@ -1662,6 +1682,34 @@ impl ImmutableStoreGroup {
                 return;
             };
             let _claim = claim;
+
+            // A store that defers eviction writes leaves all of them to this flush. Fanning out
+            // requires a claim to write; access stamps alone use the single-bucket writes below,
+            // which never fan out the group. The check runs first without the flush lock to keep
+            // the lock off the common path, then again under it. If a commit fails between the
+            // two checks, its buckets wait for the next eviction pass.
+            if intent == Intent::Write
+                && store.defers_eviction_flush()
+                && group.needs_whole_group_flush()
+            {
+                let flush_guard =
+                    crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
+                if group.needs_whole_group_flush() {
+                    let _in_flight = crate::local::fan_out::write_share(&group.writes);
+                    if let Err(err) = flush_locked_group(
+                        group.clone(),
+                        group_index,
+                        path.clone(),
+                        FlushOptions::default(),
+                    )
+                    .await
+                    {
+                        lore_base::lore_warn!("Failed to flush group {group_index}: {err}");
+                    }
+                    return;
+                }
+                drop(flush_guard);
+            }
 
             for bucket_index in 0..group.bucket.len() {
                 // Atomic pre-check avoids acquiring the bucket RwLock for clean buckets.
@@ -1724,7 +1772,7 @@ impl ImmutableStoreGroup {
                     path,
                     group_index,
                     bucket_index,
-                    false, /* Don't wait and sync all data to storage media */
+                    FlushOptions::default(),
                 )
                 .await;
             }
@@ -2137,7 +2185,6 @@ impl LocalImmutableStore {
                     Some(gc_counters.clone()),
                 ),
                 flush: Mutex::new(JoinSet::new()),
-                flush_now: Arc::new(tokio::sync::Notify::new()),
                 scheduled: AtomicBool::new(false),
                 payload_gate: PayloadGate::default(),
             }));
@@ -2246,6 +2293,7 @@ impl LocalImmutableStore {
             refuse_fragment_writes: parking_lot::Mutex::new(
                 LocalImmutableStoreFailureGenerator::hashes_from_env("LORE_REFUSE_FRAGMENT_WRITES"),
             ),
+            throttle_copies: std::env::var("LORE_THROTTLE_COPIES").is_ok_and(|value| value == "1"),
         };
 
         // Target 70% percentage of max size by default if the given setting is invalid
@@ -2592,7 +2640,7 @@ impl LocalImmutableStore {
                         path.as_ref(),
                         group_index,
                         bucket_index,
-                        true, /* Wait and sync all data to storage media */
+                        FlushOptions::SYNC_DATA,
                     )
                     .await;
                 });
@@ -3034,7 +3082,8 @@ impl LocalImmutableStore {
     /// payload, which the best match for its hash does not hold or `force` replaces, takes the one
     /// `payload` was written to, and is reported as [`StoreOutcome::NeedsPayload`] while it is
     /// unwritten. A written payload the entry does not take stays unreferenced. A store without a
-    /// payload over the tombstone of its association is refused with `PayloadNotFound`.
+    /// payload over the tombstone of its association is refused with `PayloadNotFound`. A payload
+    /// the entry takes is assigned to every other entry of its hash but a tombstone.
     async fn store_entry(
         &self,
         partition: &Partition,
@@ -3174,9 +3223,10 @@ impl LocalImmutableStore {
             last_access,
         };
 
-        if match_made == StoreMatch::MatchFull {
+        let stored_slot = if match_made == StoreMatch::MatchFull {
             let entry_index = bucket.sorted_index[match_slot] as usize;
             bucket.entry[entry_index].data = data;
+            match_slot
         } else {
             // inject new entry
             let count = bucket.entry.len();
@@ -3190,7 +3240,8 @@ impl LocalImmutableStore {
                 partition: *partition,
                 data,
             });
-        }
+            insert_slot
+        };
 
         // Ensure all other instances of this hash has the same payload associated - if storing
         // a payload for an already existing hash that had no payload we should upgrade those.
@@ -3214,7 +3265,7 @@ impl LocalImmutableStore {
                 true
             };
 
-            let mut loop_slot = insert_slot;
+            let mut loop_slot = stored_slot;
             while loop_slot > 0 {
                 loop_slot -= 1;
                 if !update_slot(loop_slot) {
@@ -3222,7 +3273,7 @@ impl LocalImmutableStore {
                 }
             }
 
-            loop_slot = insert_slot;
+            loop_slot = stored_slot;
             while loop_slot < last_slot {
                 loop_slot += 1;
                 if !update_slot(loop_slot) {
@@ -3525,7 +3576,7 @@ impl LocalImmutableStore {
             );
             group.dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             if group.fan_out_uncommitted() {
-                return flush_locked_group(group, group_index, path, true)
+                return flush_locked_group(group, group_index, path, FlushOptions::SYNC_DATA)
                     .await
                     .forward::<StoreError>("committing the group of an obliterated entry");
             }
@@ -3548,7 +3599,7 @@ impl LocalImmutableStore {
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                true,
+                FlushOptions::SYNC_DATA,
             )
             .await
             .forward::<StoreError>("writing the bucket of an obliterated entry")
@@ -3579,21 +3630,6 @@ impl LocalImmutableStore {
         }
     }
 
-    // An explicit flush has already written the dirty buckets. Wake and join
-    // queued sweeps so their IO ownership ends without waiting out their delays.
-    // Workers never take this scheduling mutex; cancellation leaves them owned
-    // by the JoinSet for the next successful flush to drain.
-    async fn drain_scheduled_flushes(&self) {
-        for group in &self.group {
-            let mut scheduled = group.flush.lock().await;
-            if !scheduled.is_empty() {
-                group.flush_now.notify_one();
-                while scheduled.join_next().await.is_some() {}
-                let _unused_wake = group.flush_now.notified().now_or_never();
-            }
-        }
-    }
-
     /// Starts the group's delayed flush unless one is due, after an index change that leaves an
     /// entry with `flags`. A change to a durable entry waits for an explicit flush unless
     /// [`ImmutableStoreSettings::flush_background`] is set, since it is stored upstream as well.
@@ -3605,23 +3641,71 @@ impl LocalImmutableStore {
         {
             return;
         }
+        self.schedule_flush(
+            group_index,
+            Duration::from_secs(self.settings.flush_delay_seconds),
+        )
+        .await;
+    }
+
+    /// Starts the group's delayed flush after `delay` unless a flush is already due. The bucket's
+    /// flag must be set before this call. See [`ImmutableStoreGroup::scheduled`].
+    async fn schedule_flush(self: &Arc<Self>, group_index: usize, delay: Duration) {
         let group = &self.group[group_index];
-        // Publish the flag only once task insertion cannot be cancelled. An explicit
-        // flush can hold this mutex while its sweep clears the flag; cancellation
-        // while waiting must leave the next writer free to schedule the dirty work.
-        let mut flush = group.flush.lock().await;
         if group.scheduled.swap(true, atomic::Ordering::Relaxed) {
             return;
         }
+        let mut flush = group.flush.lock().await;
         let _ = flush.try_join_next();
         lore_base::lore_spawn!(
             flush,
-            ImmutableStoreGroup::flush_delayed(
-                Arc::downgrade(self),
-                group_index,
-                self.settings.flush_delay_seconds,
-            )
+            ImmutableStoreGroup::flush_delayed(Arc::downgrade(self), group_index, delay)
         );
+    }
+
+    /// The delay between an eviction pass and the group's flush of the buckets it evicted from.
+    /// Delays increase by an equal step per group up to `flush_delay`. When a pass evicts from
+    /// every group, this spreads out the bucket writes queued on the I/O pool, one group at a
+    /// time.
+    #[lore_macro::test_pub]
+    fn eviction_flush_delay(flush_delay: Duration, group_index: usize) -> Duration {
+        flush_delay / GROUP_COUNT as u32 * (group_index as u32 + 1)
+    }
+
+    /// Starts delayed flushes for groups with pending writes, spreading them across one flush
+    /// delay. Changes always require a write; access stamps require one only after a pass that
+    /// `evicted`.
+    ///
+    /// Run at every eviction pass, even if it evicted nothing, to retry groups left flagged by a
+    /// failed delayed flush. Scheduling takes no claim. Each delayed flush claims the store for
+    /// itself and releases the flock once nothing is flagged. Until then, unwritten buckets hold
+    /// the flock.
+    async fn schedule_eviction_flushes(self: &Arc<Self>, evicted: bool) {
+        let flush_delay = Duration::from_secs(self.settings.flush_delay_seconds);
+        for (group_index, group) in self.group.iter().enumerate() {
+            if group.scheduled.load(atomic::Ordering::Relaxed) {
+                continue;
+            }
+            let worth_writing = match group.pending_flush() {
+                PendingFlush::Changes => true,
+                // A fan-out awaiting commit blocks single-bucket writes. Access stamps use only
+                // single-bucket writes, so they must wait for a change that triggers a whole-group
+                // write.
+                PendingFlush::Stamps => evicted && !group.fan_out_uncommitted(),
+                PendingFlush::Nothing => false,
+            };
+            if worth_writing {
+                self.schedule_flush(
+                    group_index,
+                    Self::eviction_flush_delay(flush_delay, group_index),
+                )
+                .await;
+            }
+        }
+    }
+
+    fn defers_eviction_flush(&self) -> bool {
+        self.settings.defer_eviction_flush && self.settings.flush_background && self.path.is_some()
     }
 
     pub async fn load(
@@ -3788,7 +3872,10 @@ impl LocalImmutableStore {
                         path.as_ref(),
                         group_index,
                         bucket_index,
-                        sync_data,
+                        FlushOptions {
+                            sync_data,
+                            ..FlushOptions::default()
+                        },
                     )
                     .await;
                 });
@@ -3963,10 +4050,10 @@ impl LocalImmutableStore {
     /// `max_capacity`, and returns how many, with the write claim the pass took at its first
     /// eviction, if it took one.
     ///
-    /// The claim is handed back rather than dropped, for the caller to hold until it has
-    /// written what the pass evicted. Without it, that flush runs on whatever span another use
-    /// of the store holds at the time, and that span can end, and its flock go, while the
-    /// flush still runs.
+    /// The caller receives the claim and holds it while writing the buckets the pass evicted
+    /// from, or until it delegates those writes to flushes that acquire their own claims. Without
+    /// this claim, the caller's write uses a span held by another operation on the store. That
+    /// span can end and release its flock while the write is still running.
     pub async fn evict_oldest(
         &self,
         max_capacity: usize,
@@ -4806,7 +4893,7 @@ impl LocalImmutableStore {
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                true,
+                FlushOptions::SYNC_DATA,
             )
             .await
             .forward_with::<StoreError, _>(|| {
@@ -5036,7 +5123,7 @@ impl LocalImmutableStore {
     async fn flush_all(
         self: Arc<Self>,
         path: Option<Arc<PathBuf>>,
-        sync_data: bool,
+        options: FlushOptions,
     ) -> Result<(), LocalImmutableStoreError> {
         let Some(path) = path else {
             return Ok(());
@@ -5070,7 +5157,7 @@ impl LocalImmutableStore {
                     crate::local::fan_out::lock_flush(&group.flush_lock, &group.writes).await;
                 let _in_flight = crate::local::fan_out::write_share(&group.writes);
 
-                flush_locked_group(group, group_index, path, sync_data).await
+                flush_locked_group(group, group_index, path, options).await
             };
             lore_base::lore_spawn!(
                 tasks,
@@ -5730,17 +5817,27 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 Ok(count)
             }
         );
-        // **What a pass evicts, the pass writes, under its own claim.** Eviction empties
-        // buckets in memory and nothing else is scheduled to write them, so left dirty they
-        // would keep the flock for as long as this process kept the store — for a timer
-        // running in the background of a process that has finished with the store,
-        // indefinitely. The write runs on the claim the eviction took rather than through
-        // `flush`, whose claim a span of whatever use of the store is under way would cover,
-        // and that span can end while the write runs.
-        if let Ok(count) = &evicted.result
-            && *count > 0
-        {
-            let _ = self.clone().flush_all(self.path.clone(), sync_data).await;
+        // **A pass that defers eviction writes schedules a delayed flush for every changed bucket,
+        // including buckets that an earlier delayed flush failed to write. Any other pass writes
+        // its eviction changes before it ends. Every write holds a claim until it finishes,
+        // independent of other uses of the store.** A changed bucket holds the flock until it is
+        // written. Eviction runs on a background timer. Without a scheduled write, a changed bucket
+        // could hold the flock indefinitely if the process keeps the store but no longer uses it.
+        let evicted_any = evicted.result.as_ref().is_ok_and(|count| *count > 0);
+        // Deferral is safe only when nothing waits on the write. Delayed flushes do not perform the
+        // sync a caller may request. A pass ending after a stop request writes its own evictions so
+        // delayed flushes do not claim the store after background work is asked to stop.
+        if self.defers_eviction_flush() && !sync_data && !self.gc_stop_requested() {
+            self.schedule_eviction_flushes(evicted_any).await;
+        } else if evicted_any {
+            // The write uses the eviction's claim because it lasts until the write finishes. It
+            // can't rely on the span of another use of the store: that span may end while the write
+            // is still running.
+            let options = FlushOptions {
+                sync_data,
+                ..FlushOptions::default()
+            };
+            let _ = self.clone().flush_all(self.path.clone(), options).await;
         }
         drop(writing);
         evicted.into()
@@ -5996,7 +6093,11 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
             if heal {
                 drop(evict_permit);
                 drop(compact_permit);
-                let _ = crate::immutable_store::ImmutableStore::flush(self.clone(), false).await;
+                let _ = crate::immutable_store::ImmutableStore::flush(
+                    self.clone(),
+                    FlushOptions::default(),
+                )
+                .await;
 
                 lore_base::lore_debug!("Store healing complete");
             }
@@ -6006,7 +6107,7 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), StoreError> {
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), StoreError> {
         let Some(path) = self.path.clone() else {
             return Ok(());
         };
@@ -6038,7 +6139,6 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
                 // Nothing is flagged, so a flock an earlier span left held over state
                 // since written has nothing to keep it.
                 self.note_flushed();
-                self.drain_scheduled_flushes().await;
                 return Ok(());
             }
             PendingFlush::Stamps => Intent::Read,
@@ -6047,21 +6147,49 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         let hold = self.hold(intent).await?;
         let flushed = self
             .clone()
-            .flush_all(Some(path), sync_data)
+            .flush_all(Some(path), options)
             .await
             .forward("Failed to flush store to disk");
         // The claim this flush took, if it took one, goes here, and releases the flock if
         // nothing is flagged. What a failed flush could not write stays flagged, and keeps
         // the store claimed.
         drop(hold);
-        if flushed.is_ok() {
-            self.drain_scheduled_flushes().await;
-        }
         flushed
     }
 
     fn max_query_batch(&self) -> Option<usize> {
         None
+    }
+
+    /// Checks the copy of `address` in `partition` on disk and drops it where it is corrupt, so
+    /// the next read misses it here. A copy this store does not hold, holds sound, or keeps only in
+    /// memory needs no heal.
+    async fn heal(
+        self: Arc<Self>,
+        partition: Partition,
+        address: Address,
+    ) -> Result<lore_base::types::HealResult, StoreError> {
+        use lore_base::types::HealResult;
+        if self.path.is_none() {
+            return Ok(HealResult::NotAttempted);
+        }
+        let match_requested = if address.context.is_zero() {
+            StoreMatch::MatchPartition
+        } else {
+            StoreMatch::MatchFull
+        };
+        match self
+            .verify_fragment(address, partition, match_requested, true)
+            .await
+        {
+            Ok(result) => Ok(match (result.verification_result, result.healed) {
+                (Ok(()), _) => HealResult::NotAttempted,
+                (Err(_), true) => HealResult::Healed,
+                (Err(_), false) => HealResult::Failed,
+            }),
+            Err(StoreError::AddressNotFound(_)) => Ok(HealResult::NotAttempted),
+            Err(err) => Err(err),
+        }
     }
 
     async fn fragment_count(self: Arc<Self>) -> Option<usize> {
@@ -6086,6 +6214,10 @@ impl crate::immutable_store::ImmutableStore for LocalImmutableStore {
         behavior: CopyBehavior,
     ) -> Result<(), StoreError> {
         let _hold = self.hold(Intent::Write).await?;
+        #[cfg(feature = "failure_generator")]
+        if self.failure_generator.throttle_copies {
+            return Err(StoreError::from(SlowDown));
+        }
         // Hash is preserved across the copy; the destination address only differs in context.
         // Same hash → same bucket, so source and destination always live in one bucket — including
         // the same-partition different-context case used for in-partition payload dedup, and the
@@ -6461,7 +6593,11 @@ impl LocalImmutableStore {
             self.group[group_index].dirty[bucket_index].store(true, atomic::Ordering::Relaxed);
             drop(bucket);
 
-            let _ = crate::immutable_store::ImmutableStore::flush(self.clone(), false).await;
+            let _ = crate::immutable_store::ImmutableStore::flush(
+                self.clone(),
+                FlushOptions::default(),
+            )
+            .await;
             result.healed = true;
         }
 
@@ -6616,8 +6752,9 @@ pub(crate) async fn flush_locked_group(
     group: Arc<ImmutableStoreGroup>,
     group_index: usize,
     path: Arc<PathBuf>,
-    sync_data: bool,
+    options: FlushOptions,
 ) -> Result<(), LocalImmutableStoreError> {
+    let sync_data = options.sync_data;
     let mut first_err: Option<LocalImmutableStoreError> = None;
 
     crate::local::fan_out::roll_pending_commit_forward(
@@ -6710,7 +6847,7 @@ pub(crate) async fn flush_locked_group(
                     path.as_ref(),
                     group_index,
                     bucket_index,
-                    sync_data,
+                    options,
                 )
                 .await;
                 match res {
@@ -6844,7 +6981,7 @@ pub(crate) async fn flush_locked_group(
             }
         }
     } else if first_err.is_none() {
-        // Regular flush at unchanged level: per-file .tmp + atomic rename for flagged buckets only, access stamps included. No marker write — marker already reflects the current level.
+        // Regular flush at unchanged level, for flagged buckets only, access stamps included. No marker write — marker already reflects the current level.
         for bucket_index in 0..active_buckets {
             if !group.needs_flush(bucket_index) {
                 continue;
@@ -6859,7 +6996,7 @@ pub(crate) async fn flush_locked_group(
                 path.as_ref(),
                 group_index,
                 bucket_index,
-                sync_data,
+                options,
             )
             .await;
             if let Err(err) = res
@@ -6886,7 +7023,7 @@ async fn maybe_fan_out_immutable_group(
     group_index: usize,
 ) -> Result<(), LocalImmutableStoreError> {
     let n = group.bucket_count.load(atomic::Ordering::Relaxed);
-    if n >= crate::local::fan_out::FAN_OUT_LEVEL_MAX {
+    if !crate::local::fan_out::can_fan_out(n) {
         return Ok(());
     }
     let mut b_max = 0usize;

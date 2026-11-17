@@ -1536,12 +1536,15 @@ async fn resolve_branch_id_or_current(
         return Ok(current_branch);
     }
 
-    let status = branch::resolve(repository, branch).await.map_err(|_err| {
-        lore_base::error::InvalidArguments {
-            reason: format!("branch '{branch}' not found"),
-        }
-    })?;
-    Ok(status.id)
+    match branch::resolve(repository, branch).await {
+        Ok(status) => Ok(status.id),
+        Err(err) if lore_base::error::is_refusal(&err) => Err(err).forward_any("resolving branch"),
+        Err(_err) => Err(BranchMetadataError::from(
+            lore_base::error::InvalidArguments {
+                reason: format!("branch '{branch}' not found"),
+            },
+        )),
+    }
 }
 
 /// Retrieves branch metadata. If `key` is non-empty, returns that single key's value.
@@ -1625,6 +1628,8 @@ fn metadata_set_local(
     )
 }
 
+/// Sets the metadata `args` names on the branch it names, or on the current branch.
+#[lore_macro::test_pub]
 async fn metadata_set_impl(
     repository: Arc<RepositoryContext>,
     args: LoreBranchMetadataSetArgs,

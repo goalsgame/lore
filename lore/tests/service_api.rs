@@ -494,8 +494,6 @@ mod tests {
         lore::runtime().block_on(async {
             let service = run_service_here().await;
             assert!(socket_is_accepting());
-            #[cfg(unix)]
-            let actor = lore::service::actor::current_run().expect("the service owns an actor");
 
             service.abort();
             let _ = service.await;
@@ -508,13 +506,6 @@ mod tests {
                 );
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
-            // Listener closure precedes the actor's final runtime drain and
-            // release of its process-wide run reservation.
-            #[cfg(unix)]
-            tokio::time::timeout(Duration::from_secs(15), actor.wait())
-                .await
-                .expect("the abandoned service must finish retiring")
-                .expect("the abandoned service must retire successfully");
         });
     }
 
@@ -541,8 +532,8 @@ mod tests {
         });
     }
 
-    /// Repeated quits succeed while the service drains its final calls and
-    /// after it has ended.
+    /// A quit with the service already gone is the state it asks for, so it
+    /// succeeds again rather than reaching for a service that has ended.
     #[test]
     #[serial]
     fn quitting_twice_succeeds() {
@@ -551,10 +542,7 @@ mod tests {
         lore::runtime().block_on(async {
             let service = run_service_here().await;
             assert_eq!(quit().await, 0);
-            for _ in 0..16 {
-                assert_eq!(quit().await, 0, "a quit during retirement is a no-op");
-                tokio::task::yield_now().await;
-            }
+            assert_eq!(quit().await, 0);
             let status = tokio::time::timeout(Duration::from_secs(15), service)
                 .await
                 .expect("the service must end after a quit")
@@ -562,48 +550,6 @@ mod tests {
             assert_eq!(status, 0);
 
             assert_eq!(quit().await, 0, "a quit after the service ended is a no-op");
-        });
-    }
-
-    /// Closing control admission after retirement does not turn a direct quit
-    /// into an error or let a command bound to another service control this one.
-    #[cfg(unix)]
-    #[test]
-    #[serial]
-    fn quitting_after_retirement_closes_control_admission_succeeds() {
-        use lore::service::owner::ServiceOwner;
-        use lore::service::state::ServiceStateImpl;
-        use lore::service::state::with_invocation;
-        use lore::service::state::with_owner;
-
-        let _settings = machine_settings("service-api-quit-retired-");
-        let state = Arc::new(ServiceStateImpl::new());
-        let owner = ServiceOwner::for_state(state.clone()).unwrap();
-        let guard = lore::remote::service_process::begin_service_start().unwrap();
-        assert!(guard.bind_owner(&owner));
-
-        lore::runtime().block_on(async {
-            let ticket = state.try_begin_control_invocation().unwrap();
-            with_invocation(
-                ticket,
-                with_owner(owner.clone(), async { owner.stop_control(false).await }),
-            )
-            .await
-            .unwrap()
-            .unwrap();
-            assert_eq!(owner.status().0, lore::service::owner::Phase::ReadyToExit);
-            state.close_and_drain_invocations().await;
-            assert!(state.try_begin_control_invocation().is_none());
-
-            assert_eq!(quit().await, 0);
-
-            let unrelated = Arc::new(ServiceStateImpl::new());
-            let ticket = unrelated.try_begin_control_invocation().unwrap();
-            assert_ne!(
-                with_invocation(ticket, quit()).await,
-                0,
-                "a command bound to another service must still be rejected"
-            );
         });
     }
 
@@ -875,6 +821,34 @@ mod tests {
             reported.contains("no-such-lore"),
             "the failure must name the executable it could not start: {reported}"
         );
+    }
+
+    /// With no executable named, a program that has not said its own executable runs the
+    /// service starts none, and the failure names where one can be set.
+    #[test]
+    #[serial]
+    fn a_start_with_none_named_starts_nothing_in_a_program_that_does_not_serve() {
+        let _settings = machine_settings("service-api-none-named-");
+        // Safety: as above.
+        unsafe { std::env::remove_var(EXECUTABLE_VAR) };
+
+        let (messages, callback) = capturing();
+        let status = lore::runtime().block_on(start(callback));
+        let reported = messages
+            .lock()
+            .expect("the collector lock is not poisoned")
+            .join("\n");
+
+        assert_eq!(
+            status,
+            unavailable_code(),
+            "with none named, nothing is started: {reported}"
+        );
+        assert!(
+            reported.contains("[service] executable"),
+            "the failure must name where one can be set: {reported}"
+        );
+        assert!(!socket_is_accepting(), "no service answers on the socket");
     }
 
     /// A status with no service running succeeds with running=false, rather than

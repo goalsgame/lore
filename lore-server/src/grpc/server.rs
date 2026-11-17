@@ -3,6 +3,7 @@
 use std::collections::HashMap;
 use std::future::Future;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,7 +41,7 @@ use tracing::info;
 use tracing::warn;
 
 use super::lock_service::LoreLockService;
-use crate::auth::jwt::JwtVerifier;
+use crate::auth::jwt::TokenVerification;
 use crate::auth::jwt_interceptor::JWTInterceptor;
 use crate::authnz::repository_authorizer::RepositoryAuthorizer;
 use crate::authnz::repository_catalog::RepositoryCatalog;
@@ -212,6 +213,17 @@ pub struct FeatureSettings {
     /// holds an `Arc<State>` over a deserialised revision blob;
     /// the wall-clock benefit saturates well below 64.
     pub revision_diff_history_walk_concurrency: Option<usize>,
+    /// Number of branches the v1 `BranchList` handler loads at once.
+    /// Defaults to 100.
+    pub branch_list_concurrency: Option<NonZeroUsize>,
+}
+
+impl FeatureSettings {
+    /// The configured `branch_list_concurrency`, or its default when unset.
+    pub fn branch_list_concurrency(&self) -> NonZeroUsize {
+        self.branch_list_concurrency
+            .unwrap_or(crate::grpc::revision::v1::branch_list::DEFAULT_BRANCH_LIST_CONCURRENCY)
+    }
 }
 
 /// Toggles for `RevisionList` acceleration features. Resolved once at
@@ -678,9 +690,9 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         )
     }
 
-    pub fn with_jwt_verifier(
+    pub fn with_token_verification(
         self,
-        jwt_verifier: Option<JwtVerifier>,
+        token_verification: TokenVerification,
         repository_authorizer: Arc<dyn RepositoryAuthorizer>,
         repository_catalog: Arc<dyn RepositoryCatalog>,
     ) -> Result<GrpcServerBuilder<WantsAddress>> {
@@ -749,7 +761,10 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
         );
 
         let mut admin_svc = self.0.admin_svc;
-        admin_svc.set_auth(jwt_verifier.clone(), repository_authorizer.clone());
+        admin_svc.set_auth(
+            token_verification.verifier().cloned(),
+            repository_authorizer.clone(),
+        );
         admin_svc.set_rpc_timeout(rpc_timeout);
 
         let storage_svc = LoreStorageService::new(
@@ -778,6 +793,7 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
             acceleration,
             self.0.forwarded_requests.clone(),
             rpc_timeout,
+            self.0.feature.branch_list_concurrency(),
         );
         let repository_svc = LoreRepositoryService::new(
             self.0.environment.clone(),
@@ -813,8 +829,8 @@ impl GrpcServerBuilder<MaybeJwtVerifier> {
 
         let notification_service = self.0.notification_service;
 
-        let authenticated = jwt_verifier.is_some();
-        let jwt_interceptor = JWTInterceptor::new(jwt_verifier.as_ref());
+        let authenticated = token_verification.verifier().is_some();
+        let jwt_interceptor = JWTInterceptor::new(token_verification);
 
         if check_enabled(&services.admin_service, "admin_service") {
             router = router.add_service(AdminServiceServer::new(admin_svc));

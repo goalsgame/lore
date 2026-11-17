@@ -34,8 +34,6 @@ use quinn::IdleTimeout;
 use quinn::VarInt;
 use quinn::congestion;
 use quinn::crypto::rustls::QuicClientConfig;
-use rustls::RootCertStore;
-use rustls_native_certs::load_native_certs;
 use thiserror::Error;
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
@@ -43,7 +41,6 @@ use tokio::sync::Semaphore;
 use tokio::sync::SemaphorePermit;
 use tokio::sync::oneshot;
 use url::Url;
-use webpki_roots::TLS_SERVER_ROOTS;
 
 use super::MAX_RTT_MS;
 use super::PACKET_THRESHOLD;
@@ -57,6 +54,7 @@ use crate::connection::RECONNECT_MAX_DELAY;
 use crate::connection::RECONNECT_START_DELAY;
 use crate::connection::authenticates_server;
 use crate::error::ProtocolError;
+use crate::tls::client_root_store;
 use crate::tls::load_certs;
 use crate::tls::load_private_key;
 
@@ -105,11 +103,10 @@ const HAPPY_EYEBALLS_DELAY_MS: u64 = 250;
 #[lore_macro::test_pub]
 const HAPPY_EYEBALLS_MAX_IN_FLIGHT: usize = 10;
 pub const DEFAULT_EXPECTED_RTT_MS: u64 = 100;
-/// The UDP receive buffer a client socket asks for. Linux allocates twice the request, 1 MiB, which is
-/// intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s transfer, and every
-/// datagram that arrives while it is full is lost.
-#[lore_macro::test_pub]
-const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
+/// The UDP receive buffer a QUIC socket asks for, client or server. Linux allocates twice the request,
+/// 1 MiB, which is intended. Its default of 208 KiB holds under half a millisecond of a 5 Gbit/s
+/// transfer, and every datagram that arrives while it is full is lost.
+pub const RECEIVE_BUFFER_BYTES: usize = 512 * 1024;
 
 #[derive(Clone, Debug)]
 pub struct ClientCerts {
@@ -798,31 +795,12 @@ fn client_crypto_config(
             .dangerous()
             .with_custom_certificate_verifier(insecure_client_auth::SkipServerVerification::new())
     } else {
-        let mut cert_store = RootCertStore::empty();
-
-        // load built in webpki certs
-        cert_store.extend(TLS_SERVER_ROOTS.iter().cloned());
-
-        // load native certs
-        let native_certs = load_native_certs();
-        if native_certs.certs.is_empty() {
-            lore_warn!(
-                "no certificates loaded from the OS trust store, continuing with the built-in webpki roots: {:?}",
-                native_certs.errors
-            );
-        }
-        for cert in native_certs.certs {
-            let _ = cert_store.add(cert);
-        }
-
-        // load custom ca
+        let mut cert_store = client_root_store();
         if let Some(ca_path) = &certificate_settings.custom_ca {
             let ca_certs = load_certs(ca_path).forward_with::<ProtocolError, _>(|| {
                 format!("loading CA certificate from {}", ca_path.display())
             })?;
-            for cert in ca_certs {
-                let _ = cert_store.add(cert);
-            }
+            Arc::make_mut(&mut cert_store).add_parsable_certificates(ca_certs);
         }
 
         rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -1055,8 +1033,7 @@ where
 /// Raises `socket`'s receive buffer to `bytes` when it is smaller, and leaves a buffer of at least
 /// that size alone. The OS may grant less than asked: Linux caps the request at
 /// `net.core.rmem_max`, and allocates and reports twice what it grants.
-#[lore_macro::test_pub]
-fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
+pub fn raise_receive_buffer(socket: &std::net::UdpSocket, bytes: usize) {
     let socket = socket2::SockRef::from(socket);
     if socket.recv_buffer_size().is_ok_and(|size| size >= bytes) {
         return;

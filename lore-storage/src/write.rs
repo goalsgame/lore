@@ -84,16 +84,49 @@ pub async fn write_raw(
     }
 }
 
-// In-flight writes are scoped to one store allocation. A different store may
-// hold none of these bytes even when partition and content address are equal.
-static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, CancellationToken>> = OnceLock::new();
+/// Writes in flight, keyed by the store object, partition and address: each entry holds the token
+/// cancelled when its guard drops, landed or not, and the store object it writes, so that no other
+/// store object takes the object address its key holds while the entry exists.
+static STORE_IN_FLIGHT: OnceLock<DashMap<StoreInFlightKey, StoreInFlight>> = OnceLock::new();
 
+/// A write in flight: the token cancelled when its guard drops, and the store object it writes.
+struct StoreInFlight {
+    token: CancellationToken,
+    _store: Arc<dyn ImmutableStore>,
+}
+
+/// The store a single-flight writes or reads into, by the address of the store object.
+#[lore_macro::test_pub]
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+pub(crate) struct FlightStore(std::num::NonZeroUsize);
+
+impl FlightStore {
+    /// The identity of `store`.
+    #[lore_macro::test_pub]
+    pub(crate) fn of(store: &dyn ImmutableStore) -> Self {
+        Self(std::ptr::NonNull::from(store).cast::<()>().addr())
+    }
+}
+
+/// A store object, partition and address: the key of a write in flight, and the association a
+/// read single-flight reads into.
 #[lore_macro::test_pub]
 #[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) struct StoreInFlightKey {
-    pub store: usize,
+    pub store: FlightStore,
     pub partition: Partition,
     pub address: Address,
+}
+
+impl StoreInFlightKey {
+    /// The key of `address` in `partition` of `store`.
+    fn of(store: &dyn ImmutableStore, partition: Partition, address: Address) -> Self {
+        Self {
+            store: FlightStore::of(store),
+            partition,
+            address,
+        }
+    }
 }
 
 /// Stores that have left [`STORE_IN_FLIGHT`], counted per bucket of addresses before each entry
@@ -115,8 +148,6 @@ pub(crate) fn stores_landed(address: Address) -> u64 {
 
 /// RAII guard that removes the in-flight entry and notifies waiters on drop.
 pub struct StoreInFlightGuard {
-    // Retention prevents allocation-address reuse while the key is registered.
-    _store: Arc<dyn ImmutableStore>,
     key: StoreInFlightKey,
 }
 
@@ -131,16 +162,16 @@ impl Drop for StoreInFlightGuard {
                 .is_some_and(|in_flight| in_flight.contains_key(&self.key))
         });
         if let Some(in_flight) = STORE_IN_FLIGHT.get()
-            && let Some((_, token)) = in_flight.remove(&self.key)
+            && let Some((_, flight)) = in_flight.remove(&self.key)
         {
             // Let waiters know we have finished the request that was in flight
-            token.cancel();
+            flight.token.cancel();
         }
     }
 }
 
-// Either returns a new in-flight token if request was not in flight, or waits for the request
-// to finish and then return none if already in-flight
+/// The guard of a write of `address` in `partition` of `store`, where no other write of it is in
+/// flight; otherwise waits for the one in flight to land and answers `None`.
 pub async fn stored_in_flight(
     store: &Arc<dyn ImmutableStore>,
     partition: Partition,
@@ -155,13 +186,10 @@ pub async fn stored_in_flight(
     }
 }
 
-/// Non-blocking attempt to acquire the in-flight guard for this store and `(partition, address)`.
-/// Writers and readers coordinate only when they share the same `Arc` allocation.
-/// Separate wrappers or independently opened handles do not inherit each other's writes.
+/// Non-blocking attempt to acquire the in-flight guard for `address` in `partition` of `store`.
 ///
 /// Returns `Ok(guard)` if no one else is currently writing this address to this store — the
-/// caller becomes the leader and must drop the guard when the terminal store
-/// entry is written.
+/// caller becomes the leader and must drop the guard when the terminal store entry is written.
 ///
 /// Returns `Err(token)` if another task already holds the guard. The token is
 /// cancelled when that task drops its guard; callers that want to observe the
@@ -171,49 +199,37 @@ pub fn try_acquire_in_flight(
     partition: Partition,
     address: Address,
 ) -> Result<StoreInFlightGuard, CancellationToken> {
-    let key = StoreInFlightKey {
-        store: Arc::as_ptr(store).cast::<()>() as usize,
-        partition,
-        address,
-    };
+    let key = StoreInFlightKey::of(store.as_ref(), partition, address);
     let in_flight = STORE_IN_FLIGHT.get_or_init(DashMap::new);
     // `DashMap::entry` is safe here as it is not held across any awaits and no other locks are acquired while held
     #[allow(clippy::disallowed_methods)]
     match in_flight.entry(key.clone()) {
-        Entry::Occupied(entry) => Err(entry.get().clone()),
+        Entry::Occupied(entry) => Err(entry.get().token.clone()),
         Entry::Vacant(entry) => {
-            entry.insert(CancellationToken::new());
-            Ok(StoreInFlightGuard {
-                key,
+            entry.insert(StoreInFlight {
+                token: CancellationToken::new(),
                 _store: store.clone(),
-            })
+            });
+            Ok(StoreInFlightGuard { key })
         }
     }
 }
 
-/// If another task is currently writing this store's `(partition, address)` via the tracker
-/// path, wait for its cancellation token so subsequent reads observe the
-/// terminal store entry the leader produces, and answer true. Returns false
-/// immediately when no write is in flight for this same `Arc` allocation.
-pub async fn wait_if_in_flight(
-    store: &Arc<dyn ImmutableStore>,
+/// If another task is currently writing `address` in `partition` of `store`, wait for its
+/// cancellation token so subsequent reads observe the terminal store entry the leader produces,
+/// and answer true. Returns false immediately when no write is in flight. Looks for the write at
+/// the call, so the future holds none of the arguments.
+pub fn wait_if_in_flight(
+    store: &dyn ImmutableStore,
     partition: Partition,
     address: Address,
-) -> bool {
-    let Some(in_flight) = STORE_IN_FLIGHT.get() else {
-        return false;
-    };
-    let key = StoreInFlightKey {
-        store: Arc::as_ptr(store).cast::<()>() as usize,
-        partition,
-        address,
-    };
-    let token = in_flight.get(&key).map(|entry| entry.value().clone());
-    let Some(token) = token else {
-        return false;
-    };
-    token.cancelled().await;
-    true
+) -> impl Future<Output = bool> + use<> {
+    let key = StoreInFlightKey::of(store, partition, address);
+    let token = STORE_IN_FLIGHT
+        .get()
+        .and_then(|in_flight| in_flight.get(&key).map(|entry| entry.value().token.clone()));
+    futures::future::OptionFuture::from(token.map(CancellationToken::cancelled_owned))
+        .map(|waited| waited.is_some())
 }
 
 /// Result of a [`store_fragment`] operation.
@@ -532,10 +548,11 @@ async fn remote_put_retry(
 
 /// Unified fragment store: dedup -> load existing -> compress -> optional remote -> local store.
 ///
-/// When `remote_session` is `Some`, the session is used after compression to
-/// attempt a durable remote write via `session.put()`. The durable status
-/// affects the `PayloadStoredDurable` flag and whether the payload is cached
-/// locally (payload is always cached when not yet durable, as a safety net).
+/// When `remote_session` is `Some`, the fragment is made durable on the peer where
+/// possible, by duplicating an association the peer already holds or else by
+/// uploading the compressed payload. Durability affects the `PayloadStoredDurable`
+/// flag and whether the payload is cached locally. Until the fragment is durable,
+/// the payload is always cached locally so it isn't lost.
 ///
 /// For local-only storage, pass `None` for `remote_session`.
 ///
@@ -673,8 +690,8 @@ impl FusedPublish {
 /// A publishing write is never dispatched into the tracker, whatever the caller's `writes` says. A
 /// dispatched write returns before its leader has uploaded anything, so there would be no upload
 /// for the key to ride on and no placement to report — the two are incompatible by construction
-/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address
-/// collapse onto a single upload; a publishing write whose leader left the content durable reports
+/// rather than by policy. It does take the in-flight guard, so concurrent writers of one address to
+/// one store collapse onto a single upload; a publishing write whose leader left the content durable reports
 /// `published = false` and its key follows as a `mutable_store`, the same round trip its own upload
 /// would have cost and none of the payload. A leader that left the content *not* durable — one
 /// writing locally, or one whose upload failed — cannot satisfy a publish, so this call uploads
@@ -787,10 +804,10 @@ fn observed_fragment(fragment: Fragment, result: &StoreResult) -> Fragment {
 /// inline, and returns only after the terminal store entry is written.
 ///
 /// When `remote_session` is `None`, the in-flight machinery is bypassed entirely: it exists
-/// to coordinate concurrent uploads to the same address (so duplicate uploads collapse onto
-/// one wire call), which is moot for pure-local writes. Concurrent local writers may briefly
-/// do duplicate compression work, but the bucket-level write is content-addressed and
-/// idempotent. Items with no remote consult must not enter the dedup tracker.
+/// to coordinate concurrent uploads of the same address from one store (so duplicate uploads
+/// collapse onto one wire call), which is moot for pure-local writes. Concurrent local writers
+/// may briefly do duplicate compression work, but the bucket-level write is content-addressed
+/// and idempotent. Items with no remote consult must not enter the dedup tracker.
 ///
 /// Not an `async fn`, which would hold a second copy of its arguments.
 #[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
@@ -857,8 +874,8 @@ fn store_fragment_inline(
             });
         }
 
-        // Remote-coupled path: acquire the in-flight guard so a concurrent writer to the same
-        // address dedupes onto one upload.
+        // Remote-coupled path: acquire the in-flight guard so a concurrent writer of the same
+        // address to this store dedupes onto one upload.
         let guard = stored_in_flight(&store, partition, address).await;
         if guard.is_none()
             && let Some((stored_local, stored_durable)) =
@@ -1062,46 +1079,66 @@ fn copy_source(resolved: &StoreMatchResult, address: Address) -> Option<CopySour
     })
 }
 
-/// Duplicate the association `source` names into `address` on the session's partition, reporting
-/// whether the peer now holds it durably.
-///
-/// A refusal is an outcome rather than an error — the source may be gone, the peer may never have
-/// had it, or the caller may hold no claim to its partition — and the upload the caller falls back
-/// to does everything this would have.
-async fn copy_association(
-    session: &Arc<StorageSession>,
-    source: CopySource,
-    address: Address,
-) -> bool {
-    if !session.can_copy_from(source.partition).await {
-        lore_base::lore_trace!(
-            "No claim to partition {} to copy {} from, uploading instead",
-            source.partition,
-            address.hash
-        );
-        return false;
-    }
+/// The outcome of asking a peer to duplicate an association it already holds.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum CopyOutcome {
+    /// The peer now holds the association durably.
+    Copied,
+    /// The request failed, the peer answered with something other than `SlowDown`, or the claim to
+    /// the source partition couldn't be confirmed. Uploading the payload has the same effect as
+    /// copying it.
+    Refused,
+    /// The peer was still answering `SlowDown` when the retries ran out.
+    Throttled,
+}
 
-    match session
-        .copy(source.partition, source.address, address.context)
-        .await
-    {
-        Ok(()) => {
-            REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+/// Ask the session's peer to duplicate the association `source_address` names in
+/// `source_partition` into `context` on the session's partition, without transferring a payload.
+///
+/// A `SlowDown` is retried with the same back-off as an upload.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn remote_copy_retry(
+    session: &StorageSession,
+    source_partition: Partition,
+    source_address: Address,
+    context: Context,
+) -> impl Future<Output = CopyOutcome> {
+    async move {
+        if !session.can_copy_from(source_partition).await {
             lore_base::lore_trace!(
-                "Copied {} from partition {} instead of uploading its payload",
-                address,
-                source.partition
+                "No claim to partition {source_partition} to copy {} into context {context} from",
+                source_address.hash
             );
-            true
+            return CopyOutcome::Refused;
         }
-        Err(err) => {
-            lore_base::lore_trace!(
-                "Copy of {} from partition {} refused ({err:?}), uploading instead",
-                address,
-                source.partition
-            );
-            false
+
+        let mut retry = crate::store_retry();
+        loop {
+            match session
+                .copy(source_partition, source_address, context)
+                .await
+            {
+                Ok(()) => return CopyOutcome::Copied,
+                Err(ref err) if err.is_slow_down() => {
+                    if !retry.wait().await {
+                        lore_base::lore_debug!(
+                            "Copy of {} into context {context} from partition {source_partition} still throttled after {} retries",
+                            source_address.hash,
+                            retry.counter()
+                        );
+                        return CopyOutcome::Throttled;
+                    }
+                }
+                Err(err) => {
+                    lore_base::lore_debug!(
+                        "Copy of {} into context {context} from partition {source_partition} refused ({err:?})",
+                        source_address.hash
+                    );
+                    return CopyOutcome::Refused;
+                }
+            }
         }
     }
 }
@@ -1136,10 +1173,10 @@ struct Placement {
     published: bool,
 }
 
-/// The "work" portion of [`store_fragment`]: optionally duplicate an association the peer already
-/// holds, else load existing local payload where its sizes check out
-/// ([`crate::read::check_payload_sizes`]) or compress the content, and upload, then write the
-/// terminal entry.
+/// Performs the work for [`store_fragment`]. Optionally duplicates an association the peer already
+/// holds. Otherwise, prepares a payload by loading an existing local payload whose sizes pass
+/// [`crate::read::check_payload_sizes`], or by compressing the content. Uploads the payload unless
+/// the peer throttled the copy, then writes the terminal entry.
 ///
 /// Returns where the payload ended up.
 ///
@@ -1169,6 +1206,7 @@ fn leader_body(
         let mut published = false;
         let stats = stats.as_deref();
         let mut registered_remotely = false;
+        let mut copy_throttled = false;
 
         if let Some(stats) = stats {
             stats.fragment_processed(&fragment);
@@ -1180,12 +1218,19 @@ fn leader_body(
             && let Some(session) = remote_session.as_ref()
             && let Some(source) = copy_source(&query, address)
         {
-            stored_durable = copy_association(session, source, address).await;
-            if stored_durable {
-                registered_remotely = true;
-                if let Some(stats) = stats {
-                    stats.remote_copy();
+            match remote_copy_retry(session, source.partition, source.address, address.context)
+                .await
+            {
+                CopyOutcome::Copied => {
+                    REMOTE_COPIES.fetch_add(1, Ordering::Relaxed);
+                    stored_durable = true;
+                    registered_remotely = true;
+                    if let Some(stats) = stats {
+                        stats.remote_copy();
+                    }
                 }
+                CopyOutcome::Refused => {}
+                CopyOutcome::Throttled => copy_throttled = true,
             }
         }
 
@@ -1238,8 +1283,12 @@ fn leader_body(
             }
         }
 
-        // Remote upload if session provided and not already durable
-        if !stored_durable && let Some(session) = remote_session.clone() {
+        // The peer was still asking for back-off when the copy gave up, and an upload would send
+        // it the whole payload. Keep it local and not durable, as after a failed upload.
+        if !stored_durable
+            && !copy_throttled
+            && let Some(session) = remote_session.clone()
+        {
             stored_durable = match publish {
                 Some(key) => {
                     published = remote_put_resolved_retry(
@@ -1426,7 +1475,7 @@ pub(crate) async fn write_content_publishing(
         address,
         fragment,
         Payload::Shared(buffer),
-        flags.local_cache_priority,
+        flags.cache_local(),
         remote_session,
         writes,
         permit,
@@ -1542,7 +1591,7 @@ fn write_single_fragment(
             address,
             fragment,
             buffer,
-            flags.local_cache_priority,
+            flags.cache_local(),
             remote_session,
             writes,
             permit,
@@ -1619,89 +1668,6 @@ pub fn write_from_file(
     remote_session: Option<Arc<StorageSession>>,
     writes: WriteContext,
 ) -> impl Future<Output = Result<StoreResult, StorageError>> {
-    write_from_file_impl(
-        store,
-        partition,
-        source,
-        context,
-        flags,
-        remote_session,
-        writes,
-        None,
-    )
-}
-
-/// Whole-file SHA-256 bound to the exact immutable identity established by ingestion.
-/// Its fields cannot be constructed from fragment hashes or path metadata.
-#[derive(Clone, Debug)]
-pub struct IngestedContent {
-    address: Address,
-    size: u64,
-    sha256: [u8; 32],
-}
-
-impl IngestedContent {
-    pub fn address(&self) -> Address {
-        self.address
-    }
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    pub fn sha256(&self) -> [u8; 32] {
-        self.sha256
-    }
-}
-
-/// Store a file and hash its whole content in the same ingestion stream.
-/// Hash-only requests are refused. With a write tracker, the caller must await its
-/// completion before treating the content as stored; pending storage failures do not
-/// invalidate the digest's binding to the ingested bytes and identity.
-#[allow(clippy::too_many_arguments)]
-pub async fn write_from_file_with_sha256(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
-    source: &ContentSource<'_>,
-    context: Context,
-    flags: WriteOptions,
-    remote_session: Option<Arc<StorageSession>>,
-    writes: WriteContext,
-) -> Result<(StoreResult, IngestedContent), StorageError> {
-    if flags.hash_only {
-        return Err(StorageError::internal(
-            "ingestion digests require stored content",
-        ));
-    }
-    let mut digest = ring::digest::Context::new(&ring::digest::SHA256);
-    let written = write_from_file_impl(
-        store,
-        partition,
-        source,
-        context,
-        flags,
-        remote_session,
-        writes,
-        Some(&mut digest),
-    )
-    .await?;
-    let content = IngestedContent {
-        address: written.address,
-        size: written.size_content,
-        sha256: digest.finish().as_ref().try_into().expect("SHA-256 length"),
-    };
-    Ok((written, content))
-}
-
-#[allow(clippy::too_many_arguments, clippy::manual_async_fn)]
-fn write_from_file_impl(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
-    source: &ContentSource<'_>,
-    context: Context,
-    flags: WriteOptions,
-    remote_session: Option<Arc<StorageSession>>,
-    writes: WriteContext,
-    mut sha256: Option<&mut ring::digest::Context>,
-) -> impl Future<Output = Result<StoreResult, StorageError>> {
     async move {
         let _in_flight = (!flags.hash_only).then(ContentWriteGuard::new);
         let _count_permit = file_count_limit_acquire()
@@ -1728,17 +1694,12 @@ fn write_from_file_impl(
         }
 
         // Anything larger than one fragment streams, so the scan never holds a file resident.
-        let size = usize::try_from(size).map_err(|_unaddressable_size| {
-            StorageError::internal("content size exceeds addressable memory")
-        })?;
+        let size = size as usize;
         if size <= crate::compress::FRAGMENT_SIZE_THRESHOLD {
             let read_permit = crate::concurrency::acquire_fragment_memory_permit(size).await;
             let buffer = handle.read_all(size).await.map_err(|err| {
                 StorageError::internal_with_context(err, &format!("read content: {source}"))
             })?;
-            if let Some(digest) = sha256.as_mut() {
-                digest.update(&buffer);
-            }
             let address = write_single_fragment(
                 store,
                 partition,
@@ -1757,7 +1718,7 @@ fn write_from_file_impl(
         }
 
         let (address, _stored_local, _stored_durable) =
-            crate::fragment_engine::write_fragmented_from_file_digest(
+            crate::fragment_engine::write_fragmented_from_file(
                 store,
                 partition,
                 context,
@@ -1767,7 +1728,6 @@ fn write_from_file_impl(
                 remote_session,
                 writes,
                 None,
-                sha256,
             )
             .await?;
         Ok(StoreResult {

@@ -120,7 +120,7 @@ pub struct LoreLinkStagedEntryEventData {
 
 #[derive(Clone, Debug)]
 pub struct StagedLinkInfo {
-    pub path: String,
+    pub mount_path: String,
     pub repository: RepositoryId,
     pub staged_file_count: u64,
 }
@@ -199,7 +199,8 @@ async fn list_staged_recursive(
                 link_state.clone(),
                 node.child,
             )
-            .await;
+            .await
+            .count;
 
             event::LoreEvent::LinkStagedEntry(LoreLinkStagedEntryEventData {
                 path: LoreString::from_str(&full_path),
@@ -209,7 +210,7 @@ async fn list_staged_recursive(
             .send();
 
             result.push(StagedLinkInfo {
-                path: full_path.clone(),
+                mount_path: full_path.clone(),
                 repository: link_ref.repository,
                 staged_file_count,
             });

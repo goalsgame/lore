@@ -1,11 +1,15 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
+use std::borrow::Borrow;
 use std::ops::BitAnd;
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::Ordering;
 
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream::FuturesUnordered;
 use lore_base::lore_spawn;
 use lore_error_set::prelude::*;
 use tokio::sync::mpsc;
@@ -23,6 +27,7 @@ use crate::errors::WriteRequired;
 use crate::event;
 use crate::filter::FilterMode;
 use crate::fs::filesystem_provider::FilesystemDiffIntent;
+use crate::fs::filesystem_provider::FsError;
 use crate::fs::filesystem_provider::HoldOptions;
 use crate::fs::filesystem_provider::InstanceOperation;
 use crate::fs::filesystem_provider::InstanceOperationImpl;
@@ -47,7 +52,6 @@ use crate::node::NodeID;
 use crate::node::NodeIDExt;
 use crate::node::NodeLink;
 use crate::node::ROOT_NODE;
-use crate::node::SiblingCycleGuard;
 use crate::progress::DEFAULT_WORK_CHANNEL_CAPACITY;
 use crate::repository::BASE_SUFFIX;
 use crate::repository::MINE_SUFFIX;
@@ -55,6 +59,8 @@ use crate::repository::RepositoryContext;
 use crate::repository::THEIRS_SUFFIX;
 use crate::repository::clone;
 use crate::repository::clone::CloneContext;
+use crate::revision::sync::KeptMove;
+use crate::revision::sync::KeptMoves;
 use crate::revision::sync::LoreRevisionSyncFileEventData;
 use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::revision::sync::SyncError;
@@ -64,6 +70,8 @@ use crate::revision::sync::SyncVerifyArgs;
 use crate::revision::sync::SyncVerifyStats;
 use crate::stage;
 use crate::state;
+use crate::state::Mark;
+use crate::state::NameChange;
 use crate::state::NodeComparison;
 use crate::state::NodeMapping;
 use crate::state::State;
@@ -73,7 +81,8 @@ use crate::util::path::expand_path_ancestors;
 
 /// Carries the working tree from `state_current` to `state_target`. A provider that holds its
 /// state in a `State` is handed `state_target` alone and carries itself there
-/// ([`InstanceOperationImpl::hold_state`]).
+/// ([`InstanceOperationImpl::hold_state`]), then reads the held ignore file into the store
+/// (`InstanceOperationImpl::warm_held_ignore_file`).
 ///
 /// Each context answers for the state beside it: one for a revision change, and two for a view
 /// change, where the tree holds what the current view materialized and is left holding what the
@@ -142,11 +151,31 @@ pub async fn realize_state(
                 dry_run: globals.dry_run(),
             }
         };
-        return operation
+        operation
             .hold_state(repository_target, state_target, hold)
             .await
-            .forward::<SyncError>("Holding the target revision");
+            .forward::<SyncError>("Holding the target revision")?;
+        operation.warm_held_ignore_file().await;
+        return Ok(());
     }
+
+    let inclusion_set = if options.root_files.is_empty() {
+        None
+    } else {
+        let tags: Vec<&str> = options.dependency_tags.iter().map(|s| s.as_str()).collect();
+        Some(
+            dependency::resolve::resolve_dependency_file_set(
+                repository_target.clone(),
+                state_target.clone(),
+                &options.root_files,
+                &tags,
+                options.dependency_recursive,
+                options.dependency_depth_limit,
+            )
+            .await
+            .forward::<SyncError>("Failed to resolve dependency set")?,
+        )
+    };
 
     let stats: Arc<SyncRealizeStats> = Arc::default();
     let changes = if !options.reset {
@@ -185,8 +214,8 @@ pub async fn realize_state(
                 node: ROOT_NODE,
             },
             RelativePath::new(),
-            options.filter_mode | FilterMode::Ignore,
-            FilesystemDiffIntent::Report,
+            options.filter_mode,
+            FilesystemDiffIntent::ReportTracked,
             Arc::new(Vec::new()),
         )
         .await
@@ -212,27 +241,18 @@ pub async fn realize_state(
         changes
     };
 
-    // Filter changes by dependency set when root_files is specified
-    let changes = if !options.root_files.is_empty() {
-        let tags: Vec<&str> = options.dependency_tags.iter().map(|s| s.as_str()).collect();
-        let root_refs: Vec<&str> = options.root_files.iter().map(|s| s.as_str()).collect();
-        let inclusion_set = dependency::resolve::resolve_dependency_file_set(
-            repository_target.clone(),
-            state_target.clone(),
-            &root_refs,
-            &tags,
-            options.dependency_recursive,
-            options.dependency_depth_limit,
-        )
-        .await
-        .forward::<SyncError>("Failed to resolve dependency set")?;
-
+    let changes = if let Some(inclusion_set) = inclusion_set {
         let change_count = changes.len();
         let filtered: Vec<NodeChange> = changes
             .into_iter()
-            .filter(|change| match change.action {
-                change::FileAction::Delete => inclusion_set.contains(&change.from.mapping.node),
-                _ => inclusion_set.contains(&change.to.mapping.node),
+            .filter(|change| {
+                let (mapping, state) = match change.action {
+                    change::FileAction::Delete => (&change.from.mapping, &state_current),
+                    _ => (&change.to.mapping, &state_target),
+                };
+                // Node ids are numbered per tree, so a change inside a link can carry the id of a
+                // node in the dependency set.
+                inclusion_set.contains(&mapping.node) && Arc::ptr_eq(&mapping.state, state)
             })
             .collect();
         lore_info!(
@@ -250,21 +270,40 @@ pub async fn realize_state(
     let force = globals.force();
     let dry_run = globals.dry_run();
 
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After the delta, {} changes: {}",
+            changes.len(),
+            lore_base::allocator::memory_summary()
+        );
+    }
+
     let options = Arc::new(options);
     let changes = Arc::new(changes);
     let changes = if !changes.is_empty() && !force && !options.reset {
         lore_info!("Verifying {} changes with local file system", changes.len());
+        // The list is moved in, so verification can filter it in place and the realize step never
+        // holds a second list of the same millions of changes.
         verify_filesystem_for_changes(Arc::new(SyncVerifyArgs {
-            changes: changes.clone(),
+            changes,
             repository_current: repository_current.clone(),
             operation: operation.clone(),
             current: NodeMapping::root(repository_current.clone(), state_current.clone()),
             options: options.clone(),
+            carries_modes: true,
         }))
         .await?
     } else {
         changes
     };
+
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After verification, {} changes to realize: {}",
+            changes.len(),
+            lore_base::allocator::memory_summary()
+        );
+    }
 
     realize_changes(
         repository_target,
@@ -277,94 +316,181 @@ pub async fn realize_state(
     )
     .await?;
 
+    if lore_base::allocator::memory_stats_requested() {
+        lore_debug!(
+            "After realizing: {}",
+            lore_base::allocator::memory_summary()
+        );
+    }
+
     Ok(())
 }
 
-pub async fn verify_filesystem_for_changes(
+/// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
+/// does, and answers those still having work to do, sorted by path.
+///
+/// Where [`SyncVerifyArgs::carries_modes`] is set, gives each file found holding the incoming
+/// content with the other executable bit the change's bit, once no change has refused; otherwise
+/// sets none, and the realize that follows verifies again and sets them.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+pub fn verify_filesystem_for_changes(
     args: Arc<SyncVerifyArgs>,
-) -> Result<Arc<Vec<NodeChange>>, SyncError> {
-    let mut failure = None;
-    let mut tasks = JoinSet::new();
-    let mut changes = Vec::with_capacity(args.changes.len());
-    let stats = Arc::new(SyncVerifyStats::default());
-    for change in args.changes.iter() {
-        lore_spawn!(tasks, {
-            let forward_changes = args.options.forward_changes;
-            let force_hash_check = args.options.force_hash_check;
-            let filter_mode = args.options.filter_mode;
-            let change = change.clone();
-            let repository_current = args.repository_current.clone();
-            let operation = args.operation.clone();
-            let current = args.current.clone();
-            let stats = stats.clone();
-            async move {
-                let mut change = change;
-                let realize = verify_filesystem(
-                    &mut change,
-                    repository_current,
-                    operation,
-                    current,
-                    forward_changes,
-                    force_hash_check,
-                    stats,
-                    filter_mode,
-                )
-                .await?;
-
-                Ok(realize.then_some(change))
-            }
-        });
-        while tasks.len() > MAX_CONCURRENT_TREE_TASKS
-            && let Some(result) = tasks.join_next().await
-        {
+) -> impl Future<Output = Result<Arc<Vec<NodeChange>>, SyncError>> {
+    async move {
+        // Each task answers with its change's verdict and the flags the verify left on it:
+        // verification only ever adds flags. The list to realize is the original filtered in
+        // place, so a large sync holds the changes once.
+        let mut failure = None;
+        let mut tasks = JoinSet::new();
+        let mut verdicts = vec![(Verdict::Drop, change::Flags::None); args.changes.len()];
+        let stats = Arc::new(SyncVerifyStats::default());
+        let incoming = Arc::new(IncomingMoves::new(args.changes.clone()));
+        let record = |verdicts: &mut Vec<(Verdict, change::Flags)>,
+                      failure: &mut Option<SyncError>,
+                      result: Result<
+            Result<(usize, Verdict, change::Flags), SyncError>,
+            tokio::task::JoinError,
+        >| {
             match result
                 .internal("Recursion task failed")
                 .map_err(SyncError::from)
                 .flatten()
             {
-                Ok(change) => {
-                    if let Some(change) = change {
-                        changes.push(change);
-                    }
+                Ok((index, verdict, flags)) => verdicts[index] = (verdict, flags),
+                Err(err) => *failure = failure.take().or(Some(err)),
+            }
+        };
+        for (index, change) in args.changes.iter().enumerate() {
+            lore_spawn!(tasks, {
+                let forward_changes = args.options.forward_changes;
+                let force_hash_check = args.options.force_hash_check;
+                let filter_mode = args.options.filter_mode;
+                let change = change.clone();
+                let repository_current = args.repository_current.clone();
+                let operation = args.operation.clone();
+                let current = args.current.clone();
+                let stats = stats.clone();
+                let incoming = incoming.clone();
+                async move {
+                    let mut change = change;
+                    let verdict = verify_filesystem(
+                        &mut change,
+                        repository_current,
+                        operation,
+                        current,
+                        forward_changes,
+                        false,
+                        force_hash_check,
+                        stats,
+                        filter_mode,
+                        &incoming,
+                    )
+                    .await?;
+
+                    Ok((index, verdict, change.flags))
                 }
-                Err(err) => {
-                    failure = failure.or(Some(err));
-                }
+            });
+            while tasks.len() > MAX_CONCURRENT_TREE_TASKS
+                && let Some(result) = tasks.join_next().await
+            {
+                record(&mut verdicts, &mut failure, result);
+            }
+
+            if failure.is_some() {
+                break;
             }
         }
-
-        if failure.is_some() {
-            break;
+        // Wait for the remaining tasks
+        while let Some(result) = tasks.join_next().await {
+            record(&mut verdicts, &mut failure, result);
         }
-    }
-    // Wait for the remaining tasks
-    while let Some(result) = tasks.join_next().await {
-        match result
-            .internal("Recursion task failed")
-            .map_err(SyncError::from)
-            .flatten()
+
+        if let Some(err) = failure {
+            return Err(err);
+        }
+        if args.carries_modes
+            && verdicts
+                .iter()
+                .any(|(verdict, _)| *verdict == Verdict::CarryMode)
         {
-            Ok(change) => {
-                if let Some(change) = change {
-                    changes.push(change);
+            let carried: crate::BoxFuture<'_, Result<(), SyncError>> =
+                Box::pin(carry_held_modes(&args.operation, &args.changes, &verdicts));
+            carried.await?;
+        }
+
+        // The moves hold a reference to the list; with them dropped, the list is taken back without
+        // a copy where this holds the only reference to it, which a caller that moves its list in
+        // gives it.
+        drop(incoming);
+        let original = match Arc::try_unwrap(args) {
+            Ok(args) => Arc::try_unwrap(args.changes).unwrap_or_else(|shared| (*shared).clone()),
+            Err(args) => (*args.changes).clone(),
+        };
+        // Collecting a filtered `into_iter` of the same type reuses its allocation.
+        let mut changes: Vec<NodeChange> = original
+            .into_iter()
+            .zip(verdicts)
+            .filter_map(|(mut change, (verdict, flags))| {
+                (verdict == Verdict::Realize).then(|| {
+                    change.flags = flags;
+                    change
+                })
+            })
+            .collect();
+
+        // Parent directories must appear before their children so that directory renames
+        // in the realize path complete before child file operations are spawned.
+        change::sort_by_path(&mut changes);
+
+        Ok(Arc::new(changes))
+    }
+}
+
+/// The executable bits [`carry_held_modes`] sets at once: more than the IO pool has threads, so
+/// that none of its threads sits idle.
+const CONCURRENT_CARRIES: usize = 64;
+
+/// Gives the file of each change of `changes` whose verdict is [`Verdict::CarryMode`] the change's
+/// executable bit, which the verify found the file holding the incoming content without. Up to
+/// [`CONCURRENT_CARRIES`] futures run together, each taking every so many changes in turn, so the
+/// bits are set in parallel with an allocation per future rather than per file. Every future runs
+/// to its end, or to its own first error, before the first error is answered, so no carry outlives
+/// the call.
+///
+/// Boxed by its caller: only a verify that found such a file reaches it, and inline it would grow
+/// every verify's future.
+async fn carry_held_modes(
+    operation: &InstanceOperationImpl,
+    changes: &[NodeChange],
+    verdicts: &[(Verdict, change::Flags)],
+) -> Result<(), SyncError> {
+    let carried = verdicts
+        .iter()
+        .filter(|(verdict, _)| *verdict == Verdict::CarryMode);
+    let parallel = carried.count().min(CONCURRENT_CARRIES);
+    let mut carrying: FuturesUnordered<_> = (0..parallel)
+        .map(|first| async move {
+            for index in (first..changes.len()).step_by(parallel) {
+                if verdicts[index].0 == Verdict::CarryMode {
+                    let change = &changes[index];
+                    let held = change.to.mode ^ NodeFileMode::Executable.bits();
+                    carry_file_mode(operation, change.path(), held, change.to.mode).await?;
                 }
             }
-            Err(err) => {
-                failure = failure.or(Some(err));
-            }
+            Ok::<_, SyncError>(())
+        })
+        .collect();
+    let mut failure = None;
+    loop {
+        let Some(carried) = carrying.next().await else {
+            return failure.map_or(Ok(()), Err);
+        };
+        if let Err(err) = carried {
+            failure = failure.or(Some(err));
         }
     }
-
-    if let Some(err) = failure {
-        return Err(err);
-    }
-
-    // Re-sort after parallel verification which collects results in completion order.
-    // Parent directories must appear before their children so that directory renames
-    // in the realize path complete before child file operations are spawned.
-    change::sort_by_path(&mut changes);
-
-    Ok(Arc::new(changes))
 }
 
 /// The address of the content a change brings in. `NodeChangeState` carries it where the
@@ -425,108 +551,181 @@ async fn holds_the_replaced_content(
     ))
 }
 
-/// How the working file compares to the node it was realized from, and whether the current
-/// revision is what holds that node.
+/// How the working file at `repository_path`, the path a change names or the one a move carries
+/// its file from, compares to the node it was realized from, and whether the current revision is
+/// what holds that node.
 ///
 /// A three-way merge's from side is the base revision, which answers for nothing on disk, so
 /// the node the current revision holds at the path stands in. Where the change starts at the
 /// current revision the two are the same node, reached by id rather than by path, and where
 /// the current revision holds none the from side is all there is. The node is measured in the
 /// context that holds it, whose partition its content lives in.
-async fn modification_against_measured_node(
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[allow(clippy::manual_async_fn)]
+fn modification_against_measured_node<'a>(
+    operation: &'a Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    change: &'a NodeChange,
+    current: &'a NodeMapping,
+    force_full_check: bool,
+    repository_path: &'a RelativePath,
+    established: &'a lore_storage::ContentHashes,
+) -> impl Future<Output = Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError>> + 'a
+{
+    async move {
+        let info = operation.file_info(repository_path).await?;
+        if !info.exists() {
+            return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+                info,
+                measured: None,
+                modification: None,
+            });
+        }
+
+        let from_is_current = change.from.mapping.state.revision() == current.state.revision();
+        let node_link = if from_is_current {
+            NodeLink::invalid()
+        } else {
+            current.node_at(repository_path).await
+        };
+
+        let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
+            let (repository_current, state_node) = node_link
+                .resolve(repository.clone(), current.state.clone())
+                .await
+                .forward_with::<SyncError, _>(|| {
+                    format!("Failed to deserialize state {}", node_link.revision)
+                })?;
+            let node = state_node
+                .node(repository_current.clone(), node_link.node)
+                .await
+                .forward::<SyncError>("Failed loading the node the current revision holds")?;
+            (Some(node), repository_current, true)
+        } else if change.from.mapping.node.is_valid_node_id() {
+            let node = change
+                .from
+                .get_node()
+                .await
+                .forward::<SyncError>("Failed to find node")?;
+            (
+                Some(node),
+                change.from.mapping.repository.clone(),
+                from_is_current,
+            )
+        } else {
+            (None, repository, from_is_current)
+        };
+
+        let modification = match node.as_ref() {
+            Some(node) if info.is_file() && node.is_file() => {
+                let modification = if force_full_check {
+                    state::file_modification(
+                        repository_measured,
+                        node,
+                        info.mtime(),
+                        info.size(),
+                        repository_path,
+                        true,
+                        operation,
+                        established,
+                    )
+                    .await
+                } else {
+                    state::file_modified_against_node(
+                        repository_measured,
+                        node,
+                        info.mtime(),
+                        info.size(),
+                        repository_path,
+                        is_current,
+                        operation,
+                        established,
+                    )
+                    .await
+                }
+                .forward::<SyncError>("Failed to check file modification")?;
+
+                Some(crate::fs::filesystem_provider::FileDifferenceFromNode {
+                    modified: modification.is_modified(),
+                    mode_differs: info.mode_differs_from(node.mode),
+                })
+            }
+            _ => None,
+        };
+
+        Ok(crate::fs::filesystem_provider::FileModifiedCheck {
+            info,
+            measured: node.map(|node| MeasuredNode { node, is_current }),
+            modification,
+        })
+    }
+}
+
+/// Whether the file at `source`, the path `change` relocates its file from, holds local work:
+/// content other than what it was realized from and what the change brings in.
+///
+/// Where the current revision holds the file at `source`, the realize renames it away and writes
+/// the incoming content over it where the change rewrites it, so an edit there would be lost or
+/// left at a path that never held it. Nothing there, or no file, holds none, and nor does a file
+/// the current revision holds no node for at `source`, as at the source of the current branch's
+/// own move in a three-way merge: that file is not the one the change carries.
+///
+/// Runs only for a change that relocates a file, a cold path its caller boxes: inline, the two
+/// comparisons would make the verify of every change as large as their own.
+async fn moved_file_holds_local_work(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
     change: &NodeChange,
     current: &NodeMapping,
     force_full_check: bool,
-    repository_path: &RelativePath,
-    established: &lore_storage::ContentHashes,
-) -> Result<crate::fs::filesystem_provider::FileModifiedCheck, SyncError> {
-    let info = operation.file_info(repository_path).await?;
-    if !info.exists() {
-        return Ok(crate::fs::filesystem_provider::FileModifiedCheck {
-            info,
-            measured: None,
-            modification: None,
-        });
+    source: &RelativePath,
+) -> Result<bool, SyncError> {
+    let established = lore_storage::ContentHashes::default();
+    let measured = modification_against_measured_node(
+        operation,
+        repository,
+        change,
+        current,
+        force_full_check,
+        source,
+        &established,
+    )
+    .await?;
+    let carried = measured
+        .measured
+        .as_ref()
+        .is_some_and(|measured| measured.is_current);
+    if !carried
+        || !measured
+            .modification
+            .is_some_and(|difference| difference.modified)
+    {
+        return Ok(false);
     }
 
-    let from_is_current = change.from.mapping.state.revision() == current.state.revision();
-    let node_link = if from_is_current {
-        NodeLink::invalid()
-    } else {
-        current.node_at(change.path()).await
-    };
-
-    let (node, repository_measured, is_current) = if node_link.node.is_valid_node_id() {
-        let (repository_current, state_node) = node_link
-            .resolve(repository.clone(), current.state.clone())
-            .await
-            .forward_with::<SyncError, _>(|| {
-                format!("Failed to deserialize state {}", node_link.revision)
-            })?;
-        let node = state_node
-            .node(repository_current.clone(), node_link.node)
-            .await
-            .forward::<SyncError>("Failed loading the node the current revision holds")?;
-        (Some(node), repository_current, true)
-    } else if change.from.mapping.node.is_valid_node_id() {
-        let node = change
-            .from
-            .get_node()
-            .await
-            .forward::<SyncError>("Failed to find node")?;
-        (
-            Some(node),
-            change.from.mapping.repository.clone(),
-            from_is_current,
-        )
-    } else {
-        (None, repository, from_is_current)
-    };
-
-    let modification = match node.as_ref() {
-        Some(node) if info.is_file() && node.is_file() => {
-            let modification = if force_full_check {
-                state::file_modification(
-                    repository_measured,
-                    node,
-                    info.mtime(),
-                    info.size(),
-                    change.path(),
-                    true,
-                    operation,
-                    established,
-                )
-                .await
-            } else {
-                state::file_modified_against_node(
-                    repository_measured,
-                    node,
-                    info.mtime(),
-                    info.size(),
-                    change.path(),
-                    is_current,
-                    operation,
-                    established,
-                )
-                .await
-            }
-            .forward::<SyncError>("Failed to check file modification")?;
-
-            Some(crate::fs::filesystem_provider::FileDifferenceFromNode {
-                modified: modification.is_modified(),
-                mode_differs: info.mode_differs_from(node.mode),
-            })
-        }
-        _ => None,
-    };
-
-    Ok(crate::fs::filesystem_provider::FileModifiedCheck {
-        info,
-        measured: node.map(|node| MeasuredNode { node, is_current }),
-        modification,
-    })
+    let incoming = change
+        .to
+        .get_node()
+        .await
+        .forward::<SyncError>("Failed loading the node the change brings in")?;
+    let comparison = state::file_matches_node(
+        change.to.mapping.repository.clone(),
+        &incoming,
+        measured.info.size(),
+        source,
+        operation,
+        &established,
+    )
+    .await
+    .forward::<SyncError>("Failed to compare the file to the incoming node")?;
+    match comparison {
+        NodeComparison::Matches => Ok(false),
+        NodeComparison::Differs => Ok(true),
+        NodeComparison::Unreadable => Err(SyncError::internal(format!(
+            "Failed to read {source} to compare it against the incoming revision"
+        ))),
+    }
 }
 
 /// Carries the executable bit `wanted` names onto `path`, which is all a change whose content
@@ -551,6 +750,17 @@ async fn carry_file_mode(
         )
         .await
         .forward_with::<SyncError, _>(|| format!("Failed to set the mode of {path}"))
+}
+
+/// What [`verify_filesystem`] answers for a change whose working file holds the content it
+/// brings in with the executable bit `held`: the bit to carry where it differs from the change's
+/// own and is no local one, and nothing to do otherwise.
+fn held_content_verdict(change: &NodeChange, held: u16) -> Verdict {
+    if !change.flags.is_local_mode() && util::fs::mode_changed(held, change.to.mode) {
+        Verdict::CarryMode
+    } else {
+        Verdict::Drop
+    }
 }
 
 /// Whether the executable bit the file a change realizes carries is the working tree's own, which
@@ -580,16 +790,193 @@ async fn mode_is_the_working_tree_own(
     })
 }
 
+/// The moves of a change set, looked up by the path each moves from.
+pub struct IncomingMoves {
+    changes: Arc<Vec<NodeChange>>,
+    by_source: OnceLock<Vec<usize>>,
+}
+
+impl IncomingMoves {
+    /// The moves `changes` holds, indexed on the first lookup.
+    pub fn new(changes: Arc<Vec<NodeChange>>) -> Self {
+        Self {
+            changes,
+            by_source: OnceLock::new(),
+        }
+    }
+
+    fn source(change: &NodeChange) -> &str {
+        change.move_source().map_or("", RelativePath::as_str)
+    }
+
+    /// The move carrying the node at `path` elsewhere, `path` spelled as the tree the moves start
+    /// from spells it. A tree can hold two spellings of one name, each moved on its own.
+    fn carrying(&self, path: &RelativePath) -> Option<&NodeChange> {
+        let changes = &self.changes;
+        let by_source = self.by_source.get_or_init(|| {
+            let mut by_source: Vec<usize> = (0..changes.len())
+                .filter(|&index| changes[index].move_source().is_some())
+                .collect();
+            by_source.sort_unstable_by(|&a, &b| {
+                Self::source(&changes[a]).cmp(Self::source(&changes[b]))
+            });
+            by_source
+        });
+        by_source
+            .binary_search_by(|&index| Self::source(&changes[index]).cmp(path.as_str()))
+            .ok()
+            .map(|found| &changes[by_source[found]])
+    }
+}
+
+/// Whether deleting a directory would lose the entry `change` reports below it.
+///
+/// Nothing is lost of an added entry, which the non-recursive directory delete keeps, of a
+/// tracked entry already missing, or of a file under a case variant of its name holding what the
+/// node holds. A file that differs from its node is lost unless `incoming` holds a move that
+/// carries it out of the directory to a node holding the same content, compared by size before
+/// content.
+async fn holds_local_work(
+    operation: &InstanceOperationImpl,
+    change: &NodeChange,
+    incoming: Option<&IncomingMoves>,
+) -> Result<bool, SyncError> {
+    match change.action {
+        change::FileAction::Add => return Ok(false),
+        change::FileAction::Delete => {
+            return Ok(operation
+                .file_info(change.path())
+                .await
+                .is_ok_and(|info| info.exists()));
+        }
+        _ if change.is_case_variant() => return Ok(false),
+        _ => {}
+    }
+    let Some(moved) = incoming.and_then(|incoming| incoming.carrying(&change.from.mapping.path))
+    else {
+        return Ok(true);
+    };
+    let (Some(observed), Ok(node)) = (change.to.observed, moved.to.get_node().await) else {
+        return Ok(true);
+    };
+    let comparison = state::file_matches_node(
+        moved.to.mapping.repository.clone(),
+        &node,
+        observed.size(),
+        change.path(),
+        operation,
+        &lore_storage::ContentHashes::default(),
+    )
+    .await
+    .forward::<SyncError>("Failed to compare the file to the incoming node")?;
+    Ok(!matches!(comparison, NodeComparison::Matches))
+}
+
+/// Removes the files `directory` holds under a case variant of the name of a file a change in
+/// `changes` deletes or moves away directly in it, where they hold the content the change starts
+/// from or the content the move carries, and then `directory`, answering whether it removed the
+/// directory. `changes` is sorted by the path each starts from.
+///
+/// A case-sensitive file system keeps a file spelled otherwise than the revision spells it, which
+/// the delete or the move of the revision's spelling misses. A file holding other content,
+/// compared by size before content, a directory, a link and a file no change folds to stay in
+/// place, and keep the directory. The listing is drained before anything is removed, and of its
+/// entries only the names of the files that fold to a change are kept.
+///
+/// Runs only where a directory delete finds the directory holding entries, a cold path its callers
+/// box: inline, the content comparison would make every future awaiting a realize as large as its
+/// own.
+async fn remove_directory_of_case_variants<C: Borrow<NodeChange>>(
+    operation: &InstanceOperationImpl,
+    directory: &RelativePath,
+    changes: &[C],
+) -> bool {
+    let prefix = format!("{directory}/");
+    let first = changes
+        .partition_point(|change| change.borrow().from.mapping.path.as_str() < prefix.as_str());
+    let mut folded: Vec<(u64, &NodeChange)> = changes[first..]
+        .iter()
+        .map(Borrow::borrow)
+        .map_while(|change| {
+            Some((
+                change,
+                change.from.mapping.path.as_str().strip_prefix(&prefix)?,
+            ))
+        })
+        .filter(|(change, name)| !name.contains('/') && change.from.flags.contains(NodeFlags::File))
+        .map(|(change, name)| (hash::hash_string(name), change))
+        .collect();
+    if folded.is_empty() {
+        return false;
+    }
+    folded.sort_unstable_by_key(|(name_hash, _)| *name_hash);
+    let Ok(mut listing) = operation.read_directory(directory).await else {
+        return false;
+    };
+    let mut variants = Vec::new();
+    while let Some(entry) = listing.next().await {
+        if let Ok(entry) = entry
+            && entry.info.is_file()
+            && let Ok(found) = folded.binary_search_by_key(&entry.name_hash, |(hash, _)| *hash)
+        {
+            variants.push((entry.name, entry.info.size(), folded[found].1));
+        }
+    }
+    let mut removed = false;
+    for (name, size, change) in &variants {
+        let path = directory.join(name);
+        let established = lore_storage::ContentHashes::default();
+        let carried = change.move_source().map(|_| &change.to);
+        for side in std::iter::once(&change.from).chain(carried) {
+            let Ok(node) = side.get_node().await else {
+                continue;
+            };
+            if let Ok(NodeComparison::Matches) = state::file_matches_node(
+                side.mapping.repository.clone(),
+                &node,
+                *size,
+                &path,
+                operation,
+                &established,
+            )
+            .await
+            {
+                removed |= operation.remove(&path).await.is_ok();
+                break;
+            }
+        }
+    }
+    removed && operation.remove(directory).await.is_ok()
+}
+
+/// What [`verify_filesystem`] leaves to do with a change.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// Nothing: the working tree holds what the change brings in, or keeps local work over it.
+    Drop,
+    /// Realize the change.
+    Realize,
+    /// Give the file the change's executable bit: it holds the rest of what the change brings in.
+    CarryMode,
+}
+
 /// Checks `change` against the working copy, refusing the ones that would overwrite local work
-/// and settling on it what realizing it has to know, and answers whether it still has work to do.
+/// and settling on it what realizing it has to know, and answers what is left to do with it.
 ///
 /// A caller that realizes every change it verified, which a merge does to build the staged state
-/// out of them, takes the change as this leaves it and disregards the answer. One that realizes
-/// only what the working copy still needs, which a sync does, drops the rest.
+/// out of them, takes the change as this leaves it and disregards the answer, and says so in
+/// `realizes_every_change`. One that realizes only what the working copy still needs, which a
+/// sync does, acts on the answer. This changes no executable bit: [`verify_filesystem_for_changes`]
+/// carries the bits it answers [`Verdict::CarryMode`] for once every change has passed, where its
+/// caller asks for it ([`SyncVerifyArgs::carries_modes`]), and a caller realizing every change
+/// carries them in the realize.
 ///
 /// A file found to hold the incoming content has its time recorded where it is older than the
 /// operation's clock floor ([`InstanceOperationImpl::clock_floor`]), which a comparison reads
 /// before reading the file.
+///
+/// `incoming` holds the moves of the change set the change belongs to, which answer for the target
+/// where a directory is deleted.
 #[allow(clippy::too_many_arguments)]
 pub async fn verify_filesystem(
     change: &mut NodeChange,
@@ -597,11 +984,35 @@ pub async fn verify_filesystem(
     operation: Arc<InstanceOperationImpl>,
     current: NodeMapping,
     forward_changes: bool,
+    realizes_every_change: bool,
     force_full_check: bool,
     stats: Arc<SyncVerifyStats>,
     filter_mode: FilterMode,
-) -> Result<bool, SyncError> {
+    incoming: &IncomingMoves,
+) -> Result<Verdict, SyncError> {
     lore_trace!("Verify path: {change:?}");
+    if let Some(source) = change.relocated_from()
+        && change.from.flags.contains(NodeFlags::File)
+        && Box::pin(moved_file_holds_local_work(
+            &operation,
+            repository.clone(),
+            change,
+            &current,
+            force_full_check,
+            source,
+        ))
+        .await?
+    {
+        if forward_changes && !realizes_every_change {
+            lore_info!("Keeping the locally modified file a move carries away: {source}");
+            return Ok(Verdict::Drop);
+        }
+        lore_error!(
+            "File has local changes: {source}, which the incoming revision moves to {}",
+            change.path()
+        );
+        return Err(LocalModifications.into());
+    }
     let repository_path = change.path().clone();
     // One file is measured against the node it was realized from, the incoming node and the
     // node the change starts at. What comparing it establishes serves all three.
@@ -622,6 +1033,18 @@ pub async fn verify_filesystem(
     }
 
     if !modifications.info.exists() {
+        if operation
+            .unversioned_symlink_at_or_above(&repository_path)
+            .await?
+        {
+            // A caller realizing every change would write over it whatever this answers.
+            if forward_changes && !realizes_every_change {
+                lore_info!("Keeping the symbolic link at {}", change.path());
+                return Ok(Verdict::Drop);
+            }
+            lore_error!("A symbolic link stands at or above {}", change.path());
+            return Err(LocalModifications.into());
+        }
         return match change.action {
             change::FileAction::Add => {
                 // Nothing exist in file system, safe to add
@@ -629,7 +1052,7 @@ pub async fn verify_filesystem(
                     "Nothing exist in file system for {}, safe to add",
                     change.path()
                 );
-                Ok(true)
+                Ok(Verdict::Realize)
             }
             change::FileAction::Delete => {
                 // Nothing exists, delete is a no-op
@@ -637,7 +1060,7 @@ pub async fn verify_filesystem(
                     "Nothing exist in file system for {}, delete is no-op",
                     change.path()
                 );
-                Ok(true)
+                Ok(Verdict::Realize)
             }
             _ => {
                 if forward_changes {
@@ -645,13 +1068,13 @@ pub async fn verify_filesystem(
                         "Keeping modified file as locally deleted: {}",
                         change.path()
                     );
-                    Ok(false)
+                    Ok(Verdict::Drop)
                 } else {
                     lore_trace!(
                         "Restoring modified file which was locally deleted: {}",
                         change.path()
                     );
-                    Ok(true)
+                    Ok(Verdict::Realize)
                 }
             }
         };
@@ -663,21 +1086,15 @@ pub async fn verify_filesystem(
     if let Some(modification) = modifications.modification {
         // Check if file is modified
         if !modification.modified {
+            if holds_the_content(change, modifications.measured.as_ref()) {
+                change.flags |= change::Flags::HoldsContent;
+            }
             if change.action == change::FileAction::Keep
                 && let Some(measured) = modifications.measured.as_ref()
                 && measured.is_current
                 && !measured.node.address.is_zero()
                 && measured.node.address == incoming_address(change).await
             {
-                if !change.flags.is_local_mode() {
-                    carry_file_mode(
-                        &operation,
-                        change.path(),
-                        modifications.info.mode(change.to.mode),
-                        change.to.mode,
-                    )
-                    .await?;
-                }
                 if modifications.info.mtime() < operation.clock_floor(&repository).await {
                     operation.record_modified_time(
                         &change.from.mapping.repository,
@@ -685,10 +1102,13 @@ pub async fn verify_filesystem(
                         modifications.info.mtime(),
                     );
                 }
-                return Ok(false);
+                return Ok(held_content_verdict(
+                    change,
+                    modifications.info.mode(change.to.mode),
+                ));
             }
             stats.file_retain.fetch_add(1, Ordering::Relaxed);
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
         stats.file_replace.fetch_add(1, Ordering::Relaxed);
     }
@@ -698,7 +1118,7 @@ pub async fn verify_filesystem(
 
     if is_delete && was_link {
         lore_debug!("Link is for delete, skipping filesystem verification");
-        return Ok(true);
+        return Ok(Verdict::Realize);
     }
 
     let node_to = if !is_delete {
@@ -724,7 +1144,7 @@ pub async fn verify_filesystem(
                         "Keeping deleted file as locally modified: {}",
                         change.path()
                     );
-                    return Ok(false);
+                    return Ok(Verdict::Drop);
                 }
                 lore_error!(
                     "Deleted file is currently modified in file system: {}",
@@ -742,14 +1162,14 @@ pub async fn verify_filesystem(
                     "Keeping created directory as a locally modified file: {}",
                     change.path()
                 );
-                return Ok(false);
+                return Ok(Verdict::Drop);
             }
 
             lore_trace!(
                 "Change {} from file to directory, previous change will have deleted it",
                 change.path()
             );
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
 
         let differs_from = modifications
@@ -778,7 +1198,7 @@ pub async fn verify_filesystem(
                         "Keeping modified file as locally modified: {}",
                         change.path()
                     );
-                    return Ok(false);
+                    return Ok(Verdict::Drop);
                 }
 
                 if holds_the_replaced_content(
@@ -791,7 +1211,7 @@ pub async fn verify_filesystem(
                 )
                 .await?
                 {
-                    return Ok(true);
+                    return Ok(Verdict::Realize);
                 }
 
                 lore_error!(
@@ -818,15 +1238,6 @@ pub async fn verify_filesystem(
                     change.path()
                 );
 
-                if !change.flags.is_local_mode() {
-                    carry_file_mode(
-                        &operation,
-                        change.path(),
-                        modifications.info.mode(node_to.mode),
-                        node_to.mode,
-                    )
-                    .await?;
-                }
                 if modifications.info.mtime() < operation.clock_floor(&repository).await {
                     operation.record_modified_time(
                         &change.from.mapping.repository,
@@ -835,7 +1246,10 @@ pub async fn verify_filesystem(
                     );
                 }
 
-                return Ok(false);
+                return Ok(held_content_verdict(
+                    change,
+                    modifications.info.mode(change.to.mode),
+                ));
             }
         }
     }
@@ -855,7 +1269,7 @@ pub async fn verify_filesystem(
                 "Keeping modified/deleted file as a local directory: {}",
                 change.path()
             );
-            return Ok(false);
+            return Ok(Verdict::Drop);
         }
 
         if is_delete {
@@ -893,36 +1307,16 @@ pub async fn verify_filesystem(
             )?;
             let mut has_modified_file = false;
             while let Some(subchange) = directory_changes.next().await {
-                let subchange_path = subchange.path().clone();
-
-                if subchange.action == change::FileAction::Add {
-                    // Allow locally added files to remain and keep directory
+                let incoming = (!has_modified_file).then_some(incoming);
+                if !holds_local_work(&operation, &subchange, incoming).await? {
                     lore_trace!(
-                        "Allow locally added file in {}",
-                        subchange
-                            .path()
-                            .to_absolute_path(change.from.mapping.repository.require_path()?)
-                            .display()
-                    );
-                    continue;
-                }
-
-                let file_info = operation.file_info(&subchange_path).await.ok();
-
-                // A tracked entry that is already missing on disk is
-                // effectively pre-aligned with the directory delete the
-                // destination branch is performing. There is nothing to
-                // lose by letting the switch proceed.
-                if subchange.action == change::FileAction::Delete
-                    && file_info.as_ref().is_none_or(|info| !info.exists())
-                {
-                    lore_trace!(
-                        "Skip already-missing tracked entry inside deleted directory: {}",
+                        "Deleted directory entry {} holds no local work",
                         subchange.path()
                     );
                     continue;
                 }
 
+                let file_info = operation.file_info(subchange.path()).await.ok();
                 if !has_modified_file {
                     lore_error!(
                         "Deleted directory has modified files in file system: {}",
@@ -971,7 +1365,7 @@ pub async fn verify_filesystem(
             if has_modified_file {
                 return Err(LocalModifications.into());
             }
-            return Ok(true);
+            return Ok(Verdict::Realize);
         }
         // If this is a change from directory to file, there will have been a previous change
         // which deletes the existing directory node which will have verified the filesystem
@@ -980,10 +1374,10 @@ pub async fn verify_filesystem(
             "Change {} from directory to file, previous change will have deleted it",
             change.path()
         );
-        return Ok(true);
+        return Ok(Verdict::Realize);
     }
 
-    Ok(true)
+    Ok(Verdict::Realize)
 }
 
 pub async fn realize_changes(
@@ -1010,7 +1404,7 @@ pub async fn realize_changes(
         .store(file_delete_total, Ordering::Relaxed);
 
     // First perform all deletes in case of delete-add for going from/to file & directory
-    realize_changes_delete(
+    let kept = realize_changes_delete(
         repository.clone(),
         operation.clone(),
         changes.clone(),
@@ -1078,8 +1472,9 @@ pub async fn realize_changes(
     let (tx, rx) = mpsc::channel(DEFAULT_WORK_CHANNEL_CAPACITY);
 
     let discover_stats = stats.clone();
+    let discover_changes = changes.clone();
     let producer = lore_spawn!(async move {
-        let result = sync_discover_modify_add(changes, discover_stats.clone(), tx).await;
+        let result = sync_discover_modify_add(discover_changes, discover_stats.clone(), tx).await;
         discover_stats
             .discovery
             .complete
@@ -1096,10 +1491,11 @@ pub async fn realize_changes(
     let consumer_stats = stats.clone();
     // A view-excluded path is staged into the tree but not written to disk.
     let view_filter = repository.filter.clone();
+    let consumer_operation = operation.clone();
     let consumer = lore_spawn!(async move {
         sync_execute_modify_add(
             rx,
-            operation,
+            consumer_operation,
             state_stage,
             dry_run,
             is_merge,
@@ -1111,6 +1507,7 @@ pub async fn realize_changes(
 
     let (producer_result, consumer_result) = tokio::join!(producer, consumer);
     lore_debug!("Modified/added paths realized");
+    report_kept_moves(&stats.kept_moves);
 
     event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(&stats)).send();
 
@@ -1119,7 +1516,58 @@ pub async fn realize_changes(
     consumer_result?;
     producer_result?;
 
+    remove_directories_moved_out_of(&operation, &changes, kept).await;
+
     Ok(())
+}
+
+/// Removes the directories in `kept`, which their deletes found holding entries, out of which a
+/// move in `changes` carries an entry, deepest first. A directory stays where it holds an entry
+/// other than a case variant of a file moved out of it that holds what the move starts from or
+/// carries.
+///
+/// Deletes run before moves, so a directory holding the source of a move still holds it when its
+/// delete runs.
+async fn remove_directories_moved_out_of(
+    operation: &InstanceOperationImpl,
+    changes: &[NodeChange],
+    kept: Vec<NodeChange>,
+) {
+    if kept.is_empty() {
+        return;
+    }
+    let mut moves: Vec<&NodeChange> = changes
+        .iter()
+        .filter(|change| change.move_source().is_some())
+        .collect();
+    moves.sort_unstable_by(|a, b| {
+        a.from
+            .mapping
+            .path
+            .as_str()
+            .cmp(b.from.mapping.path.as_str())
+    });
+    for change in kept {
+        let prefix = format!("{}/", change.path());
+        let first =
+            moves.partition_point(|moved| moved.from.mapping.path.as_str() < prefix.as_str());
+        if moves
+            .get(first)
+            .is_some_and(|moved| moved.from.mapping.path.as_str().starts_with(&prefix))
+            && (operation.remove(change.path()).await.is_ok()
+                || Box::pin(remove_directory_of_case_variants(
+                    operation,
+                    change.path(),
+                    &moves,
+                ))
+                .await)
+        {
+            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData::new(
+                &change, 0, false,
+            ))
+            .send();
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1246,7 +1694,7 @@ pub async fn realize_scratch_file(
             })?;
     }
 
-    if node.size > 0 {
+    let written = if node.size > 0 {
         let options = immutable::read_options_from_repository(&repository);
         immutable::read_into_file(repository, node.address, path, None, options)
             .await
@@ -1255,31 +1703,30 @@ pub async fn realize_scratch_file(
                     "Failed to sync file {}: {err}",
                     path.to_string_lossy()
                 ))
-            })?;
+            })?
+            .1
     } else {
-        lore_io::IoDriver::global()
-            .write_file_bytes(path, bytes::Bytes::new(), false)
-            .await
-            .map_err(|err| {
-                SyncError::internal(format!(
-                    "Failed to sync file {}: {err}",
-                    path.to_string_lossy()
-                ))
-            })?;
-    }
+        Some(
+            lore_io::IoDriver::global()
+                .write_file_bytes(path, bytes::Bytes::new(), false)
+                .await
+                .map_err(|err| {
+                    SyncError::internal(format!(
+                        "Failed to sync file {}: {err}",
+                        path.to_string_lossy()
+                    ))
+                })?,
+        )
+    };
 
-    let metadata = lore_io::IoDriver::global().metadata(path).await.ok();
-    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable
-        && let Some(metadata) = &metadata
-    {
-        util::fs::metadata_set_executable(path, metadata, true).await;
+    if node.mode & NodeFileMode::Executable == NodeFileMode::Executable {
+        util::fs::metadata_set_executable(path, written.as_ref(), true).await;
     }
 
     lore_trace!(
-        "Realized file {} {} bytes (target file {} bytes) {}",
+        "Realized file {} {} bytes {}",
         path.display(),
         node.size,
-        metadata.map_or(0, |metadata| metadata.len()),
         node.address.hash
     );
 
@@ -1336,8 +1783,8 @@ pub fn realize_sidecar_file(
     }
 }
 
-/// Writes `node`'s content to `path`, creating the parent directory and applying the node's
-/// mode, and reports what the file looks like once written.
+/// Writes `node`'s content to `path`, creating the parent directory where it is missing and
+/// applying the node's mode, and reports what the file looks like once written.
 async fn write_node_to_path(
     repository: &Arc<RepositoryContext>,
     operation: &Arc<InstanceOperationImpl>,
@@ -1378,6 +1825,8 @@ fn progress_ticker(stats: Arc<SyncRealizeStats>) -> AbortOnDropHandle<()> {
     }))
 }
 
+/// Realizes the deletes `changes` holds, deepest first, and answers the directory deletes that
+/// found their directory holding entries and kept it.
 async fn realize_changes_delete(
     repository: Arc<RepositoryContext>,
     operation: Arc<InstanceOperationImpl>,
@@ -1386,7 +1835,7 @@ async fn realize_changes_delete(
     dry_run: bool,
     is_merge: bool,
     stats: Arc<SyncRealizeStats>,
-) -> Result<(), SyncError> {
+) -> Result<Vec<NodeChange>, SyncError> {
     // Sort the changes by path length and iterate in descending order. This will make sure that
     // directories have files deleted first, before attempting to delete the directory.
     // If a directory still have local files which are view/ignore filtered, these directories
@@ -1400,6 +1849,7 @@ async fn realize_changes_delete(
         .cloned()
         .collect();
     change::sort_by_path(delete_changes.as_mut_slice());
+    let mut kept = Vec::new();
     for change in delete_changes.iter().rev() {
         let change = change.clone();
 
@@ -1474,8 +1924,12 @@ async fn realize_changes_delete(
                             )));
                         }
                     } else {
-                        // Directory unlink failed, keep it and the locally added/modified files
-                        deleted = false;
+                        deleted = Box::pin(remove_directory_of_case_variants(
+                            &operation,
+                            &change_path,
+                            &delete_changes,
+                        ))
+                        .await;
                         break;
                     }
                 } else {
@@ -1527,19 +1981,105 @@ async fn realize_changes_delete(
                 .forward::<SyncError>("Failed to stage change")?;
 
                 if is_link {
-                    remove_link_registry_entry(
-                        &change.from.mapping.repository,
-                        &state_stage,
-                        change.from.address.context.into(),
-                        node_link.node,
-                    )
-                    .await?;
+                    state_stage
+                        .link_remove_if_present(
+                            change.from.mapping.repository.clone(),
+                            change.from.address.context.into(),
+                            node_link.node,
+                        )
+                        .await
+                        .forward::<SyncError>("Failed to remove link from the link registry")?;
                 }
             }
         }
+
+        if !deleted {
+            kept.push(change);
+        }
     }
 
-    Ok(())
+    if !dry_run && !repository.is_layer() {
+        remove_emptied_excluded_directories(
+            &operation,
+            &repository,
+            &delete_changes,
+            &RelativePath::new(),
+            &stats,
+        )
+        .await;
+    }
+
+    Ok(kept)
+}
+
+/// Removes each directory the view excludes below `floor` and above a delete in `changes` that the
+/// deletes left empty, deepest first, reporting each one removed. Each removal counts as a delete in
+/// `stats`, done and in total, and a progress event follows the last.
+///
+/// A directory the view excludes stands on disk only for content below it. One still holding
+/// anything, a local file included, is kept. `floor` is the root, or the mount of a layer, which
+/// stands whatever the view and is realized under the layer's context, so the layer's sync removes
+/// the directories below it rather than the realize. A realize under a link's context keeps every
+/// directory. The directories of a link the realized tree mounts are treated as any other. Without
+/// a rule re-including below a directory it excludes, a view leaves none of them on disk to remove.
+/// Ancestors a delete shares with the one before it are gathered once, which sorted deletes make
+/// the most of.
+pub(crate) async fn remove_emptied_excluded_directories(
+    operation: &InstanceOperationImpl,
+    repository: &RepositoryContext,
+    changes: &[NodeChange],
+    floor: &RelativePath,
+    stats: &Arc<SyncRealizeStats>,
+) {
+    if !repository.filter.view.reincludes() || repository.is_link() {
+        return;
+    }
+    let mut directories = Vec::new();
+    let mut previous = "";
+    for change in changes
+        .iter()
+        .filter(|change| change.action == change::FileAction::Delete)
+    {
+        let mut directory = change.path().parent_path();
+        while directory
+            .below(floor)
+            .is_some_and(|below| !below.is_empty())
+            && !directory.covers(&previous)
+        {
+            let parent = directory.parent_path();
+            directories.push(directory);
+            directory = parent;
+        }
+        previous = change.path().as_str();
+    }
+    directories.sort_unstable_by(|left, right| right.as_str().cmp(left.as_str()));
+    directories.dedup_by(|left, right| left.as_str() == right.as_str());
+    let mut removed = false;
+    for directory in directories {
+        if repository
+            .filter
+            .excludes(&directory, true, FilterMode::View)
+            && operation.remove_empty_directory(&directory).await.is_ok()
+        {
+            stats
+                .complete
+                .file_delete_total
+                .fetch_add(1, Ordering::Relaxed);
+            stats.complete.file_delete.fetch_add(1, Ordering::Relaxed);
+            event::LoreEvent::RevisionSyncFile(LoreRevisionSyncFileEventData {
+                path: LoreString::from(&directory),
+                size: 0,
+                action: change::FileAction::Delete.into(),
+                flag_file: 0,
+            })
+            .send();
+            removed = true;
+        }
+    }
+    if removed {
+        event::LoreEvent::RevisionSyncProgress(LoreRevisionSyncProgressEventData::new(stats))
+            .send();
+    }
 }
 
 struct SyncWorkItem {
@@ -1547,6 +2087,8 @@ struct SyncWorkItem {
     node: Node,
 }
 
+/// Sends each change that deletes nothing to `tx`, with the node its `to` side names given the
+/// mode `to` states.
 async fn sync_discover_modify_add(
     changes: Arc<Vec<NodeChange>>,
     stats: Arc<SyncRealizeStats>,
@@ -1565,7 +2107,8 @@ async fn sync_discover_modify_add(
             .block(repository.clone(), NodeBlock::index(change.to.mapping.node))
             .await
             .forward::<SyncError>("Failed deserializing state node block")?;
-        let node = block.node(Node::index(change.to.mapping.node));
+        let mut node = block.node(Node::index(change.to.mapping.node));
+        node.mode = change.to.mode;
 
         if node.is_file() {
             stats.discovery.total_files.fetch_add(1, Ordering::Relaxed);
@@ -1665,10 +2208,9 @@ async fn sync_execute_modify_add(
 
 /// Record a link node the change just staged in the staged state's link registry.
 ///
-/// Only a link the registry has never seen gets an entry. One already there is
-/// owned by [`stage_link_pin`](crate::link::stage_link_pin) and
-/// [`update_link_pin_by_node`](crate::link::update_link_pin_by_node).
-async fn stage_link_registry_entry(
+/// A link the registry has never seen gets an entry, and one whose row names another pin is
+/// brought to the node's, the row being what every later link operation reads the pin from.
+pub(crate) async fn stage_link_registry_entry(
     repository: &Arc<RepositoryContext>,
     state_stage: &Arc<State>,
     change: &NodeChange,
@@ -1677,11 +2219,23 @@ async fn stage_link_registry_entry(
 ) -> Result<(), SyncError> {
     let link_id: RepositoryId = node.address.context.into();
 
-    if state_stage
+    let replaced: RepositoryId = change.from.address.context.into();
+    if change.from.is_link() && replaced != link_id {
+        lore_debug!(
+            "Link at {} moves from repository {replaced} to {link_id}",
+            change.path()
+        );
+        state_stage
+            .link_remove(repository.clone(), replaced, staged_node)
+            .await
+            .ok();
+    }
+
+    let existing = state_stage
         .link_find(repository.clone(), link_id, staged_node)
         .await
-        .is_ok()
-    {
+        .ok();
+    if existing.is_some_and(|reference| reference.signature == node.address.hash) {
         lore_trace!(
             "Link {link_id} at {} is already in the registry",
             change.path()
@@ -1689,7 +2243,7 @@ async fn stage_link_registry_entry(
         return Ok(());
     }
 
-    let (branch, flags) = match change
+    let incoming = change
         .to
         .mapping
         .state
@@ -1698,8 +2252,35 @@ async fn stage_link_registry_entry(
             link_id,
             change.to.mapping.node,
         )
-        .await
-    {
+        .await;
+
+    if let Some(existing) = existing {
+        let branch = incoming
+            .as_ref()
+            .map_or(existing.branch, |reference| reference.branch);
+        lore_debug!(
+            "Moving link {link_id} at {} to revision {} branch {branch}",
+            change.path(),
+            node.address.hash
+        );
+        return state_stage
+            .link_update(
+                repository.clone(),
+                link_id,
+                branch,
+                node.address.hash,
+                staged_node,
+            )
+            .await
+            .forward_with::<SyncError, _>(|| {
+                format!(
+                    "Failed to update link {link_id} at {} in the link registry",
+                    change.path()
+                )
+            });
+    }
+
+    let (branch, flags) = match incoming {
         Ok(reference) => (
             reference.branch,
             LinkFlags::from_bits_retain(reference.flags),
@@ -1737,42 +2318,32 @@ async fn stage_link_registry_entry(
         })
 }
 
-/// Drop a deleted link node's [`LinkReference`](crate::state::LinkReference)
-/// from the staged state's link registry.
-async fn remove_link_registry_entry(
-    repository: &Arc<RepositoryContext>,
-    state_stage: &Arc<State>,
-    link_id: RepositoryId,
-    node_id: NodeID,
-) -> Result<(), SyncError> {
-    match state_stage
-        .link_remove(repository.clone(), link_id, node_id)
-        .await
-    {
-        Ok(()) => {
-            lore_debug!("Removed link {link_id} node {node_id} from the link registry");
-            Ok(())
-        }
-        Err(err) if err.is_link_not_found() => Ok(()),
-        Err(err) => Err(err).forward::<SyncError>("Failed to remove link from the link registry"),
-    }
+/// Whether `change` leaves its file in place with the content it held, and `measured`, the node an
+/// unmodified working file matches, holds that content: the working file then needs only the
+/// change's executable bit. A move is left out, as realizing it renames the file and can remove
+/// what stands at its destination.
+fn holds_the_content(change: &NodeChange, measured: Option<&MeasuredNode>) -> bool {
+    change.action == change::FileAction::Keep
+        && change.from.address.hash == change.to.address.hash
+        && measured.is_some_and(|measured| measured.node.address.hash == change.to.address.hash)
 }
 
-/// Whether the rename a move was realized by left the destination holding the content it should, so
-/// that writing it from the immutable store would replace it with the same bytes.
+/// Whether the destination holds the content the change ends at, so that writing it from the
+/// immutable store would replace it with the same bytes: where the verify found the file holding
+/// it ([`change::Flags::HoldsContent`]), or where the rename a move was realized by carried it.
 ///
-/// Two things have to hold. `renamed` reports a rename that completed, which is what says the source
-/// was there to be carried: a sparse working tree holds nothing at a source its view excludes, and a
-/// tree the move has already been applied to holds nothing at it either. And the two sides address
-/// the same content, since a move that rewrites the file carries the old bytes to the destination and
-/// the new ones are only in the store.
+/// For the rename, two things have to hold. `renamed` reports a rename that completed, which is
+/// what says the source was there to be carried: a sparse working tree holds nothing at a source
+/// its view excludes, and a tree the move has already been applied to holds nothing at it either.
+/// And the two sides address the same content, since a move that rewrites the file carries the old
+/// bytes to the destination and the new ones are only in the store.
 ///
 /// The rename answers the first for itself, so nothing here infers from a view whether the file was
 /// on disk. A view could not answer it: the source is materialized under the view the tree is carried
 /// *from* while realize holds the one it is carried *to*, and neither tells a source that was never
 /// materialized from one an earlier pass already carried away.
-fn rename_carried_the_content(change: &NodeChange, renamed: bool) -> bool {
-    renamed && change.from.address.hash == change.to.address.hash
+fn content_is_in_place(change: &NodeChange, renamed: bool) -> bool {
+    (renamed && change.from.address.hash == change.to.address.hash) || change.flags.holds_content()
 }
 
 /// `node` with the executable bit the working file carries, where [`change::Flags::LocalMode`]
@@ -1803,8 +2374,141 @@ async fn node_with_a_local_mode(
     Ok(node)
 }
 
+/// Rewrites a mount whose link node moved to another subtree of the repository it points at.
+///
+/// The diff reports such a move as the link node alone, so the content the mount exposes has to be
+/// carried here.
+async fn realize_moved_mount(
+    operation: &Arc<InstanceOperationImpl>,
+    change: &NodeChange,
+    node: Node,
+) -> Result<(), SyncError> {
+    if !change.from.is_link() {
+        return Ok(());
+    }
+
+    let repository = change.to.mapping.repository.clone();
+    // Another repository's subtree shares nothing with the one it replaces, so it is cloned afresh.
+    if change.from.address.context != node.address.context {
+        let path = change.path();
+        operation
+            .remove_recursive(path)
+            .await
+            .forward::<SyncError>("Failed removing the subtree the link exposed")?;
+        operation
+            .create_dir_all(path)
+            .await
+            .forward::<SyncError>("Failed recreating the link directory")?;
+        return Box::pin(clone_added_link(&repository, operation, &node, path)).await;
+    }
+
+    let from_node = change
+        .from
+        .mapping
+        .state
+        .node(repository.clone(), change.from.mapping.node)
+        .await
+        .forward::<SyncError>("Failed reading the link node the mount stands at")?;
+    if from_node.mounts_same_source(&node) && change.from.address == node.address {
+        return Ok(());
+    }
+
+    let link_context = repository
+        .to_link_context(node.address.context.into())
+        .await;
+    realize_link_pin_change_boxed(
+        operation,
+        repository,
+        link_context,
+        crate::link::LinkPinRealizeTarget {
+            link_path: change.path().clone(),
+            old_signature: change.from.address.hash,
+            new_signature: node.address.hash,
+            current_node: from_node.child,
+            mount_source: crate::link::LinkMountSource::Node(node.child),
+        },
+    )
+    .await
+    .forward::<SyncError>("Failed realizing the subtree a link exposes")
+}
+
+/// [`realize_link_pin_change_in_operation`](crate::link::realize_link_pin_change_in_operation) for
+/// a moved mount, the cold path. Boxed with an explicit `Send`, since that realize reaches
+/// [`realize_moved_mount`] again.
+fn realize_link_pin_change_boxed(
+    operation: &Arc<InstanceOperationImpl>,
+    repository: Arc<RepositoryContext>,
+    link_context: Arc<RepositoryContext>,
+    target: crate::link::LinkPinRealizeTarget,
+) -> std::pin::Pin<Box<dyn Future<Output = Result<(), crate::link::LinkError>> + Send + '_>> {
+    Box::pin(crate::link::realize_link_pin_change_in_operation(
+        operation,
+        repository,
+        link_context,
+        target,
+        false,
+    ))
+}
+
+/// Recovers from the refusal of a move's rename, `refused`: removes what `to` holds, for the node
+/// to be written there, unless `to` names the entry `from` does, as another spelling of its name
+/// does on a file system that folds case, or cannot be told apart from it. Such a move leaves the
+/// source where it stands, the node being written over the destination as it is, and is counted in
+/// `kept` for the warning the realize ends with.
+async fn recover_refused_move(
+    operation: &InstanceOperationImpl,
+    from: &RelativePath,
+    to: &RelativePath,
+    refused: FsError,
+    kept: &KeptMoves,
+) -> Result<(), SyncError> {
+    let identity = operation.names_one_entry(from, to).await;
+    if matches!(identity, Ok(Some(false) | None)) {
+        lore_trace!("Failed renaming move node, fall back to deleting and recreating: {refused}");
+        return operation
+            .remove_recursive(to)
+            .await
+            .forward::<SyncError>("removing the destination of a refused move");
+    }
+    kept.count.fetch_add(1, Ordering::Relaxed);
+    kept.first.get_or_init(|| {
+        let reason = match identity {
+            Err(err) => {
+                format!(
+                    "{refused}, and the destination cannot be told apart from the source: {err}"
+                )
+            }
+            Ok(_) => refused.to_string(),
+        };
+        KeptMove {
+            from: from.clone(),
+            to: to.clone(),
+            reason,
+        }
+    });
+    Ok(())
+}
+
+/// Warns once for the moves a realize carried out without their rename, `kept`, with how many and
+/// the first, which the realize reports nothing else of.
+fn report_kept_moves(kept: &KeptMoves) {
+    if let Some(KeptMove { from, to, reason }) = kept.first.get() {
+        let count = kept.count.load(Ordering::Relaxed);
+        lore_warn!(
+            "The file system refused the rename of {count} {}, which leaves the source in place; \
+             the first is {from} to {to}: {reason}",
+            if count == 1 { "move" } else { "moves" }
+        );
+    }
+}
+
 /// Realizes on disk a node a change adds, modifies or moves, and stages it in `state_stage` when
 /// given.
+///
+/// A move whose rename fails is realized as [`recover_refused_move`] describes. A move is staged
+/// by moving the node the staged tree holds, which keeps the bit that node held, so a moved file
+/// is given the change's bit ([`carry_staged_mode`]): a commit records the staged bit where it
+/// reads none from the working tree.
 ///
 /// Cloning an added link and recording a staged link in the registry are boxed. Only a link
 /// reaches them, and inline they would make the future of every change realized as large as
@@ -1833,9 +2537,10 @@ fn realize_change_modify_add(
         let path = change.path();
 
         // Only on-disk work honours the view. This gates directory creation, link
-        // cloning and the file write. The move rename below is not gated, because
+        // cloning and the file write. A directory the view excludes is created by
+        // the first write below it. The move rename below is not gated, because
         // it repositions a path an earlier in-view realize may have written.
-        let write_to_disk = !view_filter.excludes_tree(path, node.is_directory(), FilterMode::View);
+        let write_to_disk = !view_filter.excludes(path, node.is_directory(), FilterMode::View);
 
         lore_trace!(
             "{}{} {}",
@@ -1859,15 +2564,20 @@ fn realize_change_modify_add(
             && change.action == change::FileAction::Move
             && let Some(from_path) = change.move_source()
         {
-            let renamed = operation.rename(from_path, &to_path).await.is_ok();
-            if !renamed {
-                lore_trace!("Failed renaming move node, fall back to deleting and recreating");
-                operation
-                    .remove_recursive(&to_path)
-                    .await
-                    .forward::<SyncError>("Failed to realize move/rename")?;
+            match operation.rename(from_path, &to_path).await {
+                Ok(()) => true,
+                Err(refused) => {
+                    recover_refused_move(
+                        &operation,
+                        from_path,
+                        &to_path,
+                        refused,
+                        &stats.kept_moves,
+                    )
+                    .await?;
+                    false
+                }
             }
-            renamed
         } else {
             false
         };
@@ -1889,9 +2599,11 @@ fn realize_change_modify_add(
             // for add. That's why we can just clone the linked files
             if node.is_link() && change.action == change::FileAction::Add {
                 Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
+            } else if node.is_link() && !dry_run {
+                realize_moved_mount(&operation, &change, node).await?;
             }
         } else if node.is_file() && !dry_run && write_to_disk {
-            if rename_carried_the_content(&change, renamed) {
+            if content_is_in_place(&change, renamed) {
                 if !change.flags.is_local_mode() {
                     carry_file_mode(&operation, path, change.from.mode, realized.mode).await?;
                 }
@@ -1913,11 +2625,34 @@ fn realize_change_modify_add(
             if change.action == change::FileAction::Move
                 && let Some(from_path) = change.move_source()
             {
-                relink_moved_node(&state_stage, &repository, &change, from_path, is_merge).await?;
+                let from_node = state_stage
+                    .find_node_link(repository.clone(), from_path.as_str())
+                    .await
+                    .forward::<SyncError>("Failed to stage change")?
+                    .node;
+                relink_moved_node(
+                    &state_stage,
+                    &repository,
+                    from_path,
+                    from_node,
+                    path,
+                    is_merge,
+                )
+                .await?;
+                if node.is_file() {
+                    carry_staged_mode(&state_stage, &repository, from_node, node.mode)
+                        .await
+                        .forward::<SyncError>("Failed to stage change")?;
+                }
             } else {
                 let mut node = node;
                 if is_merge {
                     node.flags |= NodeFlags::StagedMerge;
+                    // A directory the incoming side adds is staged as an add, including one
+                    // that already stands in the staged tree as the parent of an add below it.
+                    if change.action == change::FileAction::Add && node.is_directory() {
+                        node.flags |= NodeFlags::StagedAdd;
+                    }
                 }
                 if change.action == change::FileAction::Move {
                     node.flags &= !NodeFlags::StagedAdd;
@@ -1999,156 +2734,82 @@ async fn clone_added_link(
     .forward::<SyncError>("Failed to sync link")
 }
 
-/// Stages a realized move by relinking the node at `from_path` under the path the change moves
-/// it to, keeping its identity, and marks it staged as a move.
+/// Stages a realized move by relinking `from_node`, the staged node at `from_path`, to `to_path`,
+/// keeping its identity; marks it staged as a move and stages the directory it left. Answers with
+/// the node's new parent.
 ///
 /// A function of its own because its locals live across several awaits: kept in
 /// [`realize_change_modify_add`] they would take space in the future of every change realized.
-async fn relink_moved_node(
+#[lore_macro::test_pub]
+pub(crate) async fn relink_moved_node(
     state_stage: &Arc<State>,
     repository: &Arc<RepositoryContext>,
-    change: &NodeChange,
     from_path: &RelativePath,
+    from_node: NodeID,
+    to_path: &RelativePath,
     is_merge: bool,
-) -> Result<(), SyncError> {
-    // For move actions, relink the existing node instead of creating a new one to preserve node identity and from_path tracking.
-    // Find the node at the original path in the staged state
-    let from_node_link = state_stage
-        .find_node_link(repository.clone(), from_path.as_str())
+) -> Result<NodeID, SyncError> {
+    let new_parent_id = state_stage
+        .find_node_link(repository.clone(), to_path.parent().unwrap_or(""))
         .await
-        .forward::<SyncError>("Failed to stage change")?;
-    let block_index = NodeBlock::index(from_node_link.node);
-    let node_index = Node::index(from_node_link.node);
-    let block = state_stage
-        .block(repository.clone(), block_index)
-        .await
-        .forward::<SyncError>("Failed deserializing state node block")?;
-    let mut from_node = block.node(node_index);
+        .forward::<SyncError>("Failed to stage change")?
+        .node;
 
-    // Determine the new parent node
-    let mut parent_path = change.path().clone();
-    parent_path.pop();
-    let new_parent_node_link = state_stage
-        .find_node_link(repository.clone(), parent_path.as_str())
-        .await
-        .forward::<SyncError>("Failed to stage change")?;
-    let new_parent_id = new_parent_node_link.node;
-
-    // Unlink the node from its current parent
-    if from_node.parent != new_parent_id {
-        let old_parent_block_index = NodeBlock::index(from_node.parent);
-        let old_parent_node_index = Node::index(from_node.parent);
-        let old_parent_block = state_stage
-            .block(repository.clone(), old_parent_block_index)
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        let old_parent_node = old_parent_block.node(old_parent_node_index);
-
-        if old_parent_node.child == from_node_link.node {
-            let dirtied = {
-                let mut block = old_parent_block.write();
-                block.node(old_parent_node_index).child = from_node.sibling;
-                block.mark_dirty()
-            };
-            if dirtied {
-                state_stage.block_modified(old_parent_block, old_parent_block_index);
-                state_stage.mark_dirty();
-            }
-        } else {
-            let old_parent_id = from_node.parent;
-            let mut child_id = old_parent_node.child().unwrap_or_default();
-            let mut cycle = SiblingCycleGuard::new(old_parent_id);
-            while let Some(sibling) = {
-                let child = state_stage
-                    .node(repository.clone(), child_id)
-                    .await
-                    .forward::<SyncError>("Failed deserializing state node block")?;
-                child
-                    .walk_step(child_id, old_parent_id, &mut cycle)
-                    .forward::<SyncError>("Invalid node hierarchy in revision state")?;
-                child.sibling()
-            } {
-                if sibling == from_node_link.node {
-                    let child_block_index = NodeBlock::index(child_id);
-                    let child_node_index = Node::index(child_id);
-                    let child_block = state_stage
-                        .block(repository.clone(), child_block_index)
-                        .await
-                        .forward::<SyncError>("Failed deserializing state node block")?;
-                    let dirtied = {
-                        let mut block = child_block.write();
-                        block.node(child_node_index).sibling = from_node.sibling;
-                        block.mark_dirty()
-                    };
-                    if dirtied {
-                        state_stage.block_modified(child_block, child_block_index);
-                        state_stage.mark_dirty();
-                    }
-                    break;
-                }
-                child_id = sibling;
-            }
-        }
-
-        // Relink the same node to the new parent under the new path
-        let new_parent_block_index = NodeBlock::index(new_parent_id);
-        let new_parent_node_index = Node::index(new_parent_id);
-        let new_parent_block = state_stage
-            .block(repository.clone(), new_parent_block_index)
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        let sibling_node_id;
-        let dirtied = {
-            let mut block = new_parent_block.write();
-            let parent_node = block.node(new_parent_node_index);
-            sibling_node_id = parent_node.child;
-            parent_node.child = from_node_link.node;
-            block.mark_dirty()
-        };
-        if dirtied {
-            state_stage.block_modified(new_parent_block, new_parent_block_index);
-            state_stage.mark_dirty();
-        }
-        from_node.sibling = sibling_node_id;
-        from_node.parent = new_parent_id;
-    }
-
-    // Update node name if changed
     let from_name = from_path.name();
-    let to_name = change.path().name();
-    if from_name != to_name {
-        block
-            .deserialize_nametable(repository.clone())
-            .await
-            .forward::<SyncError>("Failed deserializing state node block")?;
-        from_node.name_hash = hash::hash_string(to_name);
-        (from_node.name_offset, from_node.name_length) = block
-            .write()
-            .node_name_store(to_name, from_node.name_offset, from_node.name_length)
-            .forward::<SyncError>("Failed to store node name")?;
-    }
-
-    // Write back updated node data
-    let dirtied = {
-        let mut block = block.write();
-        *block.node(node_index) = from_node;
-        block.mark_dirty()
+    let to_name = to_path.name();
+    let name = if from_name != to_name {
+        NameChange::Rename(to_name)
+    } else {
+        NameChange::Keep
     };
-    if dirtied {
-        state_stage.block_modified(block, block_index);
-        state_stage.mark_dirty();
-    }
-
-    // Mark the node with StagedMove and StagedMerge flags
     let mut mark_flags = NodeFlags::StagedMove;
     if is_merge {
         mark_flags |= NodeFlags::StagedMerge;
     }
+    let own = Mark::staged(mark_flags, true);
+    let left = state_stage
+        .node_move(repository.clone(), from_node, new_parent_id, name, own)
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
     state_stage
-        .node_mark(repository.clone(), from_node_link.node, mark_flags, true)
+        .node_mark_destination(repository, new_parent_id, own)
+        .await
+        .forward::<SyncError>("Failed to stage change")?;
+    state_stage
+        .node_mark_left(
+            repository,
+            (left, new_parent_id),
+            Mark::staged(NodeFlags::Staged, false),
+        )
         .await
         .forward::<SyncError>("Failed to stage change")?;
 
+    Ok(new_parent_id)
+}
+
+/// Gives the staged file `node_id` the executable bit `mode`, where it holds another.
+pub(crate) async fn carry_staged_mode(
+    state_stage: &State,
+    repository: &Arc<RepositoryContext>,
+    node_id: NodeID,
+    mode: u16,
+) -> Result<(), state::StateError> {
+    let staged = state_stage.node(repository.clone(), node_id).await?;
+    if !util::fs::mode_changed(staged.mode, mode) {
+        return Ok(());
+    }
+    state_stage
+        .node_rewrite(
+            repository,
+            node_id,
+            &state::Content {
+                mode,
+                size: staged.size,
+                address: staged.address,
+            },
+            state::Rewrite::Plain,
+        )
+        .await?;
     Ok(())
 }
 
@@ -2217,7 +2878,9 @@ async fn realize_changes_merge(
     Ok(())
 }
 
-/// Merges the file of the pair of changes at `index` in `merges`, which both sides changed.
+/// Merges the file of the pair of changes at `index` in `merges`, which both sides changed, giving a
+/// file both leave the executable bit [`change::merged_mode`] gives it, whatever the content's
+/// merge leaves.
 ///
 /// Takes the shared list and an index rather than the pair, so that the task holds an `Arc` in place
 /// of two changes. Not an `async fn`, which would hold a second copy of its arguments.
@@ -2272,6 +2935,9 @@ fn realize_file_merge(
                 )
                 .await?;
                 conflict = !resolved;
+                if !dry_run && let Some(mode) = change::merged_mode(change_from, change_to) {
+                    carry_file_mode(&operation, change_to.path(), change_to.to.mode, mode).await?;
+                }
             }
 
             if let Some(state_stage) = &state_stage {
@@ -2463,8 +3129,10 @@ async fn merge_file_in_view(
         // the mergeable files from unresolvable conflicts
         let absolute_path = change_from
             .path()
-            .to_absolute_path(repository.require_path()?);
-        if has_theirs && operation.infer_is_diffable(change_to.path()).await? {
+            .to_absolute_path(repository.require_path()?)
+            .forward::<SyncError>("placing the merged file below the root")?;
+        let mine_is_file = change_to.to.flags.contains(NodeFlags::File);
+        if has_theirs && mine_is_file && operation.infer_is_diffable(change_to.path()).await? {
             lore_trace!(
                 "Merge identified text file for merge: {}",
                 absolute_path.display()
@@ -2597,8 +3265,13 @@ async fn merge_file_in_view(
 }
 
 /// Stages the node a file both sides changed at the same path resolves to, flagged with how its
-/// merge left it, and records a conflict on `state_stage` where one is left. Removes the file where
-/// the conflict deletes it. Returns the node's size.
+/// merge left it and with the executable bit [`change::merged_mode`] gives it, and records a
+/// conflict on `state_stage` where one is left. Removes the file where the conflict deletes it.
+/// Returns the node's size.
+///
+/// A deletion at a path this branch lacks is staged as an add taken back: the node is added
+/// staged for deletion, carrying `StagedAdd` beside `StagedDelete`, so that staging the file the
+/// working tree holds there restores the add.
 ///
 /// A function of its own, so that the node is not reserved in the states of the other cases of
 /// [`realize_file_merge`].
@@ -2653,6 +3326,13 @@ async fn stage_merged_file(
         return Err(SyncError::internal("Invalid change data"));
     };
     let size = node.size;
+    if let Some(mode) = change::merged_mode(change_from, change_to) {
+        node.mode = mode;
+    }
+    node.flags = NodeFlags::from_bits_truncate(node.flags)
+        .bitand(NodeFlags::File | NodeFlags::Link)
+        .bits();
+
     if take_theirs && !change_from.to.mapping.node.is_valid_node_id() {
         // The incoming side deleted the path, so adopting it deletes.
         node.flags |= NodeFlags::StagedDelete;
@@ -2660,11 +3340,9 @@ async fn stage_merged_file(
         node.flags |= NodeFlags::StagedDelete;
 
         operation.remove(change_to.path()).await?;
+    } else if change_to.action == change::FileAction::Move {
+        node.flags |= NodeFlags::StagedMove;
     }
-
-    node.flags = NodeFlags::from_bits_truncate(node.flags)
-        .bitand(NodeFlags::File | NodeFlags::Link)
-        .bits();
 
     node.flags |= NodeFlags::StagedMerge;
     if take_theirs {
@@ -2675,10 +3353,6 @@ async fn stage_merged_file(
     }
     if resolved {
         node.flags |= NodeFlags::StagedMergeResolved;
-    }
-    if change_to.action == change::FileAction::Move {
-        node.flags &= !NodeFlags::StagedAdd;
-        node.flags |= NodeFlags::StagedMove;
     }
 
     lore_trace!(

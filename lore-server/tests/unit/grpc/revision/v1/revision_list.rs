@@ -20,8 +20,11 @@ use lore_revision::repository::RepositoryContext;
 use lore_revision::state::State;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::grpc::revision::v1::revision_list::*;
 use lore_server::grpc::revision::v1::service::RevisionListInstruments;
+use lore_storage::FlushOptions;
 use lore_storage::StoreError;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -138,6 +141,7 @@ async fn create_branch_with_history(
             false,
             DEFAULT_HISTORY_STEP_SIZE,
             lore_server::grpc::server::RevisionListAcceleration::default(),
+            &mut PushReport::new(PushHandler::Legacy, Default::default()),
         )
         .await
         .expect("push revision")
@@ -211,6 +215,7 @@ async fn push_chained_revision(
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("push revision");
@@ -2289,8 +2294,8 @@ impl lore_storage::MutableStore for FailingMutableStore {
         self.inner.clone().list(partition, key_type).await
     }
 
-    async fn flush(self: Arc<Self>, sync_data: bool) -> Result<(), lore_storage::StoreError> {
-        self.inner.clone().flush(sync_data).await
+    async fn flush(self: Arc<Self>, options: FlushOptions) -> Result<(), lore_storage::StoreError> {
+        self.inner.clone().flush(options).await
     }
 }
 

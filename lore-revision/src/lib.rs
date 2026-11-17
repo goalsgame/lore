@@ -52,6 +52,7 @@ pub mod path;
 pub mod progress;
 pub mod proto;
 pub mod protocol;
+pub mod records;
 pub mod relay;
 pub mod repository;
 pub mod revision;
@@ -60,6 +61,8 @@ pub mod service_state;
 pub mod stage;
 pub mod state;
 pub mod store;
+#[cfg(feature = "test-util")]
+pub mod test_util;
 pub mod util;
 
 #[cfg(all(target_family = "windows", feature = "vfs"))]

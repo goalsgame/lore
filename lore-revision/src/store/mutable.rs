@@ -127,7 +127,6 @@ async fn migrate_initial_to_typed(
             layout: tokio::sync::RwLock::new(()),
             writes: Arc::default(),
             flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
-            flush_now: Arc::default(),
             scheduled: AtomicBool::new(false),
         }));
     }
@@ -180,7 +179,6 @@ async fn migrate_initial_to_typed(
             layout: tokio::sync::RwLock::new(()),
             writes: Arc::default(),
             flush: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
-            flush_now: Arc::default(),
             scheduled: AtomicBool::new(false),
         }));
     }
@@ -219,7 +217,7 @@ async fn migrate_initial_to_typed(
                 &store_path,
                 group_index,
                 bucket_index,
-                true,
+                lore_storage::FlushOptions::SYNC_DATA,
             )
             .await
             .forward::<MutableStoreError>("serialize failed")?;

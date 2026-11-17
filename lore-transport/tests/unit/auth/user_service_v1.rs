@@ -1,17 +1,10 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 
 use lore_base::types::RepositoryId;
-use lore_proto::lore::user::v1::PartitionAddRequest;
-use lore_proto::lore::user::v1::PartitionAddResponse;
-use lore_proto::lore::user::v1::PartitionListRequest;
-use lore_proto::lore::user::v1::PartitionListResponse;
-use lore_proto::lore::user::v1::PartitionRemoveRequest;
-use lore_proto::lore::user::v1::PartitionRemoveResponse;
 use lore_proto::lore::user::v1::User;
 use lore_proto::lore::user::v1::UserFindRequest;
 use lore_proto::lore::user::v1::UserFindResponse;
@@ -22,7 +15,7 @@ use lore_proto::lore::user::v1::user_service_server::UserService as Service;
 use lore_proto::lore::user::v1::user_service_server::UserServiceServer;
 use lore_transport::auth::user_service_v1::UserServiceV1;
 use lore_transport::traits::UserService;
-use tokio_stream::wrappers::TcpListenerStream;
+use tonic::service::Routes;
 
 /// `(id, display_name, username)`. Two users share the display name Sam.
 const USERS: [(&str, &str, &str); 4] = [
@@ -72,44 +65,15 @@ impl Service for Directory {
         };
         Ok(tonic::Response::new(UserFindResponse { user }))
     }
-
-    type PartitionListStream = tokio_stream::Empty<Result<PartitionListResponse, tonic::Status>>;
-
-    async fn partition_list(
-        &self,
-        _request: tonic::Request<PartitionListRequest>,
-    ) -> Result<tonic::Response<Self::PartitionListStream>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
-    }
-
-    async fn partition_add(
-        &self,
-        _request: tonic::Request<PartitionAddRequest>,
-    ) -> Result<tonic::Response<PartitionAddResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
-    }
-
-    async fn partition_remove(
-        &self,
-        _request: tonic::Request<PartitionRemoveRequest>,
-    ) -> Result<tonic::Response<PartitionRemoveResponse>, tonic::Status> {
-        Err(tonic::Status::unimplemented("not under test"))
-    }
 }
 
 async fn serve() -> (String, Arc<Directory>) {
     let directory = Arc::new(Directory {
         finds: AtomicUsize::new(0),
     });
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let address: SocketAddr = listener.local_addr().unwrap();
-    let service = directory.clone();
-    lore_base::lore_spawn!(async move {
-        tonic::transport::Server::builder()
-            .add_service(UserServiceServer::from_arc(service))
-            .serve_with_incoming(TcpListenerStream::new(listener))
-            .await
-    });
+    let address =
+        crate::grpc::serve_on_loopback(Routes::new(UserServiceServer::from_arc(directory.clone())))
+            .await;
     (format!("http://{address}"), directory)
 }
 

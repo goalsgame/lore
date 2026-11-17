@@ -45,6 +45,9 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * [`lore repository instance`↴](#lore-repository-instance)
 * [`lore repository instance list`↴](#lore-repository-instance-list)
 * [`lore repository instance prune`↴](#lore-repository-instance-prune)
+* [`lore repository instance delete`↴](#lore-repository-instance-delete)
+* [`lore repository instance move`↴](#lore-repository-instance-move)
+* [`lore repository instance clone`↴](#lore-repository-instance-clone)
 * [`lore repository config`↴](#lore-repository-config)
 * [`lore repository config get`↴](#lore-repository-config-get)
 * [`lore repository update-path`↴](#lore-repository-update-path)
@@ -234,7 +237,8 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--access-token <token>` — Use given authorization token instead of exchanging one with the authentication service.
   Read from `LORE_ACCESS_TOKEN` when omitted. Unsafe: a value given here is visible to other users in the process table
   and is kept in the shell history
-* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10)
+* `--max-connections <MAX_CONNECTIONS>` — Set the number of parallel storage connections (default 1, at most 10; always
+  1 when `LORE_UDS_SOCKET` names a socket)
 * `--file-count-limit <count>` — Set maximum number of parallel files opened
 * `--file-size-limit <size>` — Set maximum total size in bytes of parallel files opened
 * `--compress-limit <count>` — Set maximum number of parallel compress operations
@@ -243,6 +247,10 @@ renders as a trailing separator, which the whitespace hook rejects — write the
 * `--no-gc` — Prevent automatic incremental garbage collection for this command; it otherwise runs in the background on
   writes. `lore repository gc` always runs a full pass regardless
 * `--sync-data` — Force sync data to storage media during flush
+* `--fast-flush` — Have the command's flushes write the local stores' index in place rather than replacing each of its
+  files through a temporary file. Faster where creating files is slow, but if the process stops or a write fails while a
+  file is being written, the store drops every entry that file held, including those of revisions and branches not yet
+  pushed
 * `--cache` — Cache fragment payloads fetched from remote in the local store
 * `--trust-remote` — Trust the remote as part of this machine's infrastructure: data fetched from it is not hash
   verified. For machines where performance comes first, such as a build server streaming from a server in its own
@@ -347,7 +355,7 @@ Create a repository in the given directory
 
 * `--description <description>` — Optional description of repository
 * `--id <id>` — Optional ID of repository
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -357,9 +365,11 @@ Create a repository in the given directory
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 
 ## `lore repository clone`
@@ -368,8 +378,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore repository clone [OPTIONS] <url> [path]`
 
@@ -386,7 +396,7 @@ writes no files and reads them from the remote when a command needs them.
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -396,15 +406,18 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
+  A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -571,9 +584,20 @@ Instance management
 ###### **Subcommands:**
 
 * `list` — List all registered instances for this repository
-* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now
+* `prune` — Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now
   hold a different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when
   it is not mounted
+* `delete` — Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and
+  delete associated directories
+* `move` — Move the current instance to a new path
+* `clone` — Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged
+  state. The clone shares the instance's data blocks, and is refused where the destination's filesystem or volume
+  cannot share them unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and
+  the path must not be inside another instance. While the clone runs, commands on the instance, and commands from
+  other processes on every instance over the store, wait for it where they open the store. An instance delete waits
+  too, since it opens the store to deregister the instance before it removes any file. An instance move renames the
+  instance before it opens the store, so a move makes the clone fail, or on Windows is refused while the clone lists
+  one of its directories
 
 ## `lore repository instance list`
 
@@ -583,11 +607,50 @@ List all registered instances for this repository
 
 ## `lore repository instance prune`
 
-Remove stale instance entries: paths that no longer exist, paths that hold no checkout, and paths that now hold a
+Remove stale instance entries: paths that no longer exist, paths that hold no revision, and paths that now hold a
 different instance. An SWFS instance is kept while its `.lore` remains in the global data directory, even when it is not
 mounted
 
 **Usage:** `lore repository instance prune`
+
+## `lore repository instance delete`
+
+Delete the current instance: unmount (if SWFS or a virtual clone), deregister from mutable store, and delete associated
+directories
+
+**Usage:** `lore repository instance delete`
+
+## `lore repository instance move`
+
+Move the current instance to a new path
+
+**Usage:** `lore repository instance move <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Target path to move the instance to
+
+## `lore repository instance clone`
+
+Clone the current instance to a new path as an instance of its own, on the same revision, branch and staged state. The
+clone shares the instance's data blocks, and is refused where the destination's filesystem or volume cannot share them
+unless --allow-copy is given. The instance must use a shared store and not be a virtual clone, and the path must not be
+inside another instance. While the clone runs, commands on the instance, and commands from other processes on every
+instance over the store, wait for it where they open the store. An instance delete waits too, since it opens the store
+to deregister the instance before it removes any file. An instance move renames the instance before it opens the
+store, so a move makes the clone fail, or on Windows is refused while the clone lists one of its directories
+
+**Usage:** `lore repository instance clone [OPTIONS] <target-path>`
+
+###### **Arguments:**
+
+* `<target-path>` — Path to create the clone at; it must not exist, and must be on the instance's volume for the clone
+  to share its data blocks
+
+###### **Options:**
+
+* `--allow-copy` — Copy the instance's files where the clone cannot share their data blocks, rather than refusing. A
+  copy takes as long as writing every file, and commands wait for it as they wait for every clone
 
 ## `lore repository config`
 
@@ -1111,7 +1174,7 @@ Synchronize to a given state of a repository
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -1457,7 +1520,7 @@ File commands
 
 * `info` — Get info about the given file or directory
 * `metadata` — Manage metadata of a given file or directory
-* `dependency` — Manage file dependencies
+* `dependency` — Manage file dependencies of files outside links
 * `stage` — Stage changes for commit
 * `dirty` — Mark files as dirty so they show up in `lore status` and get picked up by directory-scoped `lore stage` (no
   content is read or staged)
@@ -1541,7 +1604,7 @@ Set metadata on for a staged file
 
 ## `lore file dependency`
 
-Manage file dependencies
+Manage file dependencies of files outside links
 
 **Usage:** `lore file dependency <COMMAND>`
 
@@ -1747,7 +1810,9 @@ Reset changes to a path or file to the current revision, discarding your local c
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -1902,6 +1967,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore auth info`
 
@@ -2034,6 +2100,7 @@ Authenticate the CLI
 * `--auth-url <AUTH_URL>` — Auth service URL with scheme (e.g. `ucs-auth://auth.example.com`). Required when logging in
   with `--token` outside a repository without a remote-url
 * `--no-browser` — Avoid opening a browser to login
+* `--reuse-session` — Keep the stored login instead of logging in again while its session is valid
 
 ## `lore link`
 
@@ -2156,8 +2223,8 @@ Clone a remote repository into the given path
 
 A clone needs the remote, so `--offline` does not keep it from connecting: it prepares the clone for working offline
 instead. With it, as with `--cache`, a clone that writes its files caches every file metadata block of the cloned
-revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare clone
-writes no files and reads them from the remote when a command needs them.
+revision, which staging and committing write to, so both work without the remote, and fails if it cannot. A bare or
+virtual clone writes no files and reads them from the remote when a command needs them.
 
 **Usage:** `lore clone [OPTIONS] <url> [path]`
 
@@ -2174,7 +2241,7 @@ writes no files and reads them from the remote when a command needs them.
 * `--bare` — Clone without files, only fetch latest revision tree
 * `--direct-file-write` — Write directly to the destination file instead of write to a temporary file and move into
   place
-* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory
+* `--vfs <VFS>` — Virtual File System type. When not 'none', creates a VFS as the repository directory, over a shared store as if --use-shared-store were given
 
   Default value: `none`
 
@@ -2184,15 +2251,18 @@ writes no files and reads them from the remote when a command needs them.
     - `default`:
       Use whichever VFS system is preferred based on the user's system
     - `swfs`:
-      Use Epic's Split Write File System as the Virtual File System
+      Use Epic's Split Write File System as the Virtual File System. An SWFS instance keeps its content in the shared
+      store made for its remote, so it needs a reachable remote: it cannot be created offline, or for a repository with
+      no remote
 
 * `--layer <repository>` — Layer to add
 * `--layer-metadata <key>` — Metadata key to link layer revisions with
-* `--prefetch <file>` — File containing list of files to prefetch
-* `--use-shared-store` — Use the shared store rather than create a local immutable store
+* `--prefetch <file>` — Access recording whose paths a virtual clone warms in the background (one path per line, directories ending with `/`)
+* `--use-shared-store` — Use the shared store rather than create a local immutable store. A VFS always does
 * `--shared-store-path <SHARED_STORE_PATH>` — Use this path rather than the system default as the shared store location
 * `--no-tracking` — Clone without local repository tracking (memory-only stores)
-* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies)
+* `--root-file <path>` — Root files for dependency-based selective clone (only clone these files and their dependencies).
+  A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based clone
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based clone
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)
@@ -2344,7 +2414,9 @@ Reset changes to a file or directory
 
 ###### **Options:**
 
-* `--purge` — Delete untracked files
+* `--purge` — Delete every file the revision does not hold within the view: untracked files, whatever the ignore file
+  says, and files the view excludes. Nested repositories stay. With `--force` the view is not applied, and the files it
+  excludes are restored
 * `--targets <file>` — Path to a targets file containing all the paths to all files
 * `--revision <revision>` — Revision to reset files to
 * `--last-merged-from <branch>` — If given, the files will be reset to the last point of merge from this branch, or the
@@ -2432,7 +2504,7 @@ Synchronize to a repository state
 * `--forward-changes` — Fast forward any local changes if syncing to a local revision
 * `--reset` — Reset any local modified files to match the incoming revision
 * `--root-file <path>` — Root files for dependency-based selective sync (only sync changes for these files and their
-  dependencies)
+  dependencies). A root file inside a link is skipped
 * `--dependency-tag <tag>` — Tags to filter dependencies by during dependency-based sync
 * `--dependency-recursive` — Follow transitive dependencies recursively during dependency-based sync
 * `--dependency-depth-limit <depth>` — Maximum dependency traversal depth (0 means unlimited)

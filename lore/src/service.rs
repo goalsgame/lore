@@ -1,17 +1,7 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
-#[cfg(all(unix, not(feature = "test-util")))]
-pub(crate) mod actor;
-#[cfg(all(unix, feature = "test-util"))]
-pub mod actor;
 pub mod initialization;
-#[cfg(unix)]
-pub mod owner;
 pub mod service_main;
-#[cfg(all(unix, not(feature = "test-util")))]
-pub(crate) mod shutdown;
-#[cfg(all(unix, feature = "test-util"))]
-pub mod shutdown;
 pub mod state;
 
 use std::sync::Arc;
@@ -22,10 +12,9 @@ use lore_error_set::prelude::*;
 use lore_macro::LoreArgs;
 use lore_revision::event::LoreServiceMessageEventData;
 use lore_revision::event::LoreServiceStatusEventData;
-use lore_revision::fs::swfs::mount_manager_state::MountManagerState;
+use lore_revision::fs::mount_manager_state::MountManagerState;
 use lore_revision::global::GlobalConfig;
 use lore_revision::interface::LoreGlobalArgs;
-use lore_revision::lore::execution_context;
 use lore_revision::lore_info;
 use lore_revision::lore_warn;
 use lore_revision::service_state::ServiceStateImpl;
@@ -35,14 +24,14 @@ use crate::call::no_repository_call;
 use crate::interface::LoreEvent;
 use crate::interface::LoreEventCallback;
 use crate::interface::LoreString;
-use crate::remote::call::service_call_over;
+use crate::remote::call::run_service_call;
 use crate::remote::service_process::ServiceProcessError;
+use crate::remote::service_process::ServiceStart;
 use crate::remote::service_process::collect_exited_services;
 use crate::remote::service_process::connect_or_spawn_service;
 use crate::remote::service_process::connect_to_running_service;
 use crate::remote::service_process::forget_whether_service_is_in_use;
 use crate::remote::service_process::report_settings_update_that_will_not_relay;
-#[cfg(not(unix))]
 use crate::remote::service_process::request_service_stop;
 use crate::remote::service_process::service_runs_in_this_process;
 use crate::remote::service_process::wait_until_no_service_is_listening;
@@ -56,9 +45,10 @@ pub struct LoreServiceStartArgs {}
 
 /// Start the Lore service process, unless one is already running.
 ///
-/// Connects to the running service, and starts one when nothing is listening.
-/// Succeeds once a service is reachable, whether it was already running or was
-/// started here.
+/// Connects to the running service, and starts one when nothing is listening: from the
+/// executable named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`, else from this
+/// program's own where it runs the service ([`crate::serve_from_this_executable`]). Succeeds
+/// once a service is reachable, whether it was already running or was started here.
 ///
 /// # Events
 ///
@@ -98,9 +88,11 @@ fn start_local(
         // The connection is proof that a service is reachable and nothing more.
         // A start asks for one to be running, not for anything to be sent to it,
         // so it is closed again here.
-        connect_or_spawn_service().await.map(|_connection| {
-            lore_info!("Lore service is running");
-        })
+        connect_or_spawn_service(ServiceStart::NamedOrThisProgram)
+            .await
+            .map(|_connection| {
+                lore_info!("Lore service is running");
+            })
     })
 }
 
@@ -150,56 +142,18 @@ async fn stop_local(
     args: LoreServiceStopArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    #[cfg(unix)]
-    {
-        let target = state::current_owner();
-        let early = state::capture_stop_request();
-        if let Some(owner) = target {
-            let permit = match state::admit_control(&owner) {
-                Ok(permit) => permit,
-                Err(error) => {
-                    return no_repository_call(
-                        globals,
-                        callback,
-                        args,
-                        stop,
-                        move |_args| async move {
-                            Err::<(), ServiceStopError>(ServiceStopError::internal(format!(
-                                "service control admission: {error:?}"
-                            )))
-                        },
-                    )
-                    .await;
-                }
-            };
-            let target = owner.clone();
-            return state::scope_control(owner, permit, async move {
-                no_repository_call(globals, callback, args, stop, move |_args| async move {
-                    target
-                        .stop_control(execution_context().globals().force())
-                        .await
-                })
-                .await
-            })
-            .await;
-        }
-        if state::has_service_scope() || early.is_some() {
-            return no_repository_call(globals, callback, args, stop, move |_args| async move {
-                let target = early.ok_or_else(|| {
-                    ServiceStopError::internal("no trusted service run is bound to this command")
-                })?;
-                target.request_stop();
-                Ok::<(), ServiceStopError>(())
-            })
-            .await;
-        }
-    }
-    #[cfg(not(unix))]
     if service_runs_in_this_process() {
         return no_repository_call(globals, callback, args, stop, move |_args| async move {
+            // A busy mount keeps the service serving it, so the stop is refused before the
+            // service is asked to exit. `force` is read from the execution context: read from
+            // `globals` before they move, it would keep a second copy of them in the future of
+            // `stop_local`.
+            // SWFS mounts are closed as the service exits, once it takes no more commands.
+            #[cfg(target_os = "linux")]
             if let Some(manager) = MountManagerState::mount_manager() {
                 manager
-                    .unmount_all(execution_context().globals().force())
+                    .fuse()
+                    .unmount_all(lore_revision::lore::execution_context().globals().force())
                     .await
                     .forward_any::<ServiceStopError>("Unmounting before the service stops")?;
             }
@@ -214,7 +168,7 @@ async fn stop_local(
     // on a service that is running and must not be what starts one.
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
-            let status = service_call_over(connection, globals, args.into(), callback).await;
+            let status = run_service_call(Some(connection), globals, args.into(), callback).await;
             if status != 0 {
                 return status;
             }
@@ -469,47 +423,8 @@ async fn status_local(
     args: LoreServiceStatusArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    #[cfg(unix)]
-    {
-        let target = state::current_owner();
-        if let Some(owner) = target {
-            let permit = match state::admit_control(&owner) {
-                Ok(permit) => permit,
-                Err(error) => {
-                    return no_repository_call(
-                        globals,
-                        callback,
-                        args,
-                        status,
-                        move |_args| async move {
-                            Err::<(), ServiceProcessError>(ServiceProcessError::internal(format!(
-                                "service control admission: {error:?}"
-                            )))
-                        },
-                    )
-                    .await;
-                }
-            };
-            let target = owner.clone();
-            return state::scope_control(owner, permit, async move {
-                no_repository_call(globals, callback, args, status, move |_args| async move {
-                    emit_status_from_owner(Some(target));
-                    Ok::<(), ServiceProcessError>(())
-                })
-                .await
-            })
-            .await;
-        }
-        if state::has_service_scope() {
-            return no_repository_call(globals, callback, args, status, move |_args| async move {
-                emit_not_running_status();
-                Ok::<(), ServiceProcessError>(())
-            })
-            .await;
-        }
-    }
-    #[cfg(not(unix))]
     if service_runs_in_this_process() {
+        // Running inside the service: query local state.
         return no_repository_call(globals, callback, args, status, move |_args| async move {
             emit_status_from_service();
             Ok::<(), ServiceProcessError>(())
@@ -521,7 +436,7 @@ async fn status_local(
     match connect_to_running_service().await {
         Ok(Some(connection)) => {
             // Service is running; relay the status command to it.
-            service_call_over(connection, globals, args.into(), callback).await
+            run_service_call(Some(connection), globals, args.into(), callback).await
         }
         Ok(None) => {
             // No service is listening; emit not-running status.
@@ -541,41 +456,11 @@ async fn status_local(
 }
 
 /// Emit `ServiceStatus` and `ServiceMessage` events from within the service process.
-#[cfg(not(unix))]
 fn emit_status_from_service() {
-    emit_status_state(ServiceStateImpl::global().clone());
-}
-#[cfg(unix)]
-fn emit_status_from_owner(owner: Option<Arc<owner::ServiceOwner>>) {
-    let Some(owner) = owner else {
-        emit_not_running_status();
-        return;
-    };
-    if owner.stop_request().is_none_or(|stop| !stop.is_running()) {
-        emit_not_running_status();
-        return;
-    }
-    emit_status_state(owner.state().clone());
-    let (phase, error) = owner.status();
-    if phase != owner::Phase::Running {
-        LoreEvent::ServiceMessage(LoreServiceMessageEventData {
-            level: if error.is_some() {
-                LoreLogLevel::Error
-            } else {
-                LoreLogLevel::Info
-            },
-            message: LoreString::from(
-                format!(
-                    "service retirement {phase:?}{}",
-                    error.map_or(String::new(), |error| format!(": {error}"))
-                )
-                .as_str(),
-            ),
-        })
-        .send();
-    }
-}
-fn emit_status_state(service_state: Arc<ServiceStateImpl>) {
+    // The status command arrives through command dispatch, which carries no
+    // service state, so this is one of the paths that reaches for the global.
+    let service_state = ServiceStateImpl::global();
+
     // Check if service state is initialized.
     if !service_state.is_initialized() {
         // Shouldn't happen if wired correctly, but emit not-running as fallback.
@@ -589,7 +474,8 @@ fn emit_status_state(service_state: Arc<ServiceStateImpl>) {
         .unwrap_or_default();
 
     // Get mount count from MountManagerState.
-    let swfs_mount_count = MountManagerState::mount_manager().map_or(0, |m| m.mount_count() as u32);
+    let swfs_mount_count =
+        MountManagerState::mount_manager().map_or(0, |m| m.swfs().mount_count() as u32);
 
     // Emit ServiceStatus event.
     LoreEvent::ServiceStatus(LoreServiceStatusEventData {
@@ -603,15 +489,6 @@ fn emit_status_state(service_state: Arc<ServiceStateImpl>) {
 
     // Drain buffered logs and emit ServiceMessage events.
     let (messages, dropped_count) = service_state.drain_logs();
-    // SWFS's native callback sink remains process-global on Unix; it does not
-    // supply command admission, provider routing, uptime or connection identity.
-    #[cfg(unix)]
-    let (messages, dropped_count) = {
-        let mut messages = messages;
-        let (legacy, dropped) = ServiceStateImpl::global().drain_logs();
-        messages.extend(legacy);
-        (messages, dropped_count.saturating_add(dropped))
-    };
     for message in messages {
         LoreEvent::ServiceMessage(LoreServiceMessageEventData {
             level: message.level,
@@ -677,11 +554,7 @@ pub async fn run(
 ) -> i32 {
     let service_globals = globals.clone();
     no_repository_call(globals, callback, args, run, async move |_args| {
-        #[cfg(unix)]
-        let service_state = Arc::new(ServiceStateImpl::new());
-        #[cfg(not(unix))]
-        let service_state = Arc::clone(ServiceStateImpl::global());
-        service_main(service_globals, service_state).await
+        service_main(service_globals, Arc::clone(ServiceStateImpl::global())).await
     })
     .await
 }
@@ -725,76 +598,6 @@ async fn quit_local(
     args: LoreServiceQuitArgs,
     callback: LoreEventCallback,
 ) -> i32 {
-    #[cfg(unix)]
-    {
-        let target = state::current_owner();
-        let early = state::capture_stop_request();
-        if let Some(owner) = target {
-            let permit = match state::admit_control(&owner) {
-                Ok(permit) => permit,
-                Err(state::ControlError::Busy)
-                    if !state::has_service_scope()
-                        && owner.status().0 == owner::Phase::ReadyToExit =>
-                {
-                    // Retirement has succeeded and the actor may already have
-                    // closed control admission while draining its last calls.
-                    // A repeated direct quit has no further work to admit.
-                    return no_repository_call(
-                        globals,
-                        callback,
-                        args,
-                        quit,
-                        move |_args| async move {
-                            if let Some(error) = owner.actor().and_then(|actor| actor.failure()) {
-                                return Err(ServiceProcessError::internal(error));
-                            }
-                            Ok::<(), ServiceProcessError>(())
-                        },
-                    )
-                    .await;
-                }
-                Err(error) => {
-                    return no_repository_call(
-                        globals,
-                        callback,
-                        args,
-                        quit,
-                        move |_args| async move {
-                            Err::<(), ServiceProcessError>(ServiceProcessError::internal(format!(
-                                "service control admission: {error:?}"
-                            )))
-                        },
-                    )
-                    .await;
-                }
-            };
-            let target = owner.clone();
-            return state::scope_control(owner, permit, async move {
-                no_repository_call(globals, callback, args, quit, move |_args| async move {
-                    target
-                        .stop_control(execution_context().globals().force())
-                        .await
-                        .map_err(|error| ServiceProcessError::internal(error.to_string()))
-                })
-                .await
-            })
-            .await;
-        }
-        let scoped = state::has_service_scope();
-        no_repository_call(globals, callback, args, quit, move |_args| async move {
-            if scoped && early.is_none() {
-                return Err(ServiceProcessError::internal(
-                    "no trusted service run is bound to this command",
-                ));
-            }
-            if let Some(target) = early {
-                target.request_stop();
-            }
-            Ok::<(), ServiceProcessError>(())
-        })
-        .await
-    }
-    #[cfg(not(unix))]
     no_repository_call(globals, callback, args, quit, move |_args| async move {
         request_service_stop();
         Ok::<(), ServiceProcessError>(())

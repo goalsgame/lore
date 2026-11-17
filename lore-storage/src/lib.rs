@@ -13,6 +13,7 @@ pub mod fragment_engine;
 pub mod fragment_flags;
 pub mod fs_util;
 pub mod gc_event;
+#[cfg(feature = "test-util")]
 pub mod mutable_conformance;
 
 use std::sync::OnceLock;
@@ -98,6 +99,7 @@ pub use hash::hash_slice;
 pub use hash::hash_string;
 pub use hash::hash_string_bytes;
 // Re-export store traits
+pub use immutable_store::CorrelationHold;
 pub use immutable_store::ImmutableStore;
 pub use immutable_store::StoreError;
 pub(crate) use immutable_store::payload_is_content;
@@ -125,6 +127,7 @@ pub use maintenance::evictor;
 pub use maintenance::gc;
 pub use mutable_store::MutableStore;
 // Re-export options types
+pub use options::FlushOptions;
 pub use options::ReadOptions;
 pub use options::WriteOptions;
 // Re-export packstore
@@ -136,6 +139,7 @@ pub use read::REMOTE_FETCH_INFLIGHT;
 pub use read::check_payload_sizes;
 pub use read::expand_payload;
 pub use read::load_fragment;
+pub use read::load_root;
 pub use read::read;
 pub use read::read_into;
 pub use read::read_into_buffer;
@@ -148,6 +152,7 @@ pub use read::read_resolved_stream;
 pub use read::read_stream;
 pub use read::remote_fetch_bytes;
 pub use read::remote_fetch_inflight;
+pub use read::stream_root;
 pub use read::write_all_to_file;
 // Re-export store types
 pub use store_types::KeyType;
@@ -176,6 +181,7 @@ pub use types::deserialize_hash;
 /// Serde field-level helpers for hex encoding. Use with `#[serde(serialize_with = "...")]`.
 pub use types::serialize_hex;
 pub use write::ContentHashes;
+pub use write::CopyOutcome;
 pub use write::FileMatch;
 pub use write::FusedPublish;
 pub use write::StoreResult;
@@ -184,6 +190,7 @@ pub use write::content_write_peak;
 pub use write::file_matches;
 pub use write::hash_file;
 pub use write::remote_copies;
+pub use write::remote_copy_retry;
 pub use write::reset_content_write_peak;
 pub use write::reset_remote_copies;
 pub use write::store_fragment;

@@ -6,7 +6,7 @@ use lore_proto::auth::CheckUserPermissionResponse;
 use lore_proto::auth::LookupUserPermissionsRequest;
 use lore_proto::auth::LookupUserPermissionsResponse;
 use lore_proto::auth::urc_auth_api_client::UrcAuthApiClient;
-use lore_proto::lore::user::v1::user_service_client::UserServiceClient;
+use lore_proto::lore::user::v1::repository_registry_service_client::RepositoryRegistryServiceClient;
 use lore_telemetry::InstrumentProvider;
 use lore_telemetry::LabelArray;
 use lore_telemetry::METRICS_OPERATION_LATENCY_METRIC_NAME;
@@ -14,6 +14,7 @@ use lore_telemetry::timed;
 use lore_telemetry::timer::TimedResult;
 use lore_transport::auth::ucs_auth::grpc_endpoint;
 use lore_transport::grpc::CorrelationInterceptor;
+use lore_transport::tls::grpc_client_tls_config;
 use opentelemetry::KeyValue;
 use smallvec::SmallVec;
 use tonic::Request;
@@ -21,7 +22,6 @@ use tonic::Response;
 use tonic::Status;
 use tonic::codegen::InterceptedService;
 use tonic::transport::Channel;
-use tonic::transport::ClientTlsConfig;
 
 use crate::grpc::ServerResultExt;
 
@@ -40,11 +40,7 @@ fn auth_endpoint(auth_url: &str) -> Result<tonic::transport::Endpoint, Status> {
         .warn_map_err(|_| Status::internal("Failed to create lore auth endpoint"))?;
     if auth_url.starts_with("https://") {
         endpoint = endpoint
-            .tls_config(
-                ClientTlsConfig::new()
-                    .assume_http2(true)
-                    .with_native_roots(),
-            )
+            .tls_config(grpc_client_tls_config())
             .warn_map_err(|_| Status::internal("Failed to configure TLS for lore auth"))?;
     }
     Ok(endpoint)
@@ -96,12 +92,16 @@ pub async fn grpc_get_auth_client(auth_url: String) -> Result<LoreAuthClientHelp
     LoreAuthClientHelper::new(auth_url).await
 }
 
-/// A `lore.user.v1.UserService` client for `user_url`, dialed like `auth_url`.
-pub async fn grpc_get_user_service_client(
+/// A `lore.user.v1.RepositoryRegistryService` client for `user_url`, dialed
+/// like `auth_url`.
+pub async fn grpc_get_repository_registry_client(
     user_url: &str,
-) -> Result<UserServiceClient<InterceptedService<Channel, CorrelationInterceptor>>, Status> {
-    let channel = connect(user_url, "user directory").await?;
-    Ok(UserServiceClient::with_interceptor(
+) -> Result<
+    RepositoryRegistryServiceClient<InterceptedService<Channel, CorrelationInterceptor>>,
+    Status,
+> {
+    let channel = connect(user_url, "repository registry").await?;
+    Ok(RepositoryRegistryServiceClient::with_interceptor(
         channel,
         CorrelationInterceptor,
     ))

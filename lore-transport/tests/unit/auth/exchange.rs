@@ -4,6 +4,7 @@ use lore_base::types::RepositoryId;
 use lore_credential::token_store;
 use lore_transport::auth::AuthEndpoint;
 use lore_transport::auth::exchange::*;
+use lore_transport::error::ProtocolError;
 
 use super::stub::AUTHN_ONE;
 use super::stub::AUTHN_TWO;
@@ -69,6 +70,92 @@ async fn access_token_alone_authorizes_without_an_authentication_token() {
     );
     assert_eq!(authorization_token, "supplied-authz");
     assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_with_an_identity_sends_an_unsigned_identity_token() {
+    let (authentication_token, authorization_token, identity) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+
+    assert_eq!(authentication_token, authorization_token);
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_without_an_identity_sends_no_token() {
+    let tokens = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "",
+        RepositoryId::default(),
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(tokens, (String::new(), String::new(), String::new()));
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_access_token_over_an_unsigned_one() {
+    let (_, authorization_token, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "00112233445566778899aabbccddeeff"
+            .parse()
+            .expect("a valid repository id"),
+        "",
+        "supplied-authz",
+    )
+    .await;
+    assert_eq!(authorization_token, "supplied-authz");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_an_unsigned_identity_token_for_a_custom_resource() {
+    let (_, authorization_token, identity) = auth_exchange_custom_resource(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        "some-resource",
+        "",
+        "",
+    )
+    .await;
+    assert_eq!(
+        lore_credential::identity_from_token(&authorization_token),
+        "alice"
+    );
+    assert_eq!(identity, "alice");
+}
+
+#[tokio::test]
+async fn no_auth_endpoint_sends_a_supplied_identity_token_over_an_unsigned_one() {
+    let (authentication_token, _, _) = auth_exchange(
+        &AuthEndpoint::none(),
+        "example.com",
+        "alice",
+        RepositoryId::default(),
+        "supplied-authn",
+        "",
+    )
+    .await;
+    assert_ne!(
+        lore_credential::identity_from_token(&authentication_token),
+        "alice",
+        "the supplied token is not replaced with an unsigned one"
+    );
 }
 
 /// Without one, the same call fails: nothing about the short circuit above
@@ -376,7 +463,7 @@ mod refused {
 
     /// A storage session start the server refuses forgets the authorization it presented and starts
     /// the session with a newly exchanged one.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_authorization_is_exchanged_again() {
         let (endpoint, stub) = auth_service("stub-auth://auth.refused-authorization.test.invalid");
         let (server, started) = session_start(
@@ -393,7 +480,7 @@ mod refused {
 
     /// A refused authorization from the token store is not read back from it on the cache miss
     /// its eviction leaves, so the session starts with a newly exchanged one.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_stored_authorization_is_exchanged_again() {
         const AUTH_URL: &str = "stub-auth://auth.refused-stored-authorization.test.invalid";
         token_store::store_user_token(
@@ -415,7 +502,7 @@ mod refused {
     }
 
     /// A refusal of the newly exchanged authorization is final.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_new_authorization_is_final() {
         let (endpoint, stub) = auth_service("stub-auth://auth.refused-twice.test.invalid");
         let (server, started) = session_start(
@@ -432,7 +519,7 @@ mod refused {
 
     /// A refusal is final where the exchange after it gives the authorization refused again, which
     /// is not presented twice.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusal_the_exchange_gives_again_is_final() {
         let stub = StubAuthentication::new(|_, _| AUTHZ_ONE);
         let endpoint = AuthEndpoint::new(
@@ -453,7 +540,7 @@ mod refused {
 
     /// A refusal of an access token the caller supplied is final, and asks the auth service
     /// nothing.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_supplied_access_token_is_final() {
         let (endpoint, stub) = auth_service("stub-auth://auth.refused-access-token.test.invalid");
         let (server, started) = session_start(
@@ -470,7 +557,7 @@ mod refused {
 
     /// A refusal of an access token the caller supplied is final, and asks the auth service
     /// nothing, though a later call supplies an identity token while the server considers it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refused_supplied_access_token_is_final_after_a_rotation() {
         let (endpoint, stub) = auth_service("stub-auth://auth.rotated-access-token.test.invalid");
         let (server, started) = session_start_across_a_rotation(
@@ -487,7 +574,7 @@ mod refused {
 
     /// A refusal is forgotten under the identity token that exchanged the authorization refused,
     /// though a later call supplies another while the server considers it.
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refusal_after_a_rotation_forgets_the_authorization_refused() {
         let (endpoint, stub) = auth_service("stub-auth://auth.rotated-identity-token.test.invalid");
         let (server, started) = session_start_across_a_rotation(
@@ -515,13 +602,11 @@ mod refused {
 }
 
 /// An implementation that refuses the login token reports `NotAuthenticated`, and the
-/// exchange passes it on as such rather than as an internal failure, so the caller can
-/// tell that logging in again fixes it. The same holds for a refused partition and
-/// `NotAuthorized`.
+/// exchange passes it on as such, with the remote's reason on its trace, rather than as an
+/// internal failure, so the caller can tell that logging in again fixes it. The same holds
+/// for a refused partition and `NotAuthorized`.
 #[tokio::test]
 async fn a_refusal_of_the_login_token_stays_not_authenticated() {
-    use lore_base::error::NotAuthenticated;
-    use lore_base::error::NotAuthorized;
     use lore_transport::error::ProtocolError;
     use lore_transport::traits::Authentication;
     use lore_transport::types::AuthSession;
@@ -531,6 +616,9 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
 
     /// `sub` alice, `aud` example.com, expiring in 2033.
     const AUTHN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJsb3JlIiwic3ViIjoiYWxpY2UiLCJleHAiOjIwMDAwMDAwMDAsImF1ZCI6WyJleGFtcGxlLmNvbSJdLCJuYW1lIjoiQWxpY2UifQ.signature";
+
+    /// The reason the stub's remote gives for each refusal.
+    const REASON: &str = "the login expired";
 
     /// Refuses every exchange with the error it holds.
     struct Refusing(fn() -> ProtocolError);
@@ -551,11 +639,11 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
             Err((self.0)())
         }
 
-        async fn exchange_for_custom_resource(
+        async fn exchange_for_custom_resources(
             &self,
             _auth_url: &str,
             _authn_token: &str,
-            _resource_id: &str,
+            _resource_ids: &[&str],
             _correlation_id: &str,
         ) -> Result<AuthorizationToken, ProtocolError> {
             Err((self.0)())
@@ -640,7 +728,7 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
         )
         .await
         .expect_err("the stub refuses the exchange");
-        assert!(check(&refused), "{auth_url}: {refused}");
+        assert_refusal(auth_url, &refused, check);
 
         let refused = exchange_custom_resource(
             &endpoint,
@@ -652,18 +740,28 @@ async fn a_refusal_of_the_login_token_stays_not_authenticated() {
         )
         .await
         .expect_err("the stub refuses the exchange");
-        assert!(check(&refused), "{auth_url}: {refused}");
+        assert_refusal(auth_url, &refused, check);
+    }
+
+    fn assert_refusal(auth_url: &str, refused: &ExchangeError, check: fn(&ExchangeError) -> bool) {
+        assert!(check(refused), "{auth_url}: {refused}");
+        assert!(
+            refused.trace().locations().iter().any(|location| location
+                .context()
+                .is_some_and(|context| context.contains(REASON))),
+            "{auth_url}: {refused:?}"
+        );
     }
 
     assert_refused_as(
         "stub-auth://auth.refused-login.test.invalid",
-        || NotAuthenticated.into(),
+        || tonic::Status::unauthenticated(REASON).into(),
         ExchangeError::is_not_authenticated,
     )
     .await;
     assert_refused_as(
         "stub-auth://auth.refused-partition.test.invalid",
-        || NotAuthorized.into(),
+        || tonic::Status::permission_denied(REASON).into(),
         ExchangeError::is_not_authorized,
     )
     .await;
@@ -682,6 +780,7 @@ fn jwt(subject: &str, audience: &str, exp: u64) -> String {
 }
 
 const EXPIRED: u64 = 1_000_000_000;
+const REFRESHED_REFRESH_EXPIRES: u64 = 1_950_000_000_000;
 
 fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::AuthenticationToken {
     lore_transport::types::AuthenticationToken {
@@ -691,13 +790,14 @@ fn refreshed(token: &str, refresh_token: &str) -> lore_transport::types::Authent
         expires_ms: 2_000_000_000_000,
         acceptable_root_domains: Vec::new(),
         refresh_token: Some(refresh_token.to_owned()),
+        refresh_expires_ms: REFRESHED_REFRESH_EXPIRES,
         scope: None,
     }
 }
 
 /// A stored login whose token has expired is refreshed while an identity is picked, so the
-/// identity is found and authenticated without a new login. The new token is stored, so the
-/// next derivation presents no refresh token.
+/// identity is found and authenticated without a new login. The new token is stored with the
+/// new refresh token's deadline, so the next derivation presents no refresh token.
 #[tokio::test]
 async fn an_expired_stored_login_is_refreshed() {
     const AUTH_URL: &str = "oidc+https://refresh.test.invalid";
@@ -707,6 +807,7 @@ async fn an_expired_stored_login_is_refreshed() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -728,6 +829,10 @@ async fn an_expired_stored_login_is_refreshed() {
         assert_eq!(identity, "alice");
     }
     assert_eq!(stub.presented(), ["refresh-1"]);
+    assert_eq!(
+        token_store::load_refresh_expires(AUTH_URL, "alice").await,
+        Some(REFRESHED_REFRESH_EXPIRES)
+    );
 }
 
 /// A refused refresh token skips the identity, as an expired login did before, and is not
@@ -741,6 +846,7 @@ async fn an_expired_stored_login_whose_refresh_is_refused_is_skipped() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -775,6 +881,7 @@ async fn a_refreshed_token_for_another_domain_is_not_handed_out() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -817,6 +924,7 @@ async fn an_expired_supplied_identity_token_is_not_refreshed() {
         &supplied,
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -849,6 +957,7 @@ async fn an_exchange_refreshes_an_expired_stored_login_first() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -908,6 +1017,7 @@ async fn only_an_unsent_refresh_is_tried_again() {
             &jwt("alice", "example.com", EXPIRED),
             vec!["example.com".to_owned()],
             Some("refresh-1"),
+            0,
             None,
         )
         .await
@@ -943,6 +1053,7 @@ async fn a_cancelled_caller_does_not_stop_the_refresh() {
         &jwt("alice", "example.com", EXPIRED),
         vec!["example.com".to_owned()],
         Some("refresh-1"),
+        0,
         None,
     )
     .await
@@ -969,4 +1080,330 @@ async fn a_cancelled_caller_does_not_stop_the_refresh() {
     let (authentication_token, _, _) = authenticate().await;
     assert_eq!(authentication_token, AUTHN_ONE);
     assert_eq!(stub.presented(), ["refresh-1"]);
+}
+
+fn a_repository() -> RepositoryId {
+    "aabbccdd00112233aabbccdd8899aabb"
+        .parse()
+        .expect("a valid repository id")
+}
+
+/// Every identity and repository combination [`auth_exchange_for_stored_identity`] is asked
+/// with: any stored identity or the one named, and with or without a repository.
+fn identity_and_repository_cases() -> [(&'static str, RepositoryId); 4] {
+    [
+        ("", RepositoryId::default()),
+        ("", a_repository()),
+        ("alice", RepositoryId::default()),
+        ("alice", a_repository()),
+    ]
+}
+
+async fn store_expired_login(auth_url: &str, user: &str, refresh_token: Option<&str>) {
+    token_store::store_user_token_and_refresh_token(
+        auth_url,
+        user,
+        &jwt(user, "example.com", EXPIRED),
+        vec!["example.com".to_owned()],
+        refresh_token,
+        0,
+        None,
+    )
+    .await
+    .expect("store the login");
+}
+
+#[tokio::test]
+async fn a_stored_login_whose_refresh_is_refused_is_not_authenticated() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://dead-session-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", Some("refresh-1")).await;
+        let stub =
+            StubAuthentication::refreshing(|_| Err(lore_base::error::NotAuthenticated.into()));
+        let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+        let err = auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+            .await
+            .expect_err("no identity resolves");
+
+        assert!(err.is_not_authenticated(), "{auth_url}: {err}");
+        assert_eq!(stub.presented(), ["refresh-1"], "{auth_url}");
+        assert_eq!(stub.exchanges(), 0, "{auth_url}");
+    }
+}
+
+#[tokio::test]
+async fn an_expired_stored_login_without_a_refresh_token_is_not_authenticated() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://expired-no-refresh-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", None).await;
+        let endpoint = AuthEndpoint::new(auth_url.clone(), StubAuthentication::new(|_, _| ""));
+
+        let err = auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+            .await
+            .expect_err("no identity resolves");
+
+        assert!(err.is_not_authenticated(), "{auth_url}: {err}");
+    }
+}
+
+/// A refresh grant that could not be sent keeps the refresh token, so the session is not over:
+/// the failure is `Disconnected`, and the next attempt presents the same refresh token.
+#[tokio::test]
+async fn an_unsent_refresh_is_disconnected() {
+    for (case, (identity, repository)) in identity_and_repository_cases().into_iter().enumerate() {
+        let auth_url = format!("oidc+https://refresh-unsent-{case}.test.invalid");
+        store_expired_login(&auth_url, "alice", Some("refresh-1")).await;
+        let stub = StubAuthentication::refreshing(|_| Err(lore_base::error::Disconnected.into()));
+        let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+        for _ in 0..2 {
+            let err =
+                auth_exchange_for_stored_identity(&endpoint, "example.com", identity, repository)
+                    .await
+                    .expect_err("no identity resolves");
+            assert!(err.is_disconnected(), "{auth_url}: {err}");
+        }
+        assert_eq!(stub.presented(), ["refresh-1", "refresh-1"], "{auth_url}");
+    }
+}
+
+#[tokio::test]
+async fn no_stored_identity_is_not_authenticated() {
+    let endpoint = AuthEndpoint::new(
+        "oidc+https://no-identity.test.invalid".to_string(),
+        StubAuthentication::new(|_, _| ""),
+    );
+
+    let err = auth_exchange_for_stored_identity(&endpoint, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity resolves");
+    assert!(err.is_not_authenticated(), "{err}");
+}
+
+#[tokio::test]
+async fn a_given_identity_without_a_stored_login_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://given-identity.test.invalid";
+    token_store::store_user_token(AUTH_URL, "alice", AUTHN_ONE, vec!["example.com".to_owned()])
+        .await
+        .expect("store the login");
+    let endpoint = AuthEndpoint::new(
+        AUTH_URL.to_string(),
+        StubAuthentication::new(|_, _| AUTHZ_ONE),
+    );
+
+    let err =
+        auth_exchange_for_stored_identity(&endpoint, "example.com", "bob", RepositoryId::default())
+            .await
+            .expect_err("bob has no login");
+    assert!(err.is_not_authenticated(), "{err}");
+}
+
+/// A login that the remote's domain may not be sent is no credential for that remote.
+#[tokio::test]
+async fn a_stored_login_for_another_domain_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://other-domain-login.test.invalid";
+    token_store::store_user_token(
+        AUTH_URL,
+        "alice",
+        &jwt("alice", "elsewhere.test.invalid", 2_000_000_000),
+        vec!["elsewhere.test.invalid".to_owned()],
+    )
+    .await
+    .expect("store the login");
+    let stub = StubAuthentication::new(|_, _| AUTHZ_ONE);
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    let err = auth_exchange_for_stored_identity(&endpoint, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity resolves");
+    assert!(err.is_not_authenticated(), "{err}");
+    assert_eq!(stub.exchanges(), 0);
+}
+
+/// A name, the error the exchange fails with, and the check the resulting error must pass.
+type ExchangeFailureCase = (
+    &'static str,
+    fn() -> ProtocolError,
+    fn(&ExchangeError) -> bool,
+);
+
+/// The exchange's own answer decides the failure: a refusal of the repository is
+/// `NotAuthorized`, a refusal of the login token (one revoked at the issuer) is
+/// `NotAuthenticated`, and an unreachable auth service is `Disconnected`.
+#[tokio::test]
+async fn a_failed_repository_exchange_keeps_its_kind() {
+    let cases: [ExchangeFailureCase; 3] = [
+        (
+            "refused",
+            || lore_base::error::NotAuthorized.into(),
+            ExchangeError::is_not_authorized,
+        ),
+        (
+            "revoked",
+            || lore_base::error::NotAuthenticated.into(),
+            ExchangeError::is_not_authenticated,
+        ),
+        (
+            "unreachable",
+            || lore_base::error::Disconnected.into(),
+            ExchangeError::is_disconnected,
+        ),
+    ];
+    for (name, exchange_error, expected) in cases {
+        for identity in ["", "alice"] {
+            let auth_url = format!(
+                "oidc+https://exchange-{name}-{}.test.invalid",
+                identity.len()
+            );
+            token_store::store_user_token(
+                &auth_url,
+                "alice",
+                AUTHN_ONE,
+                vec!["example.com".to_owned()],
+            )
+            .await
+            .expect("store the login");
+            let stub = StubAuthentication::failing_exchanges(exchange_error);
+            let endpoint = AuthEndpoint::new(auth_url.clone(), stub.clone());
+
+            let err = auth_exchange_for_stored_identity(
+                &endpoint,
+                "example.com",
+                identity,
+                a_repository(),
+            )
+            .await
+            .expect_err("no identity is authorized");
+            assert!(expected(&err), "{auth_url}: {err}");
+            assert_eq!(stub.exchanges(), 1, "{auth_url}");
+
+            let (authentication_token, _, resolved) = auth_exchange_for_stored_identity(
+                &endpoint,
+                "example.com",
+                identity,
+                RepositoryId::default(),
+            )
+            .await
+            .expect("the identity authenticates");
+            assert_eq!(authentication_token, AUTHN_ONE, "{auth_url}");
+            assert_eq!(resolved, "alice", "{auth_url}");
+        }
+    }
+}
+
+/// With several stored identities, one that cannot authenticate does not hide another's refusal,
+/// nor stop another from being picked.
+#[tokio::test]
+async fn a_dead_identity_does_not_hide_another_identitys_answer() {
+    const REFUSED: &str = "oidc+https://mixed-refused.test.invalid";
+    store_expired_login(REFUSED, "alice", None).await;
+    token_store::store_user_token(REFUSED, "bob", AUTHN_TWO, vec!["example.com".to_owned()])
+        .await
+        .expect("store bob's login");
+    let refusing = AuthEndpoint::new(
+        REFUSED.to_string(),
+        StubAuthentication::failing_exchanges(|| lore_base::error::NotAuthorized.into()),
+    );
+    let err = auth_exchange_for_stored_identity(&refusing, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity is authorized");
+    assert!(err.is_not_authorized(), "{err}");
+
+    const REFUSED_FIRST: &str = "oidc+https://mixed-refused-first.test.invalid";
+    token_store::store_user_token(
+        REFUSED_FIRST,
+        "bob",
+        AUTHN_TWO,
+        vec!["example.com".to_owned()],
+    )
+    .await
+    .expect("store bob's login");
+    store_expired_login(REFUSED_FIRST, "alice", None).await;
+    let refusing = AuthEndpoint::new(
+        REFUSED_FIRST.to_string(),
+        StubAuthentication::failing_exchanges(|| lore_base::error::NotAuthorized.into()),
+    );
+    let err = auth_exchange_for_stored_identity(&refusing, "example.com", "", a_repository())
+        .await
+        .expect_err("no identity is authorized");
+    assert!(err.is_not_authorized(), "{err}");
+
+    const AUTHORIZED: &str = "oidc+https://mixed-authorized.test.invalid";
+    store_expired_login(AUTHORIZED, "alice", None).await;
+    token_store::store_user_token(AUTHORIZED, "bob", AUTHN_TWO, vec!["example.com".to_owned()])
+        .await
+        .expect("store bob's login");
+    let authorizing = AuthEndpoint::new(
+        AUTHORIZED.to_string(),
+        StubAuthentication::new(|_, _| AUTHZ_TWO),
+    );
+    let tokens = auth_exchange_for_stored_identity(&authorizing, "example.com", "", a_repository())
+        .await
+        .expect("bob is authorized");
+    assert_eq!(
+        tokens,
+        (AUTHN_TWO.to_owned(), AUTHZ_TWO.to_owned(), "bob".to_owned())
+    );
+}
+
+/// A grant that failed after it may have reached the issuer drops the refresh token, so the
+/// session is over.
+#[tokio::test]
+async fn a_failed_refresh_is_not_authenticated() {
+    const AUTH_URL: &str = "oidc+https://refresh-failed-answer.test.invalid";
+    store_expired_login(AUTH_URL, "alice", Some("refresh-1")).await;
+    let stub = StubAuthentication::refreshing(|_| {
+        Err(ProtocolError::internal("the answer could not be read"))
+    });
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    for _ in 0..2 {
+        let err = auth_exchange_for_stored_identity(
+            &endpoint,
+            "example.com",
+            "",
+            RepositoryId::default(),
+        )
+        .await
+        .expect_err("no identity resolves");
+        assert!(err.is_not_authenticated(), "{err}");
+    }
+    assert_eq!(stub.presented(), ["refresh-1"]);
+}
+
+/// The partition exchange refreshes an expired login first, and a grant that could not be sent
+/// fails the exchange as `Disconnected`, for the repository and for a custom resource alike.
+#[tokio::test]
+async fn an_exchange_whose_refresh_is_unsent_is_disconnected() {
+    const AUTH_URL: &str = "oidc+https://refresh-exchange-unsent.test.invalid";
+    store_expired_login(AUTH_URL, "alice", Some("refresh-1")).await;
+    let stub = StubAuthentication::refreshing(|_| Err(lore_base::error::Disconnected.into()));
+    let endpoint = AuthEndpoint::new(AUTH_URL.to_string(), stub.clone());
+
+    let err = exchange(
+        &endpoint,
+        "alice",
+        a_repository(),
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect_err("the refresh was not sent");
+    assert!(err.is_disconnected(), "{err}");
+
+    let err = exchange_custom_resource(
+        &endpoint,
+        "alice",
+        "urc-user-service",
+        "example.com".to_string(),
+        "",
+        "",
+    )
+    .await
+    .expect_err("the refresh was not sent");
+    assert!(err.is_disconnected(), "{err}");
+    assert_eq!(stub.presented(), ["refresh-1", "refresh-1"]);
+    assert_eq!(stub.exchanges(), 0);
 }

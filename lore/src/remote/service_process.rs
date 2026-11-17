@@ -9,6 +9,8 @@ use std::process::Command;
 use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use lore_base::error::ServiceUnavailable;
@@ -133,26 +135,88 @@ fn resolve_service_executable(
     )))
 }
 
-/// The executable to start the service with, reading the one set in the config.
+/// The executable named to start the service with, and whether the global config could be read.
 ///
 /// A config that cannot be read leaves the executable unknown rather than failing
 /// the call. Most callers have none set, so a config Lore cannot read is reported
 /// and stepped over.
-pub async fn service_executable() -> Result<PathBuf, ServiceProcessError> {
-    let from_config = match GlobalConfig::load().await {
-        Ok(config) => config.service_executable().map(str::to_string),
+pub async fn service_executable() -> (Result<PathBuf, ServiceProcessError>, bool) {
+    match GlobalConfig::load().await {
+        Ok(config) => (service_executable_in(Some(&config)), true),
         Err(error) => {
             lore_warn!(
                 "Could not read {SERVICE_EXECUTABLE_SETTING} from the global config: {error}"
             );
-            None
+            (service_executable_in(None), false)
         }
-    };
+    }
+}
 
+/// The executable to start the service with, from the environment variable or `config`, which is
+/// `None` for a config that could not be read.
+pub(crate) fn service_executable_in(
+    config: Option<&GlobalConfig>,
+) -> Result<PathBuf, ServiceProcessError> {
     resolve_service_executable(
         std::env::var_os(SERVICE_EXECUTABLE_VAR),
-        from_config.as_deref(),
+        config.and_then(GlobalConfig::service_executable),
     )
+}
+
+/// Whether this program's own executable runs the service when started with
+/// [`SERVICE_RUN_ARGUMENTS`]. Set once through [`serve_from_this_executable`].
+static SERVES_FROM_THIS_EXECUTABLE: AtomicBool = AtomicBool::new(false);
+
+/// Records that this program's own executable runs the service when started with
+/// `service run`.
+///
+/// A start asked for outright, and a command only the service may carry out, such as one
+/// that makes a virtual clone, then start a service from this executable when none is
+/// running and none is named. A program whose executable does not run the service that
+/// way must not call this: it would be started in place of a service.
+pub fn serve_from_this_executable() {
+    SERVES_FROM_THIS_EXECUTABLE.store(true, Ordering::Release);
+}
+
+/// The executables a caller may start a service from when none is running.
+#[lore_macro::test_pub]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ServiceStart {
+    /// The one named in `LORE_SERVICE_EXECUTABLE` or `[service] executable`. Relaying, once
+    /// turned on, is on for every program on the machine that links the library, so without a
+    /// name the build serving the machine would be whichever relayed first.
+    Named,
+    /// The named one, else this program's own where it runs the service
+    /// ([`serve_from_this_executable`]). For a start asked for outright, and for a command
+    /// only the service may carry out, which has no other place to run.
+    NamedOrThisProgram,
+}
+
+/// The executable a `start` may start a service from: `named`, else, where none is named,
+/// this program's own, from `this_executable`, where `start` allows it and `may_serve` holds.
+/// `may_serve` is false for a program that doesn't run the service, and where the global config
+/// couldn't be read, as it may name one. Fails as `named` does otherwise, and says so as well
+/// when this program's own cannot be found.
+#[lore_macro::test_pub]
+fn executable_to_start(
+    named: Result<PathBuf, ServiceProcessError>,
+    start: ServiceStart,
+    may_serve: bool,
+    this_executable: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> Result<PathBuf, ServiceProcessError> {
+    let none_named = match named {
+        Err(ServiceProcessError::ServiceUnavailable(unavailable))
+            if start == ServiceStart::NamedOrThisProgram && may_serve =>
+        {
+            unavailable.into_inner().reason
+        }
+        named => return named,
+    };
+    this_executable().map_err(|error| {
+        unavailable(format!(
+            "finding this program's executable failed: {error}, and {none_named}"
+        ))
+    })
 }
 
 /// Environment variable that turns relaying on or off, overriding the setting
@@ -207,9 +271,7 @@ pub(crate) fn report_settings_update_that_will_not_relay(config: &GlobalConfig) 
         return;
     }
 
-    let exec_from_env = std::env::var_os(SERVICE_EXECUTABLE_VAR);
-    let exec_from_config = config.service_executable();
-    if resolve_service_executable(exec_from_env, exec_from_config).is_ok() {
+    if service_executable_in(Some(config)).is_ok() {
         return;
     }
 
@@ -246,11 +308,32 @@ impl ServiceSettings {
     /// Whether calls are relayed to the service, which is when relaying is asked for.
     ///
     /// An executable is not required here: a service already running can be used
-    /// without one. Only starting a service when none is running requires an
+    /// without one. Only starting a service when none is running requires a named
     /// executable, and that check happens in [`connect_or_spawn_service`].
     fn decide_use_service(&self) -> bool {
         relaying_is_asked_for(std::env::var_os(USE_SERVICE_VAR), self.relaying_on)
     }
+}
+
+/// Whether this process is the service, set once by [`initialize_service`] before it starts
+/// handling connections.
+///
+/// A FUSE instance's commands, and a clone or create whose `vfs` resolves to FUSE, are always
+/// forced to relay to the service (see `command_requires_service` in `call_delegation`), but the
+/// service handling a relayed command re-enters the same dispatch path — without this flag it
+/// would relay to itself forever. Not the same thing as [`service_runs_in_this_process`], which
+/// answers true only later, once the service has bound its socket ([`register_service_process`]).
+///
+/// [`initialize_service`]: crate::service::initialization::initialize_service
+static IN_SERVICE_PROCESS: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn mark_running_as_service() {
+    IN_SERVICE_PROCESS.store(true, Ordering::Release);
+}
+
+#[lore_macro::test_pub]
+pub(crate) fn running_as_service() -> bool {
+    IN_SERVICE_PROCESS.load(Ordering::Acquire)
 }
 
 /// Whether this call is carried out by the service rather than here.
@@ -484,21 +567,30 @@ pub(crate) async fn connect_to_running_service() -> Result<Option<UdsStream>, Se
     connect_attempt().await
 }
 
-/// Connects to the service, starting one when none is running.
+/// Connects to the service, starting one when none is running from an executable
+/// `start` allows.
 ///
 /// Several callers reach this at once with no service running, and each starts
 /// one. Only the first to claim the socket keeps running, and the rest exit once
 /// it answers, so what is waited for afterwards is *a* service answering rather
 /// than the one this caller started: the callers whose service lost the claim
 /// become clients of the one that won it.
-pub(crate) async fn connect_or_spawn_service() -> Result<UdsStream, ServiceProcessError> {
+pub(crate) async fn connect_or_spawn_service(
+    start: ServiceStart,
+) -> Result<UdsStream, ServiceProcessError> {
     if let Some(connection) = connect_to_running_service().await? {
         return Ok(connection);
     }
 
     collect_exited_services();
 
-    let executable = service_executable().await?;
+    let (named, config_read) = service_executable().await;
+    let executable = executable_to_start(
+        named,
+        start,
+        config_read && SERVES_FROM_THIS_EXECUTABLE.load(Ordering::Acquire),
+        std::env::current_exe,
+    )?;
     let mut service = lore_base::lore_spawn_blocking!(move || spawn_service(executable))
         .await
         .internal("joining the service start task")??;
@@ -603,10 +695,6 @@ struct StopState {
     /// until it ends. A stop asked for in that window is kept for the service
     /// to find once it is serving, rather than lost.
     starting: bool,
-    #[cfg(unix)]
-    token: Option<Arc<()>>,
-    #[cfg(unix)]
-    owner: Option<std::sync::Weak<crate::service::owner::ServiceOwner>>,
 }
 
 /// The stop request for a service running in this process.
@@ -629,19 +717,6 @@ impl StopRequest {
         self.state.lock()
     }
 
-    #[cfg(any(unix, feature = "test-util"))]
-    #[lore_macro::test_pub]
-    fn bound_stop_request(self: &Arc<Self>) -> Option<ServiceStopRequest> {
-        let state = self.state();
-        if !state.starting {
-            return None;
-        }
-        Some(ServiceStopRequest {
-            request: self.clone(),
-            #[cfg(unix)]
-            token: state.token.clone()?,
-        })
-    }
     /// Claims the start for the caller, answering `false` when a service already
     /// starts or runs. Clearing the stop asked of an earlier service happens in
     /// the same step as publishing the start, so a stop that sees the start
@@ -654,31 +729,17 @@ impl StopRequest {
         }
         state.requested = false;
         state.starting = true;
-        #[cfg(unix)]
-        {
-            state.token = Some(Arc::new(()));
-            state.owner = None;
-        }
         true
     }
 
     /// Ends the service that holds the start.
-    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn end_service(&self) {
         let mut state = self.state();
         state.running = false;
         state.starting = false;
-        #[cfg(unix)]
-        {
-            state.token = None;
-            state.owner = None;
-            drop(state);
-            self.notify.notify_waiters();
-        }
     }
 
-    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn set_running(&self) {
         self.state().running = true;
@@ -689,7 +750,6 @@ impl StopRequest {
         self.state().running
     }
 
-    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn is_requested(&self) -> bool {
         self.state().requested
@@ -698,7 +758,6 @@ impl StopRequest {
     /// Asks the service to stop, and reports whether there was one, starting or
     /// running, to ask. The request is stored before the wait is woken, so a wait
     /// that reads it afterwards sees the request either way.
-    #[cfg(any(not(unix), feature = "test-util"))]
     #[lore_macro::test_pub]
     fn request_stop(&self) -> bool {
         {
@@ -719,79 +778,17 @@ static STOP_REQUEST: OnceLock<Arc<StopRequest>> = OnceLock::new();
 
 /// The stop request the process running the service waits on.
 #[lore_macro::test_pub]
-#[derive(Clone)]
 pub struct ServiceStopRequest {
     request: Arc<StopRequest>,
-    #[cfg(unix)]
-    token: Arc<()>,
 }
 
 impl ServiceStopRequest {
     /// Resolves once a stop has been requested, including one requested before
     /// the wait began.
     pub async fn requested(&self) {
-        #[cfg(not(unix))]
         while !self.request.is_requested() {
             self.request.notify.notified().await;
         }
-        #[cfg(unix)]
-        loop {
-            let changed = self.request.notify.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            if self.requested_or_ended() {
-                return;
-            }
-            changed.await;
-        }
-    }
-    #[cfg(unix)]
-    fn requested_or_ended(&self) -> bool {
-        let state = self.request.state();
-        state
-            .token
-            .as_ref()
-            .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
-            || state.requested
-            || !state.starting
-    }
-    #[cfg(unix)]
-    #[lore_macro::test_pub]
-    pub(crate) fn is_current(&self) -> bool {
-        let state = self.request.state();
-        state.starting
-            && state
-                .token
-                .as_ref()
-                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
-    }
-    #[cfg(unix)]
-    pub(crate) fn is_running(&self) -> bool {
-        let state = self.request.state();
-        state.running
-            && state
-                .token
-                .as_ref()
-                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
-    }
-    /// Request only the captured Unix run; an old command cannot stop its successor.
-    #[cfg(unix)]
-    #[lore_macro::test_pub]
-    pub(crate) fn request_stop(&self) -> bool {
-        {
-            let mut state = self.request.state();
-            if !state.starting
-                || state
-                    .token
-                    .as_ref()
-                    .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
-            {
-                return false;
-            }
-            state.requested = true;
-        }
-        self.request.notify.notify_waiters();
-        true
     }
 }
 
@@ -803,8 +800,6 @@ fn stop_request() -> &'static Arc<StopRequest> {
 /// it ends. Dropping it makes the process one that runs no service.
 pub struct ServiceStartGuard {
     request: Arc<StopRequest>,
-    #[cfg(unix)]
-    token: Arc<()>,
 }
 
 impl ServiceStartGuard {
@@ -812,54 +807,13 @@ impl ServiceStartGuard {
     pub fn stop_request(&self) -> ServiceStopRequest {
         ServiceStopRequest {
             request: Arc::clone(&self.request),
-            #[cfg(unix)]
-            token: self.token.clone(),
         }
-    }
-    #[cfg(unix)]
-    #[lore_macro::test_pub]
-    pub(crate) fn bind_owner(&self, owner: &Arc<crate::service::owner::ServiceOwner>) -> bool {
-        let mut state = self.request.state();
-        if state
-            .token
-            .as_ref()
-            .is_none_or(|token| !Arc::ptr_eq(token, &self.token))
-            || state
-                .owner
-                .as_ref()
-                .and_then(std::sync::Weak::upgrade)
-                .is_some()
-        {
-            return false;
-        }
-        if !owner.bind_stop(self.stop_request()) {
-            return false;
-        }
-        state.owner = Some(Arc::downgrade(owner));
-        true
     }
 }
 
 impl Drop for ServiceStartGuard {
     fn drop(&mut self) {
-        #[cfg(not(unix))]
         self.request.end_service();
-        #[cfg(unix)]
-        {
-            let mut state = self.request.state();
-            if state
-                .token
-                .as_ref()
-                .is_some_and(|token| Arc::ptr_eq(token, &self.token))
-            {
-                state.running = false;
-                state.starting = false;
-                state.token = None;
-                state.owner = None;
-            }
-            drop(state);
-            self.request.notify.notify_waiters();
-        }
     }
 }
 
@@ -871,57 +825,10 @@ impl Drop for ServiceStartGuard {
 /// socket and mounting is not lost. Clears any stop asked for an earlier service,
 /// so that a service started after one has stopped is not stopped on arrival.
 pub fn begin_service_start() -> Option<ServiceStartGuard> {
-    #[cfg(unix)]
-    {
-        crate::service::shutdown::with_start_admission(begin_service_start_unchecked)
-            .ok()
-            .flatten()
-    }
-    #[cfg(not(unix))]
-    begin_service_start_unchecked()
-}
-
-pub(crate) fn begin_service_start_unchecked() -> Option<ServiceStartGuard> {
     let request = Arc::clone(stop_request());
     // Built only on success: a guard made for a refused start would clear the state
     // of the service that holds it when dropped.
-    begin_service_start_for(request)
-}
-
-#[lore_macro::test_pub]
-fn begin_service_start_for(request: Arc<StopRequest>) -> Option<ServiceStartGuard> {
-    request.begin_start().then(|| {
-        #[cfg(unix)]
-        let token = request
-            .state()
-            .token
-            .clone()
-            .expect("a successful start owns a run token");
-        ServiceStartGuard {
-            request,
-            #[cfg(unix)]
-            token,
-        }
-    })
-}
-#[cfg(unix)]
-#[lore_macro::test_pub]
-fn owner_for(request: &StopRequest) -> Option<Arc<crate::service::owner::ServiceOwner>> {
-    let state = request.state();
-    if !state.starting {
-        return None;
-    }
-    state.owner.as_ref().and_then(std::sync::Weak::upgrade)
-}
-#[cfg(unix)]
-#[lore_macro::test_pub]
-pub(crate) fn current_service_owner() -> Option<Arc<crate::service::owner::ServiceOwner>> {
-    owner_for(STOP_REQUEST.get()?.as_ref())
-}
-#[cfg(unix)]
-#[lore_macro::test_pub]
-pub(crate) fn current_stop_request() -> Option<ServiceStopRequest> {
-    STOP_REQUEST.get()?.bound_stop_request()
+    request.begin_start().then(|| ServiceStartGuard { request })
 }
 
 /// Records that this process runs the service, which is what makes a stop act on
@@ -929,19 +836,7 @@ pub(crate) fn current_stop_request() -> Option<ServiceStopRequest> {
 /// bound, so that a process which lost it never claims to be the service for the
 /// moments before it exits.
 pub fn register_service_process(guard: &ServiceStartGuard) {
-    #[cfg(not(unix))]
     guard.request.set_running();
-    #[cfg(unix)]
-    {
-        let mut state = guard.request.state();
-        if state
-            .token
-            .as_ref()
-            .is_some_and(|token| Arc::ptr_eq(token, &guard.token))
-        {
-            state.running = true;
-        }
-    }
 }
 
 /// Whether the service runs in this process, which is what makes a stop act on
@@ -955,7 +850,6 @@ pub(crate) fn service_runs_in_this_process() -> bool {
 
 /// Asks the service running in this process to stop, and reports whether there
 /// was one to ask. This is the one path to a stop for both `stop` and `quit`.
-#[cfg(any(not(unix), feature = "test-util"))]
 #[lore_macro::test_pub]
 pub(crate) fn request_service_stop() -> bool {
     STOP_REQUEST

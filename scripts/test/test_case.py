@@ -93,6 +93,28 @@ def test_case(new_lore_repo):
 
 
 @pytest.mark.smoke
+def test_case_only_rename_reaches_sync(new_lore_repo):
+    """A revision whose only change renames a file in case commits without
+    force, and a sync of another instance renames the file on disk."""
+    repo: Lore = new_lore_repo()
+    docs = Path("Docs")
+    repo.write_commit_push(
+        None, {docs / "Guide.txt": "guide\n", docs / "notes.txt": "notes\n"}
+    )
+    clone = repo.clone()
+
+    repo.move(docs / "Guide.txt", docs / "guide.txt")
+    repo.stage(scan=True, case="rename")
+    repo.commit()
+    repo.push()
+
+    clone.sync()
+    assert sorted(os.listdir(clone.path / docs)) == ["guide.txt", "notes.txt"]
+    with clone.open_file(docs / "guide.txt") as f:
+        assert f.read() == "guide\n"
+
+
+@pytest.mark.smoke
 def test_case_directory_rename(new_lore_repo):
     repo: Lore = new_lore_repo()
 
@@ -197,15 +219,19 @@ def test_case_directory_rename(new_lore_repo):
     for file_name in [changed_case_file, ignored_file, added_file]:
         assert os.path.isfile(clone.path / renamed_dir / file_name)
 
-    # Sync back to revision 1 and verify original casing is restored
+    # Sync back to revision 1 and verify original casing is restored: the files revision 1
+    # holds, under the names it spells them with.
     repo.sync("@1")
     files = [str(p) for p in repo.list_paths()]
     assert str(original_dir) in files, "Original directory not restored by sync"
     assert str(renamed_dir) not in files, "Renamed directory not reverted by sync"
-    for file_name in [changed_case_file, ignored_file, deleted_file]:
+    for file_name in [case_file, ignored_file, deleted_file]:
         assert os.path.isfile(repo.path / original_dir / file_name)
 
 
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
 @pytest.mark.smoke
 def test_case_directory_keep(new_lore_repo):
     repo: Lore = new_lore_repo()
@@ -302,6 +328,35 @@ def test_case_keep(new_lore_repo):
 
 
 @pytest.mark.smoke
+@pytest.mark.parametrize("force", [False, True])
+def test_case_variant_in_a_deleted_directory_is_deleted_with_it(new_lore_repo, force):
+    """A file the working tree spells in another case than the revision does is deleted with
+    the directory a later revision deletes, forced or not."""
+    repo: Lore = new_lore_repo()
+    directory = Path("Plugin")
+    repo.write_commit_push(None, {directory / "VerseInput.Build.cs": os.urandom(1174)})
+
+    repo.move(directory / "VerseInput.Build.cs", directory / "VerseInput.build.cs")
+    repo.stage(scan=True, case="rename")
+    repo.commit()
+    repo.push()
+
+    repo.rmtree(directory)
+    repo.stage(scan=True)
+    repo.commit()
+    repo.push()
+
+    repo.sync("@1")
+    repo.sync("@2")
+    repo.move(directory / "VerseInput.build.cs", directory / "VerseInput.Build.cs")
+    repo.sync("@3", force=force)
+    assert not repo.path_exists(directory), "The sync has to delete the directory"
+
+
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
+@pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"
 )
@@ -362,6 +417,9 @@ def test_case_directory_unification_keep(new_lore_repo):
     assert "added.bin" in clone_shared_files, "Added file missing in clone"
 
 
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
 @pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"
@@ -450,6 +508,9 @@ def test_case_directory_unification_rename(new_lore_repo):
     assert os.path.isfile(os.path.join(repo.path, dir_name, "Shared", "original.bin"))
 
 
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
 @pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"
@@ -488,6 +549,9 @@ def test_case_file_variant_conflict(new_lore_repo):
         repo.stage(scan=True, case="keep")
 
 
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
 @pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"
@@ -524,6 +588,9 @@ def test_case_mixed_file_directory_variant_conflict(new_lore_repo):
         repo.stage(scan=True, case="keep")
 
 
+@pytest.mark.own_vfs(
+    "keeps case variants side by side, which a virtual clone's mount serves as one"
+)
 @pytest.mark.smoke
 @pytest.mark.skipif(
     sys.platform != "linux", reason="Requires case-sensitive filesystem"

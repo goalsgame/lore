@@ -15,6 +15,8 @@ use lore_server::grpc::forwarded_requests::CallerContext;
 use lore_server::grpc::forwarded_revision::v1::branch_delete::*;
 use lore_server::grpc::get_write_token;
 use lore_server::grpc::handlers::branch_push;
+use lore_server::grpc::handlers::branch_push::PushHandler;
+use lore_server::grpc::handlers::branch_push::PushReport;
 use lore_server::hooks::HookDispatcher;
 use lore_telemetry::InstrumentProvider;
 use lore_transport::grpc::REPOSITORY_ID_KEY;
@@ -25,6 +27,7 @@ use tonic::Request;
 use crate::notification::testing::MockNotificationSender;
 use crate::store::test_support::test_store_create;
 
+#[derive(Clone)]
 struct TestInstrumentProvider {}
 
 impl InstrumentProvider for TestInstrumentProvider {
@@ -70,6 +73,7 @@ async fn create_test_branch(repository_context: Arc<RepositoryContext>, branch: 
         false,
         DEFAULT_HISTORY_STEP_SIZE,
         lore_server::grpc::server::RevisionListAcceleration::default(),
+        &mut PushReport::new(PushHandler::Legacy, Default::default()),
     )
     .await
     .expect("Failed to push latest revision")
@@ -132,7 +136,7 @@ async fn missing_user_id_returns_internal_error() {
             tonic::metadata::BinaryMetadataValue::from_bytes(repository.data()),
         );
 
-        let hook_dispatcher = HookDispatcher::empty();
+        let hook_dispatcher = Arc::new(HookDispatcher::empty());
         let err = handler(
             request,
             immutable_store,
@@ -177,7 +181,7 @@ mod base_branch_delete_handler {
             ));
             create_test_branch(repository_context, branch_id).await;
 
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let response = handler(
                 make_forwarded_request(repository, branch_id),
                 immutable_store,
@@ -210,7 +214,7 @@ mod base_branch_delete_handler {
         let instrument_provider = TestInstrumentProvider {};
 
         Box::pin(LORE_CONTEXT.scope(execution, async move {
-            let hook_dispatcher = HookDispatcher::empty();
+            let hook_dispatcher = Arc::new(HookDispatcher::empty());
             let err = handler(
                 make_forwarded_request(repository, branch_id),
                 immutable_store,

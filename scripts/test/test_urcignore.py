@@ -4,6 +4,7 @@ import logging
 import os
 
 import pytest
+from status_util import Operation, verify_operations_in_status
 
 from lore import Lore
 
@@ -19,7 +20,8 @@ def test_urcignore_committed_file(new_lore_repo):
     Scenario:
     1. Commit a file (data.bin) normally.
     2. Add a .loreignore rule that matches that file.
-    3. Verify outbound commands (status, stage) skip the ignored file.
+    3. Verify outbound commands (status, stage) still handle the file: the
+       ignore rules govern only what the tree does not track (ADR-00027).
     4. Verify inbound commands (sync, branch switch, revision diff between
        two revisions, restore) still handle the ignored-but-committed file.
     """
@@ -62,22 +64,25 @@ def test_urcignore_committed_file(new_lore_repo):
     repo.commit("Add ignore file excluding data.bin")
     repo.push()
 
-    # -- Outbound: status should NOT show data.bin as unstaged/untracked --
-    # Modify the ignored file on disk
+    # -- Outbound: status reports a change to the tracked file --
+    # Modify the ignored-but-committed file on disk
     with repo.open_file(committed_file, "w+b") as f:
         f.write(os.urandom(512))
 
     output = repo.repository_status(unstaged=True)
-    assert "data.bin" not in output, "status should not report ignored file data.bin"
-
-    # -- Outbound: stage should skip the ignored file --
-    repo.stage(scan=True)
-    output = repo.repository_status()
-    assert "data.bin" not in output, (
-        "stage should not have staged the ignored file data.bin"
+    assert "data.bin" in output, (
+        "status should report a change to ignored-but-committed file data.bin"
     )
 
-    # Reset the local modification so it doesn't interfere with sync
+    # -- Outbound: stage takes the change without --force --
+    repo.stage(scan=True)
+    output = repo.repository_status()
+    assert "data.bin" in output, (
+        "stage should have staged the change to ignored-but-committed file data.bin"
+    )
+
+    # Unstage and reset the local modification so it doesn't interfere with sync
+    repo.unstage(".")
     repo.file_reset()
 
     # -- Inbound: revision diff between two committed revisions should include data.bin --
@@ -215,6 +220,7 @@ def test_urcignore_merge_new_file_from_incoming_branch(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
 @pytest.mark.smoke
 def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     """
@@ -284,6 +290,95 @@ def test_urcignore_branch_switch_preserves_ignored_file(new_lore_repo):
     )
 
 
+@pytest.mark.own_vfs("resets local changes, which a virtual clone refuses: it holds whole revisions")
+@pytest.mark.smoke
+@pytest.mark.parametrize("command", ["sync", "branch switch"])
+def test_urcignore_reset_restores_committed_file(new_lore_repo, command):
+    """
+    Verify that `sync --reset` and `branch switch --reset` carry the target
+    revision's change to a committed file an ignore rule matches over a local
+    edit, and its deletes of others, and leave untracked files alone, whether
+    an ignore rule matches them or not.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_files(
+        {
+            "Game/cache.tmp": "committed\n",
+            "Game/gone.tmp": "committed\n",
+            "Saved/Old/drop.ini": "committed\n",
+        }
+    )
+    repo.stage(scan=True)
+    repo.commit("Commit files before the ignore rules")
+    repo.write_commit_push("Add ignore rules", {repo.ignore_file(): "*.tmp\nSaved/\n"})
+
+    clone = repo.clone()
+    if command == "branch switch":
+        clone.branch_create("feature")
+        clone.branch_switch("feature")
+
+    repo.write_files({"Game/cache.tmp": "incoming\n"})
+    repo.remove_file("Game/gone.tmp")
+    repo.rmtree("Saved")
+    repo.stage(["Game/cache.tmp", "Game/gone.tmp", "Saved/Old/drop.ini"], force=True)
+    repo.commit("Change and delete ignored committed files")
+    repo.push()
+
+    untracked = {
+        "Game/build.tmp": "untracked\n",
+        "Game/notes.txt": "untracked\n",
+        "Saved/Old/run.log": "untracked\n",
+    }
+    clone.write_files({"Game/cache.tmp": "local\n", **untracked})
+    if command == "sync":
+        clone.sync(reset=True)
+    else:
+        clone.branch_switch("main", reset=True)
+
+    for path, content in {"Game/cache.tmp": "incoming\n", **untracked}.items():
+        assert clone.file_exists(path), f"{command}: {path} is missing"
+        with clone.open_file(path) as f:
+            assert f.read() == content, f"{command}: {path} does not hold {content!r}"
+    for path in ["Game/gone.tmp", "Saved/Old/drop.ini"]:
+        assert not clone.file_exists(path), f"{command}: {path} survived the reset"
+
+
+@pytest.mark.smoke
+def test_urcignore_directory_rule_leaves_files_of_that_name(new_lore_repo):
+    """A directory-only rule such as `Intermediate/` leaves out directories of
+    that name and nothing else: a file `src/Intermediate` is reported, diffed,
+    staged, committed and locked like any other file.
+    """
+    repo: Lore = new_lore_repo()
+
+    with repo.open_file(repo.ignore_file(), "w+") as f:
+        f.write("Intermediate/\n")
+    repo.make_dirs("src")
+    with repo.open_file("src/Intermediate", "w+") as f:
+        f.write("file\n")
+
+    output = repo.status(scan=True)
+    verify_operations_in_status(output, [], untracked_files=["src/Intermediate"])
+    assert "+++ src/Intermediate" in repo.diff("src/Intermediate"), (
+        "diff should report the file src/Intermediate"
+    )
+
+    repo.stage(scan=True)
+    verify_operations_in_status(repo.status(), [(Operation.ADD, "src/Intermediate")])
+
+    repo.commit("Add src/Intermediate")
+    repo.push()
+
+    assert repo.lock_acquire("src/Intermediate").acquired == ["src/Intermediate"]
+    assert [lock.file for lock in repo.lock_status("src/Intermediate")] == [
+        "src/Intermediate"
+    ]
+    assert [lock.file for lock in repo.lock_query("main", path="src/Intermediate")] == [
+        "src/Intermediate"
+    ]
+    assert repo.lock_release("src/Intermediate").released == ["src/Intermediate"]
+
+
 @pytest.mark.smoke
 def test_urcignore_legacy_fallback(new_lore_repo):
     """A legacy `.urcignore` is honored as a fallback when no `.loreignore`
@@ -325,4 +420,86 @@ def test_urcignore_legacy_fallback(new_lore_repo):
     )
     assert "legacy.tmp" in output, (
         ".urcignore must no longer be consulted once .loreignore exists"
+    )
+
+
+def _without_warnings(output: str) -> str:
+    """`output` without the warnings Lore logs, which name paths of their own."""
+    return "\n".join(
+        line for line in output.splitlines() if not line.startswith("[Warn]")
+    )
+
+
+@pytest.mark.smoke
+def test_instance_ignore_rules(new_lore_repo):
+    """
+    The `ignore` file in the instance's Lore directory excludes untracked
+    entries from the working-directory operations as `.loreignore` does,
+    without being committed: an untracked file under a rule drops out of
+    `status --scan` and a scanning stage, an edit to a tracked file under it
+    still flows through, and `--force stage` stages the untracked file. A `!`
+    line is skipped with a warning naming it.
+    """
+    repo: Lore = new_lore_repo()
+    repo.write_files(
+        {
+            "Binaries/Win64/tool.exe": "tracked\n",
+            "notes.txt": "tracked\n",
+        }
+    )
+    repo.stage(scan=True)
+    repo.commit("Commit files before the instance ignore rules")
+
+    with open(os.path.join(repo.dot_path(), "ignore"), "w") as f:
+        f.write("# build outputs\n\nBinaries/\n!Binaries/Win64/\n")
+    repo.write_files(
+        {
+            "Binaries/Mac/editor": "untracked\n",
+            "Binaries/Win64/tool.exe": "edited\n",
+            "notes.txt": "edited\n",
+        }
+    )
+
+    output = repo.status(scan=True)
+    # Windows paths print with either separator, so compare them with forward slashes
+    ignore_path = os.path.join(repo.dot_path(), "ignore").replace("\\", "/")
+    warning = f"Skipping line 4 of {ignore_path}, !Binaries/Win64/"
+    assert warning in output.replace("\\", "/"), (
+        f"no warning names the skipped re-inclusion:\n{output}"
+    )
+    entries = _without_warnings(output)
+    assert "editor" not in entries, (
+        f"status --scan reports an untracked file the instance ignore file excludes:\n{output}"
+    )
+    assert "notes.txt" in entries, "status --scan should report notes.txt"
+    assert "tool.exe" in entries, (
+        f"status --scan should report an edit to a tracked file under a rule:\n{output}"
+    )
+
+    diff = _without_warnings(repo.diff())
+    assert "notes.txt" in diff, "diff should report notes.txt"
+    assert "tool.exe" in diff, f"diff should report an edit to a tracked file:\n{diff}"
+
+    repo.stage(scan=True)
+    output = _without_warnings(repo.status())
+    verify_operations_in_status(
+        output,
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
+    )
+    assert "editor" not in output, (
+        f"a scanning stage staged an untracked file the instance ignore file excludes:\n{output}"
+    )
+    assert ".lore" not in output, "the instance ignore file must never be staged"
+
+    repo.stage("Binaries/Mac/editor", force=True)
+    verify_operations_in_status(
+        repo.status(),
+        [
+            (Operation.MODIFY, "Binaries/Win64/tool.exe"),
+            (Operation.ADD, "Binaries/Mac/editor"),
+            (Operation.MODIFY, "notes.txt"),
+        ],
     )

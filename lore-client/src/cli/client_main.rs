@@ -25,10 +25,32 @@ fn runs_the_service(command: &LoreCommands) -> bool {
     )
 }
 
-/// Commands that retain their work in this foreground process.
+/// Sets the variables the token store reads, `LORE_AUTH_STORE` and `LORE_AUTH_PATH`, from the
+/// global configuration's `[auth]` settings, leaving any the environment already sets to a value
+/// that isn't blank.
+///
+/// # Safety
+///
+/// It sets environment variables, so no other thread may exist while it runs.
+unsafe fn apply_auth_settings(settings: &lore::AuthSettings) {
+    for (name, value) in auth_variables_to_set(settings, |name| std::env::var_os(name)) {
+        // SAFETY: the caller guarantees that no other thread exists.
+        unsafe { std::env::set_var(name, value) };
+    }
+}
+
+/// The variables of `settings` to set, given the value `current` reads for each: those it reads as
+/// unset or blank.
 #[lore_macro::test_pub]
-fn runs_locally(command: &LoreCommands) -> bool {
-    runs_the_service(command) || matches!(command, LoreCommands::Mount(_))
+fn auth_variables_to_set(
+    settings: &lore::AuthSettings,
+    current: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Vec<(&'static str, std::ffi::OsString)> {
+    settings
+        .variables()
+        .into_iter()
+        .filter(|(name, _)| current(name).is_none_or(|set| set.is_empty()))
+        .collect()
 }
 
 pub fn client_main() -> ExitCode {
@@ -54,6 +76,15 @@ pub fn client_main() -> ExitCode {
         return ExitCode::from(2);
     };
 
+    match lore::load_auth_settings() {
+        // SAFETY: no thread has been started yet.
+        Ok(settings) => unsafe { apply_auth_settings(&settings) },
+        Err(err) => {
+            crate::eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    }
+
     let log_config = match logging::log_config_from_args(&cli) {
         Ok(config) => config,
         Err(err) => {
@@ -77,13 +108,6 @@ pub fn client_main() -> ExitCode {
         lore::set_thread_limit(max_threads);
     }
 
-    // After the thread limit, which this reads, and before the first command: the
-    // handlers below build the runtime themselves and then call the async API, so
-    // by the time the library could decide this the runtime it would size exists.
-    if !runs_locally(cli_command) {
-        lore::size_threads_for_relaying();
-    }
-
     let mut globals = match lore_globals_from_args(&cli) {
         Ok(globals) => globals,
         Err(err) => {
@@ -96,9 +120,29 @@ pub fn client_main() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
+    // After the thread limit, which this reads, and before the first command: the
+    // handlers below build the runtime themselves and then call the async API, so
+    // by the time the library could decide this the runtime it would size exists.
+    if runs_the_service(cli_command) {
+        lore::size_threads_for_service();
+    } else {
+        // A process that relays its calls builds its runtime here, sized for relaying, and
+        // sizing for its connections then finds it built.
+        lore::size_threads_for_relaying();
+        lore::size_threads_for_connections(globals.max_connections);
+    }
+
+    // This executable runs the service with `service run`, so a command only the service may
+    // carry out, such as one in a virtual clone, can start one from it.
+    lore::serve_from_this_executable();
+
     let result = handle_lore_commands(cli_command, globals);
 
     lore::shutdown();
+
+    if lore::memory_stats_requested() {
+        crate::eprintln!("{}", lore::memory_summary());
+    }
 
     if cli.time {
         crate::println!("Executed in {:.2}s", time_start.elapsed().as_secs_f32());

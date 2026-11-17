@@ -1690,12 +1690,6 @@ impl GcpImmutableStore {
 
 #[async_trait]
 impl ImmutableStoreTrait for GcpImmutableStore {
-    async fn hold_for_command(
-        self: Arc<Self>,
-    ) -> Result<Option<lore_storage::local::store_lock::StoreGuard>, StoreError> {
-        Ok(None)
-    }
-
     fn isolates_partitions(&self) -> bool {
         true
     }
@@ -2081,7 +2075,20 @@ impl ImmutableStoreTrait for GcpImmutableStore {
         Ok(())
     }
 
-    async fn flush(self: Arc<Self>, _sync_data: bool) -> Result<(), StoreError> {
+    /// Nothing on disk to claim.
+    async fn hold_for_command(
+        self: std::sync::Arc<Self>,
+    ) -> std::result::Result<
+        Option<lore_storage::local::store_lock::StoreGuard>,
+        lore_storage::StoreError,
+    > {
+        Ok(None)
+    }
+
+    async fn flush(
+        self: Arc<Self>,
+        _options: lore_storage::FlushOptions,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
 

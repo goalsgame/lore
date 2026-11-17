@@ -17,30 +17,8 @@ mod repository;
 mod revision;
 mod revision_tree;
 mod sandbox_tests;
-#[cfg(target_os = "linux")]
-mod service_owned_mount;
-#[cfg(unix)]
-mod service_owner;
-#[cfg(unix)]
-mod service_shutdown;
-mod service_state_scope;
+mod service;
 mod storage;
-#[cfg(unix)]
-mod working_mount;
-#[cfg(unix)]
-mod working_mount_admission;
-#[cfg(unix)]
-mod working_mount_bootstrap;
-#[cfg(unix)]
-mod working_mount_candidate_policy;
-#[cfg(unix)]
-mod working_mount_factory;
-#[cfg(unix)]
-mod working_mount_local_policy;
-#[cfg(unix)]
-mod working_mount_reservation;
-#[cfg(unix)]
-mod working_mount_worker;
 
 /// Points the unit tests at a global config, credential store and service socket of
 /// their own, rather than the machine's, and keeps them from relaying.
@@ -66,6 +44,9 @@ fn sandbox_machine_settings() {
     // window where writing to the environment has no reader to race.
     unsafe {
         std::env::set_var("LORE_USE_SERVICE", "0");
+        // No executable to start a service from, so a call only the service may carry out fails
+        // here rather than starting one from a build a developer named for their own use.
+        std::env::remove_var("LORE_SERVICE_EXECUTABLE");
         std::env::set_var("LORE_GLOBAL_PATH", &sandbox);
         std::env::set_var("LORE_AUTH_PATH", &sandbox);
         std::env::set_var(

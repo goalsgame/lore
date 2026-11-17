@@ -127,7 +127,7 @@ pub async fn write_fragmented(
                 Address { context, hash },
                 fragment,
                 Payload::Shared(chunk_buffer),
-                flags.local_cache_priority,
+                flags.cache_local(),
                 remote_session,
                 writes,
                 chunk_permit,
@@ -152,7 +152,7 @@ pub async fn write_fragmented(
                     Address { context, hash },
                     fragment,
                     chunk_buffer,
-                    flags.local_cache_priority,
+                    flags.cache_local(),
                     session,
                     task_writes,
                     chunk_permit,
@@ -229,34 +229,6 @@ pub(crate) async fn write_fragmented_from_file(
     writes: WriteContext,
     publish: Option<Arc<FusedPublish>>,
 ) -> Result<(Address, bool, bool), StorageError> {
-    write_fragmented_from_file_digest(
-        store,
-        partition,
-        context,
-        handle,
-        size,
-        flags,
-        remote_session,
-        writes,
-        publish,
-        None,
-    )
-    .await
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn write_fragmented_from_file_digest(
-    store: Arc<dyn ImmutableStore>,
-    partition: Partition,
-    context: Context,
-    handle: crate::content::ContentHandle,
-    size: usize,
-    flags: WriteOptions,
-    remote_session: Option<Arc<StorageSession>>,
-    writes: WriteContext,
-    publish: Option<Arc<FusedPublish>>,
-    mut sha256: Option<&mut ring::digest::Context>,
-) -> Result<(Address, bool, bool), StorageError> {
     let mut tasks = JoinSet::<Result<StoredChunk, StorageError>>::new();
 
     lore_base::lore_trace!(
@@ -275,7 +247,6 @@ pub(crate) async fn write_fragmented_from_file_digest(
 
     let mut results = ChunkResults::default();
     let mut chunk_index = 0usize;
-    let mut hashed_bytes = 0u64;
     while let Some(chunk) = chunker.next_chunk().await? {
         results.reap(&mut tasks);
         if results.failure.is_some() {
@@ -285,15 +256,6 @@ pub(crate) async fn write_fragmented_from_file_digest(
         let chunk_offset = chunk.offset as usize;
         let chunk_buffer = chunk.data;
         let chunk_size = chunk_buffer.len();
-        if let Some(digest) = sha256.as_mut() {
-            if chunk.offset != hashed_bytes {
-                return Err(StorageError::internal(
-                    "ingestion chunks are not contiguous",
-                ));
-            }
-            hashed_bytes += chunk_size as u64;
-            digest.update(&chunk_buffer);
-        }
 
         let fragment = Fragment {
             flags: flags.into(),
@@ -318,7 +280,7 @@ pub(crate) async fn write_fragmented_from_file_digest(
                     Address { context, hash },
                     fragment,
                     chunk_buffer,
-                    flags.local_cache_priority,
+                    flags.cache_local(),
                     session,
                     task_writes,
                     chunk_budget,
@@ -340,10 +302,6 @@ pub(crate) async fn write_fragmented_from_file_digest(
     // Holding a window while the list waits for budget is the hold-and-wait the
     // reservation exists to avoid.
     drop(chunker);
-
-    if sha256.is_some() && results.failure.is_none() && hashed_bytes != file_size {
-        return Err(StorageError::internal("ingestion content length mismatch"));
-    }
 
     write_chunk_list(
         tasks,
@@ -636,7 +594,7 @@ async fn write_fragmentlist_impl(
                         Address { context, hash },
                         fragment,
                         chunk_buffer,
-                        flags.local_cache_priority,
+                        flags.cache_local(),
                         session,
                         task_writes,
                         permit,

@@ -23,6 +23,8 @@ enum_dispatch = { workspace = true }
 futures = { workspace = true }
 hex = { workspace = true }
 http = { workspace = true }
+hyper = { workspace = true, features = ["server", "http2"] }
+hyper-util = { workspace = true, features = ["tokio"] }
 jsonwebtoken = { workspace = true }
 opentelemetry = { workspace = true }
 opentelemetry-semantic-conventions = { workspace = true }
@@ -30,6 +32,7 @@ parking_lot = { workspace = true }
 pin-project = { workspace = true }
 prost-types = { workspace = true }
 quinn = { workspace = true }
+quinn-proto = { workspace = true }
 rand = { workspace = true }
 reqwest = { workspace = true }
 ring = { workspace = true }
@@ -85,6 +88,8 @@ tonic-prost-build = { workspace = true }
 # The unit-test binary's store policies, set before the harness starts; see tests/unit/main.rs.
 ctor = { workspace = true }
 lore-base = { workspace = true, features = ["test-util"] }
+lore-credential = { workspace = true }
+lore-storage = { workspace = true, features = ["test-util"] }
 axum-test = { version = "18.1.0", default-features = false }
 rcgen = { workspace = true }
 http-body = "1.0.1"
@@ -93,7 +98,11 @@ indexmap = { workspace = true }
 mockall = { workspace = true }
 opentelemetry_sdk = { workspace = true, features = ["testing"] }
 temp-env = { workspace = true }
+# `start_paused` for the tests that time push phases on a virtual clock.
+tokio = { workspace = true, features = ["test-util"] }
 lore-server = { workspace = true, features = ["test-util"] }
+# The points where a test stops a branch write, to leave a restore stopped part way.
+lore-revision = { workspace = true, features = ["test-util"] }
 
 [features]
 default = []
@@ -105,11 +114,18 @@ seeding = ["lore-revision/seeding"]
 # Enables fault-injection in the storage layer (e.g. LORE_MISS_FRAGMENT_WRITES).
 # Used by smoke tests that exercise missing-fragment recovery paths.
 failure_generator = ["lore-storage/failure_generator"]
+# Builds the `uds-bench` example, which the container tests drive.
+uds-bench = []
 
 [[bin]]
 name = "loreserver"
 # The binary holds no unit tests; the library it drives does.
 test = false
+
+[[example]]
+name = "uds-bench"
+path = "examples/uds_bench.rs"
+required-features = ["uds-bench"]
 
 [lib]
 name = "lore_server"

@@ -177,8 +177,8 @@ fn require_free_destination(held: FileInfo, destination: &Path) -> Result<(), Wr
 
 /// What the host filesystem holds at `destination`, for a destination no operation covers.
 async fn host_file_info(destination: &Path) -> Result<FileInfo, WriteError> {
-    match lore_io::IoDriver::global().metadata(destination).await {
-        Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
+    match lore_io::IoDriver::global().stat(destination).await {
+        Ok(stat) => Ok(FileInfo::from_stat(&stat)),
         Err(err) if err.kind() == tokio::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
         Err(err) => Err(WriteError::internal_with_context(
             err,
@@ -206,9 +206,11 @@ pub(crate) async fn write_file(
             execution_context().globals().search_location(),
         )
         .await
-        .map_err(|_err| {
-            WriteError::from(RevisionNotFound {
-                revision: revision.clone(),
+        .map_err(|err| {
+            forward_refusal_or(err, "resolving the revision", |_err| {
+                WriteError::from(RevisionNotFound {
+                    revision: revision.clone(),
+                })
             })
         })?
     } else {
@@ -231,9 +233,11 @@ pub(crate) async fn write_file(
     let node_link = state
         .find_node_link(repository.clone(), relative_path.as_str())
         .await
-        .map_err(|_err| {
-            WriteError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "finding the node", |_err| {
+                WriteError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
     if !node_link.is_valid() {
@@ -246,9 +250,11 @@ pub(crate) async fn write_file(
     let node = state
         .node(repository.clone(), node_link.node)
         .await
-        .map_err(|_err| {
-            WriteError::from(FileNotFound {
-                resource: relative_path.to_string(),
+        .map_err(|err| {
+            forward_refusal_or(err, "reading the node", |_err| {
+                WriteError::from(FileNotFound {
+                    resource: relative_path.to_string(),
+                })
             })
         })?;
 
@@ -300,15 +306,12 @@ pub(crate) async fn write_file(
                     .internal("Failed to write file")?,
             };
 
-            let node_executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-            if node_executable != util::fs::file_is_executable(&metadata) {
-                util::fs::metadata_set_executable(
-                    destination.as_path(),
-                    &metadata,
-                    node_executable,
-                )
-                .await;
-            }
+            util::fs::metadata_set_executable(
+                destination.as_path(),
+                Some(&metadata),
+                node.mode & NodeFileMode::Executable == NodeFileMode::Executable,
+            )
+            .await;
         }
     }
 

@@ -1,19 +1,25 @@
 //! This module wraps the SWFS C API. Code that requires the SWFS library to be linked is
-//! conditionally compiled based on the "swfs" feature.
-//! The `SwfsInterface` type will always have the same interface, but if the "swfs" feature is
-//! unavailable it will return a `SwfsInterfaceError`.
+//! conditionally compiled for x86-64 Windows, the only target SWFS is available on.
+//! The `SwfsInterface` type will always have the same interface, but on other targets it will
+//! return a `SwfsInterfaceError`.
 //! The `swfs_api` module will always contain the C API's types even if the library isn't linked.
 pub mod swfs_api;
 
+use std::ops::Deref;
 use std::sync::Arc;
 
 use dashmap::DashSet;
+use lore_base::log::LoreLogLevel;
 use lore_error_set::error_set;
 use swfs_api::SWFSHandle;
 
+use crate::event::LoreErrorDetail;
+use crate::fs::swfs::handle_gate::HandleGate;
+use crate::fs::swfs::handle_gate::HandleGateGuard;
 use crate::fs::swfs::mount_resources::MountResources;
 use crate::fs::swfs::mount_resources::SwfsExecutionToken;
 use crate::fs::swfs::paths::RelativePathKey;
+use crate::service_state::ServiceStateImpl;
 
 #[derive(Debug, Clone, Hash, Eq, PartialEq)]
 pub struct WrappedHandle(#[allow(unused)] SWFSHandle);
@@ -36,20 +42,61 @@ pub enum SwfsInterfaceError {}
 
 #[derive(Debug)]
 pub struct SwfsInterface {
-    #[allow(unused)]
-    handle: Option<WrappedHandle>,
+    handle: WrappedHandle,
+    /// Entered for every use of `handle` and of the interface from an SWFS callback, and closed
+    /// by [`SwfsInterface::close`], which waits for the uses in progress before it closes the
+    /// handle.
+    gate: HandleGate,
     #[allow(unused)]
     resources: MountResources,
 }
 
+/// The SWFS handle, for one use of it. [`SwfsInterface::close`] waits for the guard to be
+/// dropped before it closes the handle, so hold it across the call into SWFS.
+pub struct SwfsHandleGuard<'a> {
+    handle: &'a WrappedHandle,
+    _use: HandleGateGuard<'a>,
+}
+
+impl Deref for SwfsHandleGuard<'_> {
+    type Target = WrappedHandle;
+
+    fn deref(&self) -> &WrappedHandle {
+        self.handle
+    }
+}
+
 impl SwfsInterface {
-    pub fn handle(&self) -> Result<WrappedHandle, SwfsInterfaceError> {
-        match self.handle.clone() {
-            Some(handle) => Ok(handle),
-            None => Err(SwfsInterfaceError::internal(
+    /// The handle for one use of it, which keeps the mount from closing until the guard is
+    /// dropped. Fails once the mount has begun to close.
+    pub fn handle(&self) -> Result<SwfsHandleGuard<'_>, SwfsInterfaceError> {
+        let Some(guard) = self.gate.enter() else {
+            return Err(SwfsInterfaceError::internal(
                 "Accessing SWFS handle after closing",
-            )),
-        }
+            ));
+        };
+        Ok(SwfsHandleGuard {
+            handle: &self.handle,
+            _use: guard,
+        })
+    }
+
+    /// The handle as a key for finding this interface from an SWFS callback. It is never passed
+    /// to SWFS, so it stays valid after the mount closes, to remove the entry it keys.
+    pub fn lookup_key(&self) -> WrappedHandle {
+        self.handle.clone()
+    }
+
+    /// Logs `error` and keeps it for the service's status, for code that can't propagate an error
+    /// upwards by returning it, such as callbacks from SWFS.
+    pub(crate) fn handle_lore_error(
+        error: impl lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
+    ) {
+        let message = LoreErrorDetail::from_error(&error).message_with_trace();
+        // Logged as well as kept for the service's status, as `handle_swfs_error` does: a
+        // `read_file` that fails here is served as zeros.
+        crate::lore_error!("SWFS callback failed: {message}");
+        ServiceStateImpl::global().push_log(LoreLogLevel::Error, message);
     }
 }
 
@@ -59,12 +106,12 @@ impl Drop for SwfsInterface {
     }
 }
 
-/// Logic elsewhere should prevent an `SwfsInterface` from being constructed if the "swfs" feature
-/// isn't available, but have this in case of logic errors.
-#[cfg(not(feature = "swfs"))]
+/// Logic elsewhere should prevent an `SwfsInterface` from being constructed on a target SWFS
+/// isn't available on, but have this in case of logic errors.
+#[cfg(not(all(windows, target_arch = "x86_64")))]
 impl SwfsInterface {
     fn no_swfs_error() -> SwfsInterfaceError {
-        SwfsInterfaceError::internal("SWFS feature not enabled")
+        SwfsInterfaceError::internal("SWFS is only available on x86-64 Windows")
     }
 
     pub fn resources(&self) -> &MountResources {
@@ -93,12 +140,17 @@ impl SwfsInterface {
         Err(Self::no_swfs_error())
     }
 
+    /// Close the mount. Does nothing if it is already closed.
+    pub fn close(&self) {
+        self.gate.close(|| {});
+    }
+
     fn cleanup(&mut self) {
-        let _ = self;
+        self.close();
     }
 }
 
-#[cfg(feature = "swfs")]
+#[cfg(all(windows, target_arch = "x86_64"))]
 mod swfs_impl {
     use std::ffi::CStr;
     use std::ffi::c_char;
@@ -111,7 +163,7 @@ mod swfs_impl {
     use tokio::task::yield_now;
 
     use super::*;
-    use crate::event::LoreErrorDetail;
+    use crate::fs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::api_interface::swfs_api::SWFSCallbacks;
     use crate::fs::swfs::api_interface::swfs_api::SWFSFile;
     use crate::fs::swfs::api_interface::swfs_api::SWFSHandle;
@@ -126,11 +178,12 @@ mod swfs_impl {
     use crate::fs::swfs::api_interface::swfs_api::swfsIsBusy;
     use crate::fs::swfs::api_interface::swfs_api::swfsThaw;
     use crate::fs::swfs::file::SwfsFileArray;
-    use crate::fs::swfs::mount_manager_state::MountManagerState;
     use crate::fs::swfs::mount_resources::MountResources;
     use crate::fs::swfs::mount_resources::SwfsWorkError;
+    use crate::fs::swfs::panic_guard::panic_guard_swfs_callback;
     use crate::fs::swfs::paths::SwfsPath;
     use crate::fs::swfs::state::written_files;
+    use crate::lore_debug;
     use crate::service_state::ServiceStateImpl;
 
     impl SwfsInterface {
@@ -138,12 +191,16 @@ mod swfs_impl {
             &self.resources
         }
 
-        pub async fn freeze(&self, token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
-            let handle = self
-                .handle()
-                .forward::<SwfsWorkError>("Unable to freeze")?
-                .handle();
-            if unsafe { swfsFreeze(handle, Some(swfs_freeze_callback), std::ptr::null_mut()) } {
+        #[allow(clippy::unused_async)]
+        pub async fn freeze(&self, _token: SwfsExecutionToken) -> Result<(), SwfsWorkError> {
+            let handle = self.handle().forward::<SwfsWorkError>("Unable to freeze")?;
+            if unsafe {
+                swfsFreeze(
+                    handle.handle(),
+                    Some(swfs_freeze_callback),
+                    std::ptr::null_mut(),
+                )
+            } {
                 Ok(())
             } else {
                 Err(SwfsWorkError::internal("Failed to freeze"))
@@ -190,11 +247,10 @@ mod swfs_impl {
             let files = SwfsFileArray::new(files);
             let handle = self
                 .handle()
-                .forward::<SwfsWorkError>("Getting SWFS handle for thaw")?
-                .handle();
+                .forward::<SwfsWorkError>("Getting SWFS handle for thaw")?;
             if unsafe {
                 swfsThaw(
-                    handle,
+                    handle.handle(),
                     if apply_changes {
                         files.array_ptr()
                     } else {
@@ -232,31 +288,53 @@ mod swfs_impl {
 
             let mut handle = SWFSHandle::default();
 
+            // Paired with the lines around `swfsClose` in `close`, which name the same handle and
+            // path, so that a mount's opening and closing can be matched in a debug log.
+            let mount_path = resources.mount_path_nul_terminated.to_string_lossy();
+            lore_debug!("swfsInit: mounting {mount_path}");
             unsafe {
                 swfsInit(&mut init, &mut handle);
             }
+            lore_debug!("swfsInit: mounted {mount_path} as SWFS handle {handle:?}");
 
             let this = Arc::new(Self {
-                handle: Some(WrappedHandle(handle)),
+                handle: WrappedHandle(handle),
+                gate: HandleGate::default(),
                 resources,
             });
             Ok(this)
         }
 
         pub async fn wait_for_ready(&self) -> Result<(), SwfsInterfaceError> {
-            let handle = self.handle()?;
-            while unsafe { swfsIsBusy(handle.handle()) } {
+            // A guard for each check rather than across the wait, so a close need not wait for
+            // the mount to become ready.
+            while unsafe { swfsIsBusy(self.handle()?.handle()) } {
                 yield_now().await;
             }
             Ok(())
         }
 
-        pub fn cleanup(&mut self) {
-            if let Some(handle) = self.handle.clone() {
+        /// Unmount from SWFS and release the mount path. Does nothing if it is already closed.
+        ///
+        /// [`SwfsInterface::handle`] fails from the moment this is called, and SWFS callbacks no
+        /// longer reach the interface. The handle is closed once the uses already in progress
+        /// end, however long they take, and every caller returns only after it is closed. Must
+        /// not be called while holding a [`SwfsHandleGuard`].
+        pub fn close(&self) {
+            self.gate.close(|| {
+                // Paired with the lines around `swfsInit` in `mount`.
+                let handle = self.handle.handle();
+                let mount_path = self.resources.mount_path_nul_terminated.to_string_lossy();
+                lore_debug!("swfsClose: closing SWFS handle {handle:?} at {mount_path}");
                 unsafe {
-                    swfsClose(handle.handle());
+                    swfsClose(handle);
                 }
-            }
+                lore_debug!("swfsClose: closed SWFS handle {handle:?} at {mount_path}");
+            });
+        }
+
+        pub fn cleanup(&mut self) {
+            self.close();
         }
 
         fn read_file(
@@ -266,10 +344,11 @@ mod swfs_impl {
             read_offset: swfs_u64,
             num_bytes_to_read: swfs_u64,
         ) -> swfs_u64 {
+            self.resources.callbacks().record_read_file();
             let file = unsafe { &mut *file };
             let file_name = unsafe { CStr::from_ptr(file.path).to_string_lossy() };
             let out_buffer = unsafe {
-                &mut *slice_from_raw_parts_mut(out_buffer as *mut u8, num_bytes_to_read as usize)
+                &mut *slice_from_raw_parts_mut(out_buffer.cast::<u8>(), num_bytes_to_read as usize)
             };
             let read_result = self
                 .resources
@@ -294,6 +373,7 @@ mod swfs_impl {
         }
 
         fn fill_dir_begin(&self, path: *const c_char) {
+            self.resources.callbacks().record_directory_evaluation();
             let Some(handle) = Self::handle_lore_result(self.handle()) else {
                 return;
             };
@@ -312,17 +392,22 @@ mod swfs_impl {
             }
         }
 
+        #[allow(clippy::unused_self)]
         fn notify_write(&self, _file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_create(&self, _file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_move(&self, _old_file: *mut SWFSFile, _new_file: *mut SWFSFile) {}
+        #[allow(clippy::unused_self)]
         fn notify_delete(&self, _file: *mut SWFSFile) {}
 
+        #[allow(clippy::unused_self)]
         fn freeze_callback(
             &self,
-            user_data: *mut ::std::os::raw::c_void,
-            start_buff: *mut swfs_ubyte,
-            num_bytes: usize,
-            out_num_buff_bytes: *mut usize,
+            _user_data: *mut ::std::os::raw::c_void,
+            _start_buff: *mut swfs_ubyte,
+            _num_bytes: usize,
+            _out_num_buff_bytes: *mut usize,
         ) -> *mut swfs_ubyte {
             // `start_buff` is an array of `SWFSFile` objects. By default, all files are frozen.
             // Setting the `mod_flag` will cause that file to not be frozen.
@@ -339,18 +424,20 @@ mod swfs_impl {
         ) -> bool {
             let source_filename = unsafe { CStr::from_ptr(source_filename) };
             let error_message = unsafe { CStr::from_ptr(error_message) };
+            let message = format!(
+                "SWFS Error ({}): {}::{}: {}",
+                error_code,
+                source_filename.to_string_lossy(),
+                source_line_number,
+                error_message.to_string_lossy()
+            );
+            // Logged as well as kept for the service's status: the status is only read when asked
+            // for, and SWFS serves a read it could not complete as zeros, so this may be the only
+            // trace of a file served wrong.
+            crate::lore_error!("{message}");
             // SWFS calls this from C with nothing of ours to carry the state,
             // so this is one of the paths that reaches for the global.
-            ServiceStateImpl::global().push_log(
-                LoreLogLevel::Error,
-                format!(
-                    "SWFS Error ({}): {}::{}: {}",
-                    error_code,
-                    source_filename.to_string_lossy(),
-                    source_line_number,
-                    error_message.to_string_lossy()
-                ),
-            );
+            ServiceStateImpl::global().push_log(LoreLogLevel::Error, message);
             false
         }
 
@@ -370,14 +457,6 @@ mod swfs_impl {
                 }
             }
         }
-
-        fn handle_lore_error(
-            error: impl lore_error_set::FfiError + std::fmt::Display + lore_error_set::HasTrace,
-        ) {
-            let error_detail = LoreErrorDetail::from_error(&error);
-            ServiceStateImpl::global()
-                .push_log(LoreLogLevel::Error, error_detail.message_with_trace());
-        }
     }
 
     fn lookup_handle(handle: SWFSHandle) -> Result<Arc<SwfsInterface>, SwfsInterfaceError> {
@@ -385,6 +464,7 @@ mod swfs_impl {
             SwfsInterfaceError::internal("Looking up SWFS interface without SWFS being enabled"),
         )?;
         mount_manager
+            .swfs()
             .get_interface_from_swfs_handle(handle)
             .ok_or(SwfsInterfaceError::internal(
                 "Missing SWFS interface for handle",
@@ -392,24 +472,42 @@ mod swfs_impl {
     }
 
     /// Creates a C function that takes an `SWFSHandle` as its first argument and calls the associated
-    /// method on that handle's `SwfsInterface`.
+    /// method on that handle's `SwfsInterface`, under [`panic_guard_swfs_callback`].
     macro_rules! handle_redirect {
             ($fn_name:ident, $interface_fn_name:ident, ($($arg_name:ident: $arg_ty:ty),* $(,)?) -> $ret_ty:ty) => {
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn $fn_name(handle: SWFSHandle, $($arg_name: $arg_ty),*) -> $ret_ty {
-                    if let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) {
-                        interface.$interface_fn_name($($arg_name),*)
-                    } else {
-                        Default::default()
-                    }
+                    panic_guard_swfs_callback(
+                        stringify!($interface_fn_name),
+                        || {
+                            let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
+                                return Default::default();
+                            };
+                            // Held for the whole callback, so a close waits for it to finish.
+                            let Ok(_use) = interface.handle() else {
+                                return Default::default();
+                            };
+                            interface.$interface_fn_name($($arg_name),*)
+                        },
+                    )
                 }
             };
             ($fn_name:ident, $interface_fn_name:ident, ($($arg_name:ident: $arg_ty:ty),* $(,)?)) => {
                 #[unsafe(no_mangle)]
                 pub unsafe extern "C" fn $fn_name(handle: SWFSHandle, $($arg_name: $arg_ty),*) {
-                    if let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) {
-                        interface.$interface_fn_name($($arg_name),*)
-                    }
+                    panic_guard_swfs_callback(
+                        stringify!($interface_fn_name),
+                        || {
+                            let Some(interface) = SwfsInterface::handle_lore_result(lookup_handle(handle)) else {
+                                return;
+                            };
+                            // Held for the whole callback, so a close waits for it to finish.
+                            let Ok(_use) = interface.handle() else {
+                                return;
+                            };
+                            interface.$interface_fn_name($($arg_name),*)
+                        },
+                    )
                 }
             };
         }
@@ -431,11 +529,13 @@ mod swfs_impl {
         source_line_number: c_int,
         error_message: *const c_char,
     ) -> bool {
-        SwfsInterface::handle_swfs_error(
-            error_code,
-            source_filename,
-            source_line_number,
-            error_message,
-        )
+        panic_guard_swfs_callback("error_callback", || {
+            SwfsInterface::handle_swfs_error(
+                error_code,
+                source_filename,
+                source_line_number,
+                error_message,
+            )
+        })
     }
 }

@@ -109,7 +109,7 @@ pub struct Oidc {
     pub issuer: String,
     /// The public client ID presented to the provider.
     pub client_id: String,
-    /// Default scopes to request at login. Empty leaves the choice to the client.
+    /// Default scopes to request at an interactive (device) login. Empty leaves the choice to the client.
     pub scopes: Vec<String>,
     /// Whether a client takes the OIDC path by default rather than `auth_url`.
     pub preferred: bool,
@@ -119,6 +119,8 @@ pub struct Oidc {
     pub scope_template: Option<String>,
     /// The issuer of the RFC 8693 token-exchange endpoint that mints partition-scoped tokens.
     pub token_exchange_issuer: Option<String>,
+    /// Scopes to request with the client credentials grant. Empty requests none.
+    pub client_credentials_scopes: Vec<String>,
 }
 
 /// A compression mode as it arrives from a server, held as the number it was sent as: the codec
@@ -159,20 +161,35 @@ pub struct BranchPushResponse {
     pub message: Option<String>,
 }
 
-pub struct BranchQueryResponse {
-    /// Branch ID
+/// A branch as Lore Server records it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BranchRecord {
+    /// Branch identifier.
     pub id: BranchId,
-    /// Latest revision
+    /// Branch name.
+    pub name: String,
+    /// Category the branch belongs to.
+    pub category: String,
+    /// Identity that created the branch.
+    pub creator: String,
+    /// Creation time, in milliseconds since the Unix epoch.
+    pub created: u64,
+    /// Latest revision on the branch.
     pub latest: Hash,
-    /// Metadata hash
+    /// Hash of the branch's metadata blob.
     pub metadata: Hash,
-    /// Whether the branch has been deleted (name->id mapping removed)
+    /// Whether the branch is archived: the record remains, and its name no longer maps to it.
     pub deleted: bool,
+    /// Branch points the branch is built on, from its parent's to the root's.
+    pub stack: Vec<BranchPoint>,
 }
+
+/// The answer to a branch query: the branch's record.
+pub type BranchQueryResponse = BranchRecord;
 
 pub struct BranchListResponse {
     /// Branch list
-    pub list: Vec<BranchMetadata>,
+    pub list: Vec<BranchRecord>,
 }
 
 pub struct RevisionListResponse {
@@ -298,6 +315,9 @@ pub struct AuthenticationToken {
     /// without re-authenticating. `None` if the auth backend does not support
     /// refresh. Consumed on use -- the next refresh returns a new one.
     pub refresh_token: Option<String>,
+    /// When `refresh_token` stops working, in milliseconds since the UNIX epoch. 0
+    /// if there is no refresh token, or if the provider did not give a deadline.
+    pub refresh_expires_ms: u64,
     /// The scope the backend granted, space-delimited as RFC 6749 §3.3 has
     /// it. `None` when the backend reports no scope.
     pub scope: Option<String>,
@@ -305,7 +325,7 @@ pub struct AuthenticationToken {
 
 /// Authorization token scoped to a specific resource.
 ///
-/// Returned from `exchange_for_repository` or `exchange_for_custom_resource`.
+/// Returned from `exchange_for_repository` or `exchange_for_custom_resources`.
 /// Shorter-lived than the authentication token and re-obtained via exchange
 /// when expired.
 #[derive(Clone, Debug)]

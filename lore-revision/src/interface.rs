@@ -711,9 +711,9 @@ pub struct LoreGlobalArgs {
     pub store_keep_alive_seconds: u64,
     /// Force sync data to storage media during store flush
     pub sync_data: u8,
-    /// Cache fragment payloads fetched from remote in the local store. Without
-    /// this only state fragments and fragments flagged for local cache priority
-    /// are retained
+    /// Cache fragment payloads fetched from remote, and those written, in the local store, as
+    /// a repository's `[store] cache_payloads` does for every command. Without either only state
+    /// fragments and fragments flagged for local cache priority are retained
     pub cache: u8,
     /// Authentication token to use instead of the one held in the secure token
     /// store. Authorization tokens are exchanged from it as they are needed.
@@ -752,6 +752,13 @@ pub struct LoreGlobalArgs {
     /// takes it from the globals it is opened with. Any non-zero value trusts
     /// the remote, so a caller zeroes the whole struct, padding included
     pub trust_remote: u8,
+    /// Have the call's flushes write the local stores' index in place, rather than replacing each
+    /// of its files through a temporary file, which is faster where creating files is slow. If the
+    /// process stops or a write fails while a file is being written, the store drops every entry
+    /// that file held, including those of revisions and branches not yet pushed. Eviction and
+    /// compaction replace the files they write whatever it says, and it is independent of
+    /// `sync_data`, which syncs what is written either way. Any non-zero value writes in place
+    pub fast_flush: u8,
 }
 
 // Lock the C ABI size of `LoreGlobalArgs` (`lore_global_args_t`), which callers zero-initialize.
@@ -881,6 +888,14 @@ impl LoreGlobalArgs {
         self.sync_data != 0
     }
 
+    /// The options of the flushes this call makes: its `sync_data` and `fast_flush`.
+    pub fn flush_options(&self) -> lore_storage::FlushOptions {
+        lore_storage::FlushOptions {
+            sync_data: self.sync_data(),
+            fast_flush: self.fast_flush != 0,
+        }
+    }
+
     pub fn cache(&self) -> bool {
         self.cache != 0
     }
@@ -1008,7 +1023,7 @@ fn execution_initialize() {
     });
 }
 
-#[derive(PartialEq, Debug)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum ExecutionMode {
     Client,
     Server,
@@ -1021,7 +1036,6 @@ pub struct ExecutionContext {
     user_id: Mutex<String>,
     mode: ExecutionMode,
     caller_state: Option<Arc<dyn Any + Send + Sync>>,
-    provider_resolver: Option<std::sync::Weak<dyn crate::fs::provider_registry::ProviderResolver>>,
     /// What this call's fragment writes cost, accumulated across every write it
     /// performs — including the ones a background tracker task performs and the
     /// ones inside linked and layered repositories, which run under this same
@@ -1036,11 +1050,10 @@ pub struct ExecutionContext {
     /// no counters, and only a push reads them whatever the level.
     fragment_stats: OnceLock<Arc<lore_storage::FragmentWriteStats>>,
     /// What this call's push registered with the peer, accumulated across every
-    /// revision, link and layer it covers.
-    ///
-    /// Kept whatever the statistics level: the per-revision progress event reads
-    /// its share out of these, so they are load-bearing rather than diagnostic.
+    /// revision, link and layer it covers, for the statistics event.
     push_stats: OnceLock<Arc<crate::branch::push::PushStats>>,
+    /// The query and upload slots every push this call makes shares.
+    push_budget: OnceLock<crate::branch::push::PushBudget>,
     /// The environment of the process that relayed this call, read in place of this process's
     /// through [`lore_base::env::var`]. `None` for a call made in this process.
     environment: Option<CallEnvironment>,
@@ -1106,29 +1119,38 @@ impl ExecutionContext {
         }
     }
 
-    /// Detach a long-lived owner from a command's callbacks and opaque caller
-    /// state, preserving its identity, credential environment and weak resolver.
-    /// Construct this before connecting transports or capturing a backend context;
-    /// copying a context cannot detach tasks already spawned under the original.
-    /// Statistics belong to the new owner rather than the completed command.
-    pub async fn for_background_owner(&self) -> Self {
-        let mut dispatcher = EventDispatcher::no_dispatch();
-        dispatcher.correlation_id = self.globals.correlation_id.to_string();
+    /// This context for a holder that serves past the call that made it, a mounted filesystem,
+    /// for a caller with `environment`: these globals and this mode, and a dispatcher that sends
+    /// nowhere, as no call awaits what the holder logs.
+    #[cfg(target_os = "linux")]
+    #[lore_macro::test_pub]
+    pub(crate) fn serving(&self, environment: CallEnvironment) -> Self {
+        let mut dispatcher = EventDispatcher::new(None);
+        dispatcher
+            .correlation_id
+            .clone_from(&self.dispatcher.correlation_id);
+        let user_id = self
+            .user_id
+            .try_lock()
+            .map(|id| id.clone())
+            .unwrap_or_default();
         Self {
             globals: self.globals.clone(),
             dispatcher,
             log_level: self.log_level,
-            user_id: Mutex::new(self.user_id().await),
-            mode: match self.mode {
-                ExecutionMode::Client => ExecutionMode::Client,
-                ExecutionMode::Server => ExecutionMode::Server,
-            },
-            caller_state: None,
-            provider_resolver: self.provider_resolver.clone(),
-            fragment_stats: OnceLock::new(),
-            push_stats: OnceLock::new(),
-            environment: self.environment.clone(),
+            user_id: Mutex::new(user_id),
+            mode: self.mode,
+            caller_state: self.caller_state.clone(),
+            environment: Some(environment),
+            ..Default::default()
         }
+    }
+
+    /// The environment of the process that relayed this call, `None` for a call made in this
+    /// process.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn environment(&self) -> Option<&CallEnvironment> {
+        self.environment.as_ref()
     }
 
     pub fn globals(&self) -> &LoreGlobalArgs {
@@ -1151,23 +1173,6 @@ impl ExecutionContext {
         self.caller_state.as_ref()
     }
 
-    /// Route explicitly configured experimental working instances to existing
-    /// service owners. The service or scoped command must retain the resolver;
-    /// captured contexts keep only a weak reference to avoid provider cycles.
-    /// This does not change command credentials or caller state.
-    pub fn set_provider_resolver(
-        &mut self,
-        resolver: &Arc<dyn crate::fs::provider_registry::ProviderResolver>,
-    ) {
-        self.provider_resolver = Some(Arc::downgrade(resolver));
-    }
-
-    pub fn provider_resolver(
-        &self,
-    ) -> Option<Arc<dyn crate::fs::provider_registry::ProviderResolver>> {
-        self.provider_resolver.as_ref()?.upgrade()
-    }
-
     /// The counters this call's fragment writes report into. See the field.
     pub fn fragment_stats(&self) -> &Arc<lore_storage::FragmentWriteStats> {
         self.fragment_stats
@@ -1178,6 +1183,12 @@ impl ExecutionContext {
     pub(crate) fn push_stats(&self) -> &Arc<crate::branch::push::PushStats> {
         self.push_stats
             .get_or_init(|| Arc::new(crate::branch::push::PushStats::new(self.globals().stats())))
+    }
+
+    /// The slots this call's pushes share. See the field.
+    pub(crate) fn push_budget(&self) -> &crate::branch::push::PushBudget {
+        self.push_budget
+            .get_or_init(crate::branch::push::PushBudget::default)
     }
 }
 
@@ -1192,9 +1203,9 @@ impl Default for ExecutionContext {
             user_id: Mutex::default(),
             mode: ExecutionMode::Client,
             caller_state: None,
-            provider_resolver: None,
             fragment_stats: OnceLock::new(),
             push_stats: OnceLock::new(),
+            push_budget: OnceLock::new(),
             environment: None,
         }
     }

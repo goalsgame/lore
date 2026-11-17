@@ -41,6 +41,8 @@ pub type LoreArray<T> = lore_revision::interface::LoreArray<T>;
 pub use lore_revision::auth::AuthMode;
 pub use lore_revision::auth::AuthPath;
 pub use lore_revision::auth::UnknownAuthMode;
+pub use lore_revision::instance::LoreRepositoryInstanceCloneMethod;
+pub use lore_revision::instance::LoreRepositoryInstanceClonePhase;
 pub use lore_revision::repository::LoreSharedStoreMode;
 
 use crate::call_delegation::dispatch_command;
@@ -318,20 +320,26 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 
 /// Resolve user identities to display names from locally stored JWT tokens.
 ///
-/// Decodes cached JWT tokens to extract display names without contacting the
-/// auth service. For user IDs without a local token, returns the raw user
-/// ID. For remote resolution with proper authorization, use
-/// `lore_auth_user_info` which queries the remote authentication service.
+/// Decodes cached JWT tokens to extract display names. For user IDs without a
+/// local token, returns the raw user ID. For remote resolution with proper
+/// authorization, use `lore_auth_user_info` which queries the remote
+/// authentication service.
 ///
-/// When `with_identity_token` is set, identities with a locally stored token
-/// are answered as `AUTH_USER_TOKEN` events carrying the cached identity
-/// token instead of `AUTH_USER_INFO`.
+/// When `auth_endpoint` is empty, the call reads it from the repository's
+/// remote, and first refreshes an expired stored token unless the call
+/// supplies a token. The refresh contacts the auth service and replaces the
+/// stored tokens; a refused or failed refresh removes the stored refresh token.
+///
+/// Every identity is answered with an `AUTH_USER_INFO` event, and an identity
+/// with a locally stored token also with an `AUTH_USER_TOKEN` event. Its
+/// `token` holds the cached identity token when `with_identity_token` is set,
+/// and is empty otherwise.
 ///
 /// When `with_access_token` is set, the call requires a repository and
 /// additionally emits one `AUTH_IDENTITY` event carrying the
 /// repository-scoped authorization (access) token for the current user. A
 /// valid cached token is reused. Otherwise a token exchange is performed
-/// against the auth service, so this variant can contact the network.
+/// against the auth service.
 ///
 /// # Events
 ///
@@ -353,7 +361,7 @@ pub type LoreAuthLocalUserInfoArgs = crate::auth::LoreAuthLocalUserInfoArgs;
 /// | Tag | Data Type | Description |
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with the resolved user id and display name |
-/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted instead of `AUTH_USER_INFO` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | `LORE_EVENT_AUTH_USER_TOKEN` | `lore_auth_user_token_event_data_t` | Emitted before `AUTH_USER_INFO` for an identity with a cached token, with the token details; `token` is empty unless `with_identity_token` is set |
 /// | `LORE_EVENT_AUTH_IDENTITY` | `lore_auth_identity_event_data_t` | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_local_user_info(
@@ -378,6 +386,10 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 
 /// Authenticate interactively via a browser-based login flow.
 ///
+/// With `reuse_session` set, a stored login whose session is still valid, as
+/// `session_valid` in `lore_auth_user_token_event_data_t` reports it, is
+/// returned without starting a new login.
+///
 /// # Events
 ///
 /// Events are delivered via the callback as `lore_event_t`. Use the `tag` field to identify the event type.
@@ -399,7 +411,7 @@ pub type LoreAuthLoginInteractiveArgs = crate::auth::LoreAuthLoginInteractiveArg
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive(
     globals: &LoreGlobalArgs,
@@ -432,7 +444,7 @@ pub extern "C" fn lore_auth_login_interactive(
 /// |-----|-----------|-------------|
 /// | `LORE_EVENT_AUTH_URL` | `lore_auth_url_event_data_t` | Emitted with the login URL when no_browser mode is requested, and whenever the login has a code the user may need to enter or confirm at that URL, browser or not. `user_code` holds the code, or is empty |
 /// | `LORE_EVENT_AUTH_PENDING` | `lore_auth_pending_event_data_t` | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires. |
-/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication |
+/// | `LORE_EVENT_AUTH_USER_INFO` | `lore_auth_user_info_event_data_t` | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_auth_login_interactive_async(
     globals: &LoreGlobalArgs,
@@ -3247,6 +3259,8 @@ pub type LoreFileDependencyAddArgs = crate::dependency::LoreFileDependencyAddArg
 
 /// Adds dependency relationships between files.
 ///
+/// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -3307,6 +3321,8 @@ pub type LoreFileDependencyRemoveArgs = crate::dependency::LoreFileDependencyRem
 
 /// Removes dependency relationships between files.
 ///
+/// Fails with error code 9 (not supported) when a path is inside a link, and changes nothing.
+///
 /// # Events
 ///
 /// ## Standard Events
@@ -3366,6 +3382,8 @@ pub extern "C" fn lore_file_dependency_remove_async(
 pub type LoreFileDependencyListArgs = crate::dependency::LoreFileDependencyListArgs;
 
 /// Queries dependency information for files.
+///
+/// Fails with error code 9 (not supported) when a path is inside a link.
 ///
 /// # Events
 ///
@@ -3562,6 +3580,10 @@ pub extern "C" fn lore_lock_file_status_async(
 pub type LoreLockFileQueryArgs = crate::lock::LoreLockFileQueryArgs;
 
 /// Query which files are currently locked, optionally filtered by user or path.
+///
+/// A `path` without a `branch` in `lore_lock_file_query_args_t` queries the current branch. A
+/// query giving both `owner` and `path` fails with `LORE_ERROR_CODE_INVALID_ARGUMENTS` before the
+/// remote is asked.
 ///
 /// # Events
 ///
@@ -4088,8 +4110,8 @@ pub type LoreRepositoryCloneArgs = crate::repository::LoreRepositoryCloneArgs;
 /// A clone needs the remote, so the `offline` global argument does not keep it from connecting: it
 /// prepares the clone for working offline instead. With `offline` or `cache`, a clone that writes
 /// its files caches every file metadata block of the cloned revision, which staging and committing
-/// write to, so both work without the remote, and fails if it cannot. A bare clone writes no files
-/// and reads them from the remote when a call needs them.
+/// write to, so both work without the remote, and fails if it cannot. A bare or virtual clone writes
+/// no files and reads them from the remote when a call needs them.
 ///
 /// # Events
 ///
@@ -7015,7 +7037,7 @@ pub type LoreStorageFlushArgs = crate::storage::flush::LoreStorageFlushArgs;
 
 /// Flush pending writes through the handle's stores.
 ///
-/// On disk-backed stores this performs an fsync honoring `globals.sync_data`.
+/// On disk-backed stores this writes as `globals.sync_data` and `globals.fast_flush` ask.
 /// On in-memory stores the underlying flush is a no-op and the call still
 /// completes with `status: 0`.
 #[unsafe(no_mangle)]
@@ -7895,17 +7917,12 @@ pub extern "C" fn lore_log_configure(config: &LoreLogConfig) -> i32 {
 }
 
 /// Shut the library down, stopping its worker threads and releasing the
-/// resources it holds. Call this when no further calls will be made and
+/// resources it holds. Call this once, when no further calls will be made and
 /// every call made has completed. The library makes a best effort to cancel
 /// calls still executing safely, but a call it does not stop in time may still
 /// use the memory passed to it after this returns.
 ///
-/// Returns 0 when this call completes teardown and a non-zero value otherwise.
-/// On Unix, an owned service that cannot finish retiring within the shutdown
-/// bound prevents teardown. Its runtimes, connections and allocator remain
-/// available, and shutdown may be retried once the service can retire.
-/// A panic during service start publication also prevents teardown on the next
-/// attempt; a subsequent retry inspects the retained service run.
+/// Returns 0 on success and a non-zero value on failure.
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_shutdown() -> i32 {
     if crate::shutdown() {
@@ -8143,6 +8160,123 @@ pub extern "C" fn lore_repository_instance_prune_async(
     run_asynchronously(globals, args, callback, dispatch_command);
 }
 
+pub type LoreRepositoryInstanceDeleteArgs = crate::repository::LoreRepositoryInstanceDeleteArgs;
+
+/// Delete the current repository instance: unmount (if SWFS and in service),
+/// deregister from the mutable store, and delete associated directories.
+/// With `dry_run` set in `globals`, emits events describing what would be deleted
+/// without performing any changes.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_delete`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_delete_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceDeleteArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceMoveArgs = crate::repository::LoreRepositoryInstanceMoveArgs;
+
+/// Move the current repository instance to a new path: update registry metadata
+/// and remap mount (for SWFS in service context) or move directory (for regular
+/// instances).
+/// With `dry_run` set in `globals`, checks that the move can be made without performing it.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_move`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_move_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceMoveArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
+pub type LoreRepositoryInstanceCloneArgs = crate::repository::LoreRepositoryInstanceCloneArgs;
+
+/// Clone the current repository instance to `args->target_path`, sharing its data blocks where
+/// the destination allows it, and register the clone as an instance of its own on the same
+/// revision, branch and staged state. The clone holds the instance's and the store's locks while
+/// it copies, so other calls on the instance, and calls from other processes on the store, that
+/// open the store wait for it. An instance delete waits too, since it opens the store to deregister
+/// the instance before it removes any file. An instance move renames the instance before it opens
+/// the store, so a move makes the clone fail, or on Windows is refused while the clone lists one of
+/// its directories. `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` says how the clone is made, once the
+/// instance's store and the destination have passed their checks and before any of the instance
+/// is copied; a refusal before that, of the store or the destination, comes only with the
+/// completion. Delivers `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_PROGRESS` per phase, and each event
+/// interval (`globals->event_interval_ms`) while it copies, and
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE`, which names the new instance.
+///
+/// Fails with:
+/// - error code 9 (not supported) for a clone that cannot share blocks while `args->allow_copy`
+///   is zero, refused before anything is copied or, for an entry that turns out not to share
+///   blocks, partway through the copy; and for an instance with a local store or a virtual
+///   clone, whatever `args->allow_copy` is;
+/// - error code 3 (invalid arguments) for a destination that exists before the clone moves into
+///   place, names no directory, has no parent directory that can be resolved, has a name too
+///   long for the directory the clone writes beside it, is nested in another instance or a
+///   virtual clone's mount, or is where another live instance is registered, and where a path
+///   inside the copy is taken while the clone writes it;
+/// - error code 4 (invalid path) where the instance's Lore directory lies outside its tree;
+/// - error code 118 (oversized) for a copy the destination has no room for, and where a volume the
+///   clone writes fills while it runs;
+/// - error code 82 (file not found) where the instance, or an entry the clone needs, is moved or
+///   removed while it is copied.
+///
+/// Failures every repository call can report, such as code 89 (repository not found), are
+/// reported as for those calls; any other failure of the clone is internal.
+///
+/// A failure while the clone registers itself, after it is at `args->target_path`, leaves the
+/// instance there; it registers itself when a write command next opens it. A failure before that
+/// leaves nothing at `args->target_path`: the call returns once it has tried to remove what the
+/// clone copied, which takes minutes for a large tree; what it cannot remove the next clone to the
+/// same destination removes.
+///
+/// With `dry_run` set in `globals`, runs the checks that take no lock, sending
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_BEGIN` as the clone does, fails as the clone would where
+/// one of those checks refuses it, and otherwise sends a
+/// `LORE_EVENT_REPOSITORY_INSTANCE_CLONE_COMPLETE` with a zero instance ID, and writes nothing but
+/// the probe files it removes again. The checks for
+/// another live instance registered at the destination and for a branch to clone need the store,
+/// so only the clone itself makes them.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_clone(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceCloneArgs,
+    callback: LoreEventCallbackConfig,
+) -> i32 {
+    run_synchronously(globals, args, callback, run_command)
+}
+
+/// Asynchronous version of `lore_repository_instance_clone`.
+#[unsafe(no_mangle)]
+pub extern "C" fn lore_repository_instance_clone_async(
+    globals: &LoreGlobalArgs,
+    args: &LoreRepositoryInstanceCloneArgs,
+    callback: LoreEventCallbackConfig,
+) {
+    run_asynchronously(globals, args, callback, dispatch_command);
+}
+
 pub type LoreRepositoryUpdatePathArgs = crate::repository::LoreRepositoryUpdatePathArgs;
 
 /// Update the recorded path of the current repository instance to its present
@@ -8284,9 +8418,15 @@ pub type LoreRevisionTreeListChildrenArgs =
 
 /// Stream the children of a directory node in a loaded revision tree.
 ///
+/// Moves and deletions on the same handle may run beside the listing: a child
+/// moved away meanwhile may be left out, and a child may be reported twice. A
+/// caller that needs each child once drops repeats by `node_id`. A listing the
+/// tree gave up on under load, heavy changes beside it or a store asking it to
+/// slow down, completes with `LORE_ERROR_CODE_SLOW_DOWN`, which a caller can retry.
+///
 /// | Terminal event                       | Payload                                | Notes                                                          |
 /// |--------------------------------------|----------------------------------------|----------------------------------------------------------------|
-/// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child; an empty directory emits none before `Complete` |
+/// | `LORE_EVENT_REVISION_TREE_CHILD`     | `lore_revision_tree_child_event_data_t` | One per child reached; an empty directory emits none before `Complete` |
 #[unsafe(no_mangle)]
 pub extern "C" fn lore_revision_tree_list_children(
     globals: &LoreGlobalArgs,
@@ -8395,7 +8535,12 @@ pub type LoreRevisionTreeAddArgs = crate::revision_tree::add::LoreRevisionTreeAd
 /// entry is checked before any node is created, so one bad entry rejects the
 /// call and creates nothing; the reason names the offending entry's batch index,
 /// which a caller leaving `entry_id` at zero has no other way to identify. A failure
-/// after those checks pass is internal and may leave part of the batch created.
+/// after those checks pass reports `LORE_ERROR_CODE_INTERNAL` and may leave part of
+/// the batch created. An entry the tree gave up on under load, in its checks or
+/// after, reports `LORE_ERROR_CODE_SLOW_DOWN` instead, and so do the entries parented
+/// onto it. The load is heavy concurrent change on the handle, or a store asking the
+/// tree to slow down, and a caller can retry. The batch reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 ///
 /// A link entry's target revision is not resolved here, so a link naming a
 /// revision that cannot be read is accepted and fails only when something later
@@ -8432,32 +8577,44 @@ pub type LoreRevisionTreeDeleteArgs = crate::revision_tree::delete::LoreRevision
 /// is checked before any node is touched, so one bad entry rejects the call and
 /// leaves every subtree in place; the reason names the offending entry's batch
 /// index, which a caller leaving `entry_id` at zero has no other way to
-/// identify. A failure after those checks pass is internal and may leave part of
-/// the batch removed.
+/// identify. A failure after those checks pass reports `LORE_ERROR_CODE_INTERNAL`
+/// and may leave part of the batch removed. An entry the tree gave up on under
+/// load, heavy concurrent change on the handle or a store asking it to slow down,
+/// reports `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch
+/// reports `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 ///
 /// A node the loaded revision holds is **staged** for deletion and stays in the
 /// tree: it keeps its name and its place among its siblings, still lists through
 /// `lore_revision_tree_list_children`, and reports
 /// `LORE_NODE_STAGED_ACTION_DELETE` in its `staged_action`. The commit that
 /// freezes the tree is what drops it. A node added through this handle is in no
-/// revision yet, so it is discarded outright instead, freeing its name and its
-/// node id. A link is removed as one node — its subtree belongs to the linked
-/// repository's tree.
+/// revision yet, so it leaves the tree outright instead: it stops being listed,
+/// `lore_revision_tree_node_info` answers for it as for a freed id, and the next
+/// commit that goes ahead frees its node id. A link is removed as one node — its
+/// subtree belongs to the linked repository's tree.
 ///
 /// A staged deletion is reversible: `lore_revision_tree_add` of the same name
 /// under the same parent with the same kind restores the node. A zero
 /// `address.context` on that add preserves the node's `file_id`; supplying one
 /// replaces it, as on `lore_revision_tree_modify`. Only the named node comes back
 /// — restoring a directory leaves its children staged for deletion, so each has to
-/// be added back in turn. A discarded node is not restorable, since its id is
-/// gone.
+/// be added back in turn. An added node that left the tree is not restorable:
+/// adding its name again creates a new node.
 ///
-/// Staging fans out one depth level at a time; discarding an added node rewrites
-/// sibling pointers and so runs serially, deepest first. Memory while the call
-/// runs is proportional to the widest level of the subtrees being removed rather
-/// than to the entry count, since a level is collected before it is staged. The
-/// root cannot be deleted, and an entry whose ancestor another entry deletes is
-/// rejected rather than removed twice.
+/// Staging fans out one depth level at a time over at most one task per
+/// processor. Each added subtree is checked whole, then detached from its
+/// directory in one step; detaches from one directory run one after another. An
+/// added subtree holding a live node the loaded revision holds, moved there, fails
+/// its entry with nothing detached. Memory while the call runs is proportional to
+/// the entry count times the tasks the work spreads over, plus two adjacent depth
+/// levels of the tracked subtrees being removed, plus one record per added subtree
+/// root found. Entries report in entry order once the whole batch has been walked.
+/// The root cannot be deleted, and an entry whose ancestor another entry deletes
+/// is rejected rather than removed twice.
+///
+/// A delete or move call waits for any other delete or move call on the same handle
+/// to finish, so they apply one after the other, each checking its entries against
+/// the tree the one before left.
 ///
 /// | Terminal event                              | Payload                                           | Notes                                                    |
 /// |---------------------------------------------|---------------------------------------------------|----------------------------------------------------------|
@@ -8488,8 +8645,11 @@ pub type LoreRevisionTreeModifyArgs = crate::revision_tree::modify::LoreRevision
 /// revision tree. Every entry is checked before any node is rewritten, so one bad
 /// entry rejects the call and leaves every target untouched; the reason names the
 /// offending entry's batch index, which a caller leaving `entry_id` at zero has no
-/// other way to identify. A failure after those checks pass is internal and may
-/// leave part of the batch rewritten.
+/// other way to identify. A failure after those checks pass reports
+/// `LORE_ERROR_CODE_INTERNAL` and may leave part of the batch rewritten. An entry
+/// the tree gave up on under load, a store asking it to slow down, reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` instead, which a caller can retry. The batch reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 ///
 /// Only a file is modifiable: a directory's size and address are derived at
 /// commit and a link's address is its target. A zero `address.context` preserves
@@ -8528,7 +8688,11 @@ pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisio
 /// before any node is moved, so one bad entry rejects the call and leaves every node
 /// where it was; the reason names the offending entry's batch index, which a caller
 /// leaving `entry_id` at zero has no other way to identify. A failure after those checks
-/// pass is internal and may leave earlier entries applied.
+/// pass reports `LORE_ERROR_CODE_INTERNAL` and may leave earlier entries applied. An entry
+/// the tree gave up on under load, in its checks or after, reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` instead. The load is heavy concurrent change on the handle,
+/// or a store asking the tree to slow down, and a caller can retry. The batch reports
+/// `LORE_ERROR_CODE_SLOW_DOWN` where every failed entry did.
 ///
 /// A move keeps the node: its node id, its `file_id` and its children come along, and
 /// the change is recorded as a move rather than as a deletion and an addition, so the
@@ -8550,10 +8714,9 @@ pub type LoreRevisionTreeMoveArgs = crate::revision_tree::move_node::LoreRevisio
 ///
 /// Entries apply one at a time, in batch order, because a move rewrites the parent and
 /// sibling pointers of two child chains where `lore_revision_tree_add` only prepends to
-/// one. For the same reason concurrent calls have more to lose here than on `add` or
-/// `modify`: two calls moving nodes that share a parent chain can interleave their
-/// unlinks, which the pre-commit validator then refuses. Moves that may touch one parent
-/// chain belong in one call.
+/// one. A delete or move call waits for any other delete or move call on the same handle
+/// to finish, so they apply one after the other, each checking its entries against the
+/// tree the one before left.
 ///
 /// | Terminal event                            | Payload                                          | Notes                                                       |
 /// |-------------------------------------------|--------------------------------------------------|-------------------------------------------------------------|

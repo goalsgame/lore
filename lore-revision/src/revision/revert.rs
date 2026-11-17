@@ -29,6 +29,7 @@ use crate::revision::sync::LoreRevisionSyncProgressEventData;
 use crate::runtime::execution_context;
 use crate::stage;
 use crate::stage::StageError;
+use crate::state::NodeMapping;
 use crate::state::State;
 
 /// Event data reported at the start of a revert.
@@ -140,7 +141,6 @@ pub(crate) async fn revert(
     revision: Hash,
     options: RevertOptions,
 ) -> Result<Hash, MergeError> {
-    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -207,7 +207,7 @@ pub(crate) async fn revert(
         repository.clone(),
         token,
         diff,
-        state_current.clone(),
+        NodeMapping::root(repository.clone(), state_current.clone()),
         MergeType::Revert,
         false,
         current_branch,
@@ -275,7 +275,6 @@ pub(crate) async fn revert_restart(
     token: &RepositoryWriteToken,
     paths: LoreArray<LoreString>,
 ) -> Result<(), MergeError> {
-    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, _current_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -358,7 +357,6 @@ pub fn revert_resolve_mine_boxed(
     paths: LoreArray<LoreString>,
 ) -> crate::BoxFuture<'_, Result<(), StageError>> {
     Box::pin(async move {
-        crate::fs::hold::require_revision_replacement(&repository)?;
         validate_merge_type(repository.clone(), None, MergeType::Revert)
             .await
             .forward::<StageError>("Failed to deserialize revision state")?;
@@ -373,7 +371,6 @@ pub fn revert_resolve_theirs_boxed(
     paths: LoreArray<LoreString>,
 ) -> crate::BoxFuture<'_, Result<(), StageError>> {
     Box::pin(async move {
-        crate::fs::hold::require_revision_replacement(&repository)?;
         validate_merge_type(repository.clone(), None, MergeType::Revert)
             .await
             .forward::<StageError>("Failed to deserialize revision state")?;

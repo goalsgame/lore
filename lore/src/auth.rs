@@ -17,6 +17,7 @@ use lore_base::error::TokenNotFound;
 use lore_base::lore_debug;
 use lore_base::lore_warn;
 use lore_base::runtime::LORE_CONTEXT;
+use lore_base::types::RepositoryId;
 use lore_credential::UserInfo;
 use lore_credential::token_store::RemovedRefreshToken;
 use lore_error_set::prelude::*;
@@ -88,7 +89,7 @@ pub struct LoreAuthUserInfoArgs {
 /// resolve the provided user IDs to their display names.
 ///
 /// When `user_ids` is empty, falls back to [`local_user_info`] to return the
-/// current user's identity without contacting the remote service.
+/// current user's identity without querying the user service.
 ///
 /// # Events
 ///
@@ -129,7 +130,13 @@ async fn resolve_user_info_local(
             with_identity_token: 0,
             with_access_token: 0,
         };
-        return local_user_info_impl(globals, local_args, callback).await;
+        let execution = setup_execution(globals, callback);
+        return LORE_CONTEXT
+            .scope(execution, async move {
+                let result = emit_local_user_info(&local_args, false).await;
+                execution_context().dispatcher.complete_result(result).await
+            })
+            .await;
     }
 
     repository_call_read(
@@ -363,9 +370,14 @@ pub struct LoreAuthLoginInteractiveArgs {
     pub remote_url: LoreString,
     /// Emit the login URL instead of opening a browser
     pub no_browser: u8,
+    /// Return the stored login instead of starting a new one while its session is valid
+    pub reuse_session: u8,
 }
 
 /// Authenticates interactively via browser-based login flow for a remote URL.
+///
+/// With `reuse_session` set, a stored login whose session is still valid is
+/// returned without starting a new login.
 ///
 /// # Events
 ///
@@ -386,7 +398,7 @@ pub struct LoreAuthLoginInteractiveArgs {
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUrl`](crate::interface::LoreEvent::AuthUrl) | Emitted with the login URL when no_browser mode is requested (instead of opening browser), and whenever the login has a code for the user to enter or confirm at that URL |
 /// | [`LoreEvent::AuthPending`](crate::interface::LoreEvent::AuthPending) | Emitted before each wait while the login awaits the user's approval, with the seconds elapsed, the seconds until the next poll, and the seconds left before the session expires |
-/// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication |
+/// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted with user id and display name after successful interactive authentication, or for the stored login it reuses |
 pub async fn login_interactive(
     globals: LoreGlobalArgs,
     args: LoreAuthLoginInteractiveArgs,
@@ -411,7 +423,13 @@ async fn login_interactive_local(
     LORE_CONTEXT
         .scope(execution, async move {
             let result = async move {
-                match auth::login::interactive(remote_url.as_str(), args.no_browser != 0).await {
+                match auth::login::interactive(
+                    remote_url.as_str(),
+                    args.no_browser != 0,
+                    args.reuse_session != 0,
+                )
+                .await
+                {
                     Ok(user_info) => {
                         send_user_info(user_info);
                         Ok(())
@@ -559,7 +577,6 @@ async fn logout_local(
     callback: LoreEventCallback,
 ) -> i32 {
     let repository_path = globals.repository_path.to_string();
-    let identity = globals.identity().unwrap_or_default().to_string();
 
     let execution = setup_execution(globals, callback);
 
@@ -567,7 +584,7 @@ async fn logout_local(
         .scope(execution, async move {
             let result = async move {
                 let (auth_url, endpoint) =
-                    logout_endpoint(args.auth_url.as_str(), &repository_path, &identity).await?;
+                    logout_endpoint(args.auth_url.as_str(), &repository_path).await?;
                 let auth_url = auth_url.as_str();
 
                 if execution_context().globals().dry_run() {
@@ -666,7 +683,7 @@ pub struct LoreAuthLocalUserInfoArgs {
     pub auth_endpoint: LoreString,
     /// User identities to resolve; empty resolves the current user
     pub user_ids: LoreArray<LoreString>,
-    /// Emit cached identity token details for identities with a local token
+    /// Include the cached identity token string in `AuthUserToken` events
     pub with_identity_token: u8,
     /// Emit the repository's authorization (access) token. Requires running
     /// inside a repository
@@ -675,17 +692,18 @@ pub struct LoreAuthLocalUserInfoArgs {
 
 /// Resolves user identities to user information using locally stored JWT tokens.
 ///
-/// Does not require a repository context or network access. Decodes locally
-/// cached JWT tokens to extract display names. For user IDs without a local
-/// token, returns the raw user ID as the display name.
+/// Decodes locally cached JWT tokens to extract display names. For user IDs
+/// without a local token, returns the raw user ID as the display name.
 ///
 /// When `user_ids` is empty, returns the current user's identity. When
 /// `auth_endpoint` is empty, resolves it from the repository's remote
-/// environment configuration.
+/// environment configuration, and first refreshes an expired stored token
+/// unless the call supplies a token.
 ///
-/// When `with_identity_token` is set, emits `AuthUserToken` events (including
-/// the cached identity token string) for identities that have a locally stored
-/// token, and `AuthUserInfo` events for others.
+/// Emits an `AuthUserInfo` event for each identity, and an `AuthUserToken`
+/// event for each identity that has a locally stored token. The `AuthUserToken`
+/// event carries the cached token when `with_identity_token` is set, and an
+/// empty `token` otherwise.
 ///
 /// When `with_access_token` is set, the call requires a repository and
 /// additionally emits an `AuthIdentity` event carrying the repository-scoped
@@ -713,7 +731,7 @@ pub struct LoreAuthLocalUserInfoArgs {
 /// | Event | Description |
 /// |-------|-------------|
 /// | [`LoreEvent::AuthUserInfo`](crate::interface::LoreEvent::AuthUserInfo) | Emitted once per resolved identity with user id and display name |
-/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted instead of `AuthUserInfo` when `with_identity_token` is set and a cached token is available, includes full token details |
+/// | [`LoreEvent::AuthUserToken`](crate::interface::LoreEvent::AuthUserToken) | Emitted for each identity with a cached token, with the token details. `token` is empty unless `with_identity_token` is set |
 /// | [`LoreEvent::AuthIdentity`](crate::interface::LoreEvent::AuthIdentity) | Emitted when `with_access_token` is set, carries the repository-scoped authorization token for the current user |
 pub async fn local_user_info(
     globals: LoreGlobalArgs,
@@ -723,16 +741,18 @@ pub async fn local_user_info(
     dispatch_call(globals, args, callback, local_user_info_impl).await
 }
 
+/// `auth_endpoint` when given, else the auth URL the repository's remote advertises, with that
+/// endpoint and the remote's domain.
 #[lore_macro::test_pub]
 async fn resolve_auth_endpoint(
     auth_endpoint: &str,
     repository_path: &str,
-    identity: &str,
-) -> Result<String, AuthStoreError> {
+) -> Result<(String, Option<(AuthEndpoint, String)>), AuthStoreError> {
     if !auth_endpoint.is_empty() {
-        return Ok(auth_endpoint.to_string());
+        return Ok((auth_endpoint.to_string(), None));
     }
-    Ok(remote_auth_endpoint(repository_path, identity).await?.url)
+    let (endpoint, remote_domain) = remote_auth_endpoint(repository_path).await?;
+    Ok((endpoint.url.clone(), Some((endpoint, remote_domain))))
 }
 
 /// The auth URL whose tokens a logout removes, `auth_url` when given, and the endpoint to revoke
@@ -741,53 +761,39 @@ async fn resolve_auth_endpoint(
 async fn logout_endpoint(
     auth_url: &str,
     repository_path: &str,
-    identity: &str,
 ) -> Result<(String, Option<AuthEndpoint>), AuthStoreError> {
     if auth_url.is_empty() {
-        let endpoint = remote_auth_endpoint(repository_path, identity).await?;
+        let (endpoint, _) = remote_auth_endpoint(repository_path).await?;
         return Ok((endpoint.url.clone(), Some(endpoint)));
     }
     Ok((auth_url.to_string(), AuthEndpoint::resolve(auth_url).ok()))
 }
 
+/// The auth endpoint the repository's remote advertises, and the remote's domain.
 async fn remote_auth_endpoint(
     repository_path: &str,
-    identity: &str,
-) -> Result<AuthEndpoint, AuthStoreError> {
-    // Forward the connect error instead of discarding it, so the real failure
-    // reaches the caller rather than collapsing into the generic error below.
+) -> Result<(AuthEndpoint, String), AuthStoreError> {
     match read_repository_remote(repository_path) {
         RepositoryRemote::Remote(remote_url) => {
-            let connection = lore_revision::protocol::connect(
-                &remote_url,
-                identity,
-                lore_revision::lore::RepositoryId::default(),
-            )
-            .await
-            .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
-
-            let endpoint = connection.auth_endpoint();
-            if !endpoint.url.is_empty() {
-                return Ok(endpoint.clone());
-            }
+            let (endpoint, remote_url) =
+                auth::login::remote_auth_endpoint(&remote_url)
+                    .await
+                    .forward::<AuthStoreError>("resolving auth endpoint from remote")?;
+            Ok((
+                endpoint,
+                lore_credential::domain_from_url_or_url(&remote_url),
+            ))
         }
         // The repository exists and simply has no remote. Nothing is unreachable and
         // nothing is unsupported — there is just no remote to ask for an auth endpoint.
-        RepositoryRemote::NoRemote => return Err(NoRemote.into()),
+        RepositoryRemote::NoRemote => Err(NoRemote.into()),
         // Without a repository there is nowhere to read a remote from, and the fix is to
         // run this from one (or pass an endpoint) rather than to configure anything.
-        RepositoryRemote::NoRepository => {
-            return Err(RepositoryNotFound {
-                repository: repository_path.to_string(),
-            }
-            .into());
+        RepositoryRemote::NoRepository => Err(RepositoryNotFound {
+            repository: repository_path.to_string(),
         }
+        .into()),
     }
-
-    Err(NotSupported {
-        operation: "authentication requires a configured auth endpoint".to_string(),
-    }
-    .into())
 }
 
 /// Revokes each of `removed` at `endpoint`, which serves `auth_url`. They are removed from the
@@ -855,7 +861,7 @@ async fn local_user_info_impl(
             args,
             local_user_info,
             |repository, args| async move {
-                emit_local_user_info(&args).await?;
+                emit_local_user_info(&args, true).await?;
                 auth::userinfo::repository_access_token(repository)
                     .await
                     .forward::<AuthStoreError>("resolving the repository access token")
@@ -868,24 +874,28 @@ async fn local_user_info_impl(
 
     LORE_CONTEXT
         .scope(execution, async move {
-            let result = emit_local_user_info(&args).await;
+            let result = emit_local_user_info(&args, true).await;
             execution_context().dispatcher.complete_result(result).await
         })
         .await
 }
 
-/// Resolves the requested identities from locally stored tokens and emits one
-/// `AuthUserInfo` or `AuthUserToken` event per identity. Runs inside an
-/// execution scope. The caller dispatches completion.
-async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), AuthStoreError> {
+/// Resolves the requested identities from locally stored tokens and emits an
+/// `AuthUserInfo` event per identity. With `user_token_events`, an identity with
+/// a stored token also gets an `AuthUserToken` event, before its `AuthUserInfo`.
+/// Runs inside an execution scope. The caller dispatches completion.
+async fn emit_local_user_info(
+    args: &LoreAuthLocalUserInfoArgs,
+    user_token_events: bool,
+) -> Result<(), AuthStoreError> {
     let execution = execution_context();
     let globals = execution.globals();
     let repository_path = globals.repository_path.to_string();
     let identity = globals.identity().unwrap_or_default().to_string();
     let include_identity_token = args.with_identity_token != 0;
 
-    let auth_endpoint =
-        resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path, &identity).await?;
+    let (auth_endpoint, remote) =
+        resolve_auth_endpoint(args.auth_endpoint.as_str(), &repository_path).await?;
 
     let mut user_ids: Vec<String> = args
         .user_ids
@@ -912,22 +922,37 @@ async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), Au
         }
     }
 
+    let supplied_credentials =
+        !globals.identity_token().is_empty() || !globals.access_token().is_empty();
+    if let Some((endpoint, remote_domain)) = &remote
+        && !supplied_credentials
+    {
+        refresh_expired_logins(endpoint, remote_domain, &user_ids).await;
+    }
+
     let resolved =
         lore_revision::auth::userinfo::resolve_local_user_info_boxed(&auth_endpoint, &user_ids)
             .await;
 
     for entry in &resolved {
-        if include_identity_token && let Some(user_info) = &entry.local_user_info {
+        if user_token_events && let Some(user_info) = &entry.local_user_info {
+            let token = if include_identity_token {
+                user_info.token.clone().into()
+            } else {
+                LoreString::default()
+            };
             LoreEvent::AuthUserToken(LoreAuthUserTokenEventData {
                 id: user_info.id.clone().into(),
                 name: user_info.name.clone().into(),
-                token: user_info.token.clone().into(),
+                token,
                 preferred_username: user_info.preferred_username.clone().into(),
                 flag_service_account: user_info.is_service_account.into(),
                 expires: user_info.expires,
+                refresh_expires: entry.refresh_expires.unwrap_or_default(),
+                refreshable: entry.refresh_expires.is_some().into(),
+                session_valid: entry.session_valid().into(),
             })
             .send();
-            continue;
         }
 
         LoreEvent::AuthUserInfo(LoreAuthUserInfoEventData {
@@ -938,4 +963,18 @@ async fn emit_local_user_info(args: &LoreAuthLocalUserInfoArgs) -> Result<(), Au
     }
 
     Ok(())
+}
+
+/// Refreshes the stored login of each of `user_ids` at `endpoint` that has expired, so the store
+/// holds the refreshed token. A login that cannot be refreshed is skipped.
+async fn refresh_expired_logins(endpoint: &AuthEndpoint, remote_domain: &str, user_ids: &[String]) {
+    for user_id in user_ids {
+        let _ = lore_transport::auth::exchange::auth_exchange_for_stored_identity(
+            endpoint,
+            remote_domain,
+            user_id,
+            RepositoryId::default(),
+        )
+        .await;
+    }
 }

@@ -1137,8 +1137,8 @@ mod tests {
         for (name, bytes) in every_encoding(ENCODED_RULES) {
             let filter = load(name, &bytes);
             assert_eq!(
-                filter.lines.len(),
-                baseline.lines.len(),
+                filter.len(),
+                baseline.len(),
                 "{name} loaded a different number of rules"
             );
             for probe in ENCODED_PROBES {
@@ -1262,40 +1262,6 @@ mod tests {
         }
     }
 
-    /// `save` writes UTF-8 with no byte-order mark, whatever encoding the rules
-    /// were loaded from, so the file Lore writes back does not depend on the one
-    /// it read.
-    #[tokio::test]
-    async fn save_writes_utf8_without_a_byte_order_mark() {
-        let dir = TempDir::new("lore-filter-encoding-save-");
-        let mut expected: Option<String> = None;
-
-        for (name, bytes) in every_encoding(ENCODED_RULES) {
-            let source = dir.child(name);
-            test_file_write(&source, &bytes);
-            let filter = lore_revision::filter::load_filter(&source).expect("load");
-
-            let target = dir.child(&format!("{name}.saved"));
-            lore_revision::filter::save(&filter, &target)
-                .await
-                .expect("save");
-            let written = std::fs::read(&target).expect("read back");
-
-            assert!(
-                !written.starts_with(&[0xEF, 0xBB, 0xBF])
-                    && !lore_revision::util::encoding::is_utf16_bom(&written),
-                "{name} saved behind a byte-order mark"
-            );
-            let text = String::from_utf8(written)
-                .unwrap_or_else(|_| panic!("{name} did not save as UTF-8"));
-            assert!(!text.is_empty(), "{name} saved no rules");
-            match &expected {
-                Some(expected) => assert_eq!(&text, expected, "{name} saved different text"),
-                None => expected = Some(text),
-            }
-        }
-    }
-
     /// `parse_filter` reads the rules a load of the same bytes reads, so a
     /// caller that has the bytes already does not get a different filter for
     /// having read them itself.
@@ -1316,7 +1282,7 @@ mod tests {
         )
         .expect("parse");
 
-        assert_eq!(parsed.lines.len(), loaded.lines.len());
+        assert_eq!(parsed.len(), loaded.len());
         for probe in ENCODED_PROBES {
             for is_directory in [false, true] {
                 assert_eq!(
@@ -1330,7 +1296,6 @@ mod tests {
         assert!(
             lore_revision::filter::load_filter(dir.child("absent"))
                 .expect("an absent filter loads")
-                .lines
                 .is_empty(),
             "an absent filter is still an empty one"
         );
@@ -1374,7 +1339,8 @@ mod tests {
     /// Rule sets spanning the shapes that decide a covering answer: an open
     /// re-inclusion, one with an exclusion nested under it, one with the
     /// exclusion somewhere else entirely, a literal name rule, a suffix rule, a
-    /// `**` in the middle, and one of each at once.
+    /// `**` in the middle, a `**` and a bracket expression that each share a
+    /// component with other text and match inside it, and one of each at once.
     const COVER_RULES: &[&[&str]] = &[
         &["/*", "!/engine"],
         &["/*", "!/engine", "/engine/intermediate"],
@@ -1382,6 +1348,8 @@ mod tests {
         &["Thumbs.db"],
         &["*.tmp"],
         &["/some/**/path"],
+        &["/engine/c**", "!/engine/c*"],
+        &["/*", "!/engine", "/engine[!x]content"],
         &["/engine/content"],
         &["**/node_modules"],
         &["/*", "!/alt", "/alt/{b,c/d}/keep/*"],
@@ -1435,18 +1403,16 @@ mod tests {
         );
     }
 
-    /// A rule compared as text keeps its braces, and its subtree companion does
-    /// not.
+    /// A rule compared as text keeps its braces, and so does its subtree
+    /// companion.
     ///
     /// A glob carrying no `*?[]\\` is compared to the path rather than
     /// evaluated, so its braces are part of the name it matches and enumerating
     /// them would record paths it never names. The companion
-    /// [`FilterInstance::add_inclusion`] generates is evaluated as a glob
-    /// whatever the rule it carries was, so the same braces do alternate there
-    /// and the index has to enumerate them or the walk loses the subtree.
-    ///
-    /// The two together are why the filter re-includes `alt/b/x` without
-    /// re-including `alt/b`.
+    /// [`FilterInstance::add_inclusion`] generates is evaluated as a glob, so it
+    /// escapes those braces and re-includes only what lies below the rule's own
+    /// text: `!alt/{b,c}` re-includes `alt/{b,c}/x` and neither `alt/b` nor
+    /// `alt/b/x`, and `!/a{b,c/d}` re-includes nothing below `ab` or `ac/d`.
     #[test]
     fn a_literal_braced_rule_matches_its_own_text() {
         let mut exclusion = FilterInstance::default();
@@ -1459,18 +1425,72 @@ mod tests {
             );
         }
 
-        let mut inclusion = FilterInstance::default();
-        inclusion.add_exclusion("**").expect("exclude");
-        inclusion.add_inclusion("alt/{b,c}").expect("include");
-        let alt = probe_path("alt");
-        let state = inclusion.child_exclusion_state(FilterState::ROOT, &alt, true);
-        assert!(
-            inclusion.should_descend(state, &alt),
-            "the walk never reaches what the companion re-includes"
-        );
-        assert!(!inclusion.excludes(&probe_path("alt/{b,c}"), true));
-        assert!(!inclusion.excludes(&probe_path("alt/b/x"), false));
-        assert!(inclusion.excludes(&probe_path("alt/b"), true));
+        for (rule, below, expansions) in [
+            ("alt/{b,c}", "alt/{b,c}/x", &["alt/b/x", "alt/c/x"][..]),
+            ("/a{b,c/d}", "a{b,c/d}/x", &["ab/w", "ab/x/y", "ac/d/x"][..]),
+        ] {
+            let mut inclusion = FilterInstance::default();
+            inclusion.add_exclusion("**").expect("exclude");
+            inclusion.add_inclusion(rule).expect("include");
+            let top = probe_path(below.split('/').next().expect("a component"));
+            let state = inclusion.child_exclusion_state(FilterState::ROOT, &top, true);
+            assert!(
+                inclusion.should_descend(state, &top),
+                "the walk never reaches what the companion of {rule} re-includes"
+            );
+            assert!(
+                !inclusion.excludes(&probe_path(below), false),
+                "{rule} does not re-include {below}"
+            );
+            for expansion in expansions {
+                assert!(
+                    inclusion.excludes(&probe_path(expansion), false),
+                    "{rule} re-includes {expansion}"
+                );
+            }
+        }
+    }
+
+    /// A rule the matcher evaluates matches paths with fewer components than
+    /// its text where a `/` in it may match no separator: in a brace group, whose
+    /// alternative may hold fewer, and in a bracket expression, which matches
+    /// none. `/{a,b/c}*` names `ax` as well as `b/cx`, `/a{b,c/d}*` names `ab`,
+    /// `/x[a/b]y` names `xay` and `/a[b/c]/d` names `ab/d`, as exclusions and as
+    /// re-inclusions. A brace group in a rule compared as text is text, as in
+    /// git, so `/a{b,c/d}` names `a{b,c/d}` alone.
+    #[test]
+    fn a_rule_matches_fewer_components_than_its_text() {
+        for (rule, named) in [
+            ("/{a,b/c}*", &["ax", "b/cx"][..]),
+            ("/a{b,c/d}*", &["ab", "ac/dx"][..]),
+            ("/x[a/b]y", &["xay", "xby"][..]),
+            ("/a[b/c]/d", &["ab/d"][..]),
+        ] {
+            let mut exclusion = FilterInstance::default();
+            exclusion.add_exclusion(rule).expect("exclude");
+            let mut inclusion = FilterInstance::default();
+            inclusion.add_exclusion("**").expect("exclude");
+            inclusion.add_inclusion(rule).expect("include");
+            for path in named {
+                assert!(
+                    exclusion.excludes(&probe_path(path), false),
+                    "{rule} does not exclude {path}"
+                );
+                assert!(
+                    !inclusion.excludes(&probe_path(path), false),
+                    "{rule} does not re-include {path}"
+                );
+            }
+            assert!(
+                !exclusion.excludes(&probe_path("bx"), false),
+                "{rule} excludes bx"
+            );
+        }
+
+        let mut literal = FilterInstance::default();
+        literal.add_exclusion("/a{b,c/d}").expect("exclude");
+        assert!(literal.excludes(&probe_path("a{b,c/d}"), false));
+        assert!(!literal.excludes(&probe_path("ab"), false));
     }
 
     /// A filter holding `rules` in its view slot, built through the file they
@@ -1497,8 +1517,8 @@ mod tests {
     /// wrong "covered" drops every change inside it silently. The other
     /// direction only costs traversal.
     ///
-    /// Held against `FilterInstance::excludes`, which folds every ancestor on
-    /// every call and consults no index, the way the rest of these tests hold
+    /// Held against `FilterInstance::excludes`, which never reads the exclusion
+    /// index `covers_subtree` answers from, the way the rest of these tests hold
     /// the memoized answers against it.
     #[test]
     fn a_covered_subtree_holds_nothing_excluded() {
@@ -1552,15 +1572,12 @@ mod tests {
             "engine"
         ));
 
-        // `*` keeps its own one-component bound whatever `engine/intermediate`
-        // needs: a single depth for the whole index would lend `*` the longer
-        // rule's reach and lose this prune everywhere.
+        // `/{x,y}` compares its braces as text, so the trie stops at its first
+        // component and only its depth of one keeps it from `game`, whatever
+        // `engine/intermediate` needs: a single depth for the whole index would
+        // lend it the longer rule's reach and lose this prune everywhere.
         assert!(covers(
-            &view_filter(
-                &dir,
-                "per-marker",
-                &["/*", "!/game", "/engine/intermediate"]
-            ),
+            &view_filter(&dir, "per-marker", &["/{x,y}", "/engine/intermediate"]),
             "game"
         ));
 
@@ -1571,11 +1588,21 @@ mod tests {
         // subtree holding `game/thumbs.db` as untouched.
         assert!(!covers(&view_filter(&dir, "name", &["Thumbs.db"]), "game"));
 
-        // A `**` anywhere in a rule leaves its depth unbounded.
+        // A `**` component leaves a rule's depth unbounded.
         assert!(!covers(
             &view_filter(&dir, "globstar", &["/some/**/path"]),
             "some"
         ));
+
+        let class = view_filter(&dir, "class", &["/*", "!/engine", "/engine/[bb]inaries"]);
+        assert!(
+            !covers(&class, "engine"),
+            "engine is covered while engine/binaries is excluded"
+        );
+        assert!(
+            covers(&class, "engine/source"),
+            "a bracket expression reaches below engine/source"
+        );
 
         // A brace alternative can hold a separator, so the group's text names no
         // component and the trie cannot follow it. Each alternative is indexed
@@ -1692,8 +1719,8 @@ mod tests {
         second.add_exclusion("/*").expect("exclude");
         second.add_inclusion("/engine").expect("include");
         assert_eq!(
-            second.lines.len(),
-            first.view.lines.len(),
+            second.len(),
+            first.view.len(),
             "the two views have to be the same length to be the case this tests"
         );
 
@@ -1745,70 +1772,155 @@ mod tests {
         );
     }
 
-    /// The file `save` builds the new rules in, named as the implementation
-    /// names it so these tests fail if it stops writing through a sibling at all.
-    fn temp_sibling_of(path: &std::path::Path) -> std::path::PathBuf {
-        let mut temp = path.as_os_str().to_owned();
-        temp.push(lore_revision::repository::TEMP_FILE_EXTENSION);
-        std::path::PathBuf::from(temp)
+    /// The warnings logged while a test runs, which [`record_warning`] collects.
+    static WARNINGS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+    fn record_warning(level: lore_revision::lore_base::log::LoreLogLevel, _: &str, message: &str) {
+        if level == lore_revision::lore_base::log::LoreLogLevel::Warn {
+            WARNINGS.lock().expect("warnings").push(message.to_string());
+        }
     }
 
-    /// A save that succeeds leaves the target and nothing else, the sibling
-    /// having been renamed onto it rather than copied.
-    #[tokio::test]
-    async fn save_leaves_no_temporary_file_behind() {
-        let dir = TempDir::new("lore-filter-save-clean-");
-        let target = dir.child("rules");
-        test_file_write(&target, ENCODED_RULES.as_bytes());
-        let filter = lore_revision::filter::load_filter(&target).expect("load");
+    /// A filter loaded from a repository ignore file holding `repository` and an
+    /// instance ignore file holding `instance`.
+    fn instance_filter(
+        dir: &TempDir,
+        repository: &[u8],
+        instance: &[u8],
+    ) -> Result<lore_revision::filter::Filter, lore_revision::filter::FilterError> {
+        let ignore = dir.child("loreignore");
+        test_file_write(&ignore, repository);
+        let instance_ignore = dir.child("ignore");
+        test_file_write(&instance_ignore, instance);
+        lore_revision::filter::load_with_instance_ignore(
+            &ignore,
+            &instance_ignore,
+            dir.child("view"),
+        )
+    }
 
-        lore_revision::filter::save(&filter, &target)
-            .await
-            .expect("save");
+    /// An instance's ignore rules exclude on top of the repository's, in the same
+    /// syntax: blank lines and `#` comments are skipped, and `\!` escapes a name
+    /// starting with `!`.
+    #[test]
+    fn instance_ignore_rules_exclude_after_the_repositorys() {
+        let dir = TempDir::new("lore-filter-instance-ignore-");
+        let filter = instance_filter(
+            &dir,
+            b"/out\n",
+            b"# build outputs\n\n/binaries/mac\n  *.obj  \n\\!bang\n",
+        )
+        .expect("load");
 
-        let temporary = temp_sibling_of(&target);
+        for (path, is_directory) in [
+            ("out", true),
+            ("binaries/mac", true),
+            ("binaries/mac/editor", false),
+            ("game/unit.obj", false),
+            ("!bang", false),
+            (".lore", true),
+        ] {
+            assert!(
+                filter.excludes(&probe_path(path), is_directory, FilterMode::Ignore),
+                "{path} is not excluded"
+            );
+        }
+        for (path, is_directory) in [
+            ("binaries/win64", true),
+            ("# build outputs", false),
+            ("bang", false),
+        ] {
+            assert!(
+                !filter.excludes(&probe_path(path), is_directory, FilterMode::Ignore),
+                "{path} is excluded"
+            );
+        }
+    }
+
+    /// An instance's exclusion of a directory wins over a re-inclusion below it
+    /// in the repository's ignore file, though a rule there excluded the
+    /// directory first: `.lore/ignore`'s `/Game/Saved/` keeps
+    /// `Game/Saved/Config/game.ini` out under `Saved/` and `!/Game/Saved/Config/`.
+    #[test]
+    fn an_instance_exclusion_wins_over_a_reinclusion_below_it() {
+        let dir = TempDir::new("lore-filter-instance-ignore-wins-");
+        let filter = instance_filter(&dir, b"Saved/\n!/Game/Saved/Config/\n", b"/Game/Saved/\n")
+            .expect("load");
         assert!(
-            !temporary.exists(),
-            "the save left {} behind",
-            temporary.display()
+            filter.excludes(
+                &probe_path("Game/Saved/Config/game.ini"),
+                false,
+                FilterMode::Ignore
+            ),
+            "the repository's re-inclusion wins over the instance's exclusion"
         );
     }
 
-    /// A save that fails leaves the previous rules.
-    ///
-    /// The target is never the file being written, so it never holds part of the
-    /// new rules. Here a directory occupies the sibling's path so the write
-    /// cannot open; a write breaking off part way, on a full filesystem for
-    /// instance, reaches the same place having touched nothing but the sibling.
-    ///
-    /// A filter file lost to a failed save is not visible afterwards: the rules
-    /// stop excluding what they named, and that reads as a filter matching
-    /// nothing.
-    #[tokio::test]
-    async fn a_failed_save_leaves_the_previous_rules() {
-        let dir = TempDir::new("lore-filter-save-failure-");
-        let target = dir.child("rules");
-        test_file_write(&target, ENCODED_RULES.as_bytes());
-        let filter = lore_revision::filter::load_filter(&target).expect("load");
-
-        // Occupy the sibling the save writes through, so opening it fails.
-        let temporary = temp_sibling_of(&target);
-        std::fs::create_dir(&temporary).expect("occupy the temporary path");
+    /// A `!` line in an instance's ignore file is skipped with a warning naming
+    /// the file and the line, so it cannot bring back what the repository
+    /// ignores; the lines around it still apply.
+    #[test]
+    fn instance_ignore_rules_skip_a_reinclusion_with_a_warning() {
+        lore_revision::lore_base::log::set_log_callback(Some(record_warning));
+        let dir = TempDir::new("lore-filter-instance-ignore-reinclude-");
+        let filter =
+            instance_filter(&dir, b"*.log\n", b"/build\n!important.log\n/cache\n").expect("load");
+        lore_revision::lore_base::log::set_log_callback(None);
 
         assert!(
-            lore_revision::filter::save(&filter, &target).await.is_err(),
-            "a save that could not be written reported success"
+            filter.excludes(&probe_path("important.log"), false, FilterMode::Ignore),
+            "the instance's file re-included what the repository ignores"
         );
-        assert_eq!(
-            std::fs::read(&target).expect("read the target back"),
-            ENCODED_RULES.as_bytes(),
-            "a failed save changed the target"
-        );
+        for path in ["build", "cache"] {
+            assert!(
+                filter.excludes(&probe_path(path), true, FilterMode::Ignore),
+                "{path} is not excluded"
+            );
+        }
 
-        let reloaded = lore_revision::filter::load_filter(&target).expect("reload");
+        let file = dir.child("ignore").display().to_string();
+        let warnings = WARNINGS.lock().expect("warnings");
         assert!(
-            reloaded.excludes(&probe_path("build.log"), false),
-            "the rules that were there before no longer apply"
+            warnings.iter().any(|warning| warning.contains(&file)
+                && warning.contains("line 2")
+                && warning.contains("!important.log")),
+            "no warning names line 2 of {file}: {warnings:?}"
+        );
+    }
+
+    /// An instance ignore file that cannot be read adds no rules, as an absent
+    /// one does, while one that cannot be decoded fails the load with an error
+    /// naming it.
+    #[test]
+    fn instance_ignore_file_errors_follow_the_repository_ignore_file() {
+        let dir = TempDir::new("lore-filter-instance-ignore-errors-");
+        let ignore = dir.child("loreignore");
+        test_file_write(&ignore, b"/out\n");
+        let view = dir.child("view");
+        let baseline = lore_revision::filter::load(&ignore, &view).expect("load");
+
+        let unreadable = dir.child("directory");
+        std::fs::create_dir(&unreadable).expect("create directory");
+        for instance_ignore in [dir.child("absent"), unreadable] {
+            let filter =
+                lore_revision::filter::load_with_instance_ignore(&ignore, &instance_ignore, &view)
+                    .expect("an unreadable instance ignore file loads");
+            assert_eq!(
+                filter.ignore.len(),
+                baseline.ignore.len(),
+                "{} added rules",
+                instance_ignore.display()
+            );
+        }
+
+        let mut invalid_utf8 = b"/build\n".to_vec();
+        invalid_utf8.extend([0xC3, 0x28, b'\n']);
+        let error = instance_filter(&dir, b"/out\n", &invalid_utf8)
+            .expect_err("an undecodable instance ignore file is refused");
+        let file = dir.child("ignore").display().to_string();
+        assert!(
+            error.to_string().contains(&file),
+            "the error does not name {file}: {error}"
         );
     }
 }

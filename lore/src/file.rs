@@ -481,7 +481,8 @@ pub struct LoreFileStageArgs {
     pub paths: LoreArray<LoreString>,
     /// Case change handling, 0 = error, 1 = update filesystem (keep), 2 = update repository (rename)
     pub case_change: u32,
-    /// Force a recursive filesystem scan of directory paths (no effect on file paths)
+    /// Walk directory paths recursively on the filesystem, as the global `force` argument also
+    /// does (no effect on file paths)
     pub scan: u8,
 }
 
@@ -504,6 +505,11 @@ pub struct LoreFileStageArgs {
 ///   and the dirty flags are disregarded. Use this when you need a full
 ///   reconciliation (e.g. after operations that may have changed files
 ///   without going through the dirty-tracking path).
+/// - **Forced directory paths**, with the global `force` argument, are walked
+///   as with [`scan`](LoreFileStageArgs::scan), past the ignore file and the
+///   view: everything in the directory but Lore's own entries is staged,
+///   unchanged files included, with the deletion of what the working tree no
+///   longer holds, except what the view leaves out.
 ///
 /// # Events
 ///
@@ -845,13 +851,14 @@ fn unstage_local(
         args,
         unstage,
         move |repository, token, args| async move {
-            let options = UnstageOptions { single_node: false };
+            let options = UnstageOptions::default();
             file::unstage::unstage(repository, &token, args.paths, options).await
         },
     )
 }
 
-/// Arguments for resetting files to a revision, optionally purging untracked files.
+/// Arguments for resetting files to a revision, optionally deleting what the revision does not
+/// hold.
 #[repr(C)]
 #[derive(Debug, Clone, PartialEq, LoreArgs, bitcode::Encode, bitcode::Decode)]
 #[handler(reset_local)]
@@ -860,11 +867,13 @@ pub struct LoreFileResetArgs {
     pub paths: LoreArray<LoreString>,
     /// Revision to reset files into
     pub revision: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
 }
 
-/// Resets one or more files to a specified revision, optionally purging untracked files.
+/// Resets one or more files to a specified revision, optionally deleting what the revision does
+/// not hold.
 ///
 /// # Events
 ///
@@ -928,7 +937,8 @@ pub struct LoreFileResetToLastMergedArgs {
     pub paths: LoreArray<LoreString>,
     /// Branch whose last merged revision to reset to
     pub branch: LoreString,
-    /// Purge untracked files
+    /// Delete what the revision does not hold within the view: untracked files, whatever the
+    /// ignore file says, and files the view excludes. Nested repositories stay
     pub purge: u8,
     /// Merge side to restore, 0 = resolved (the merge revision), 1 = self ("mine"), 2 = other ("theirs")
     pub merge_side: u32,

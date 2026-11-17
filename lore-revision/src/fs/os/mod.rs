@@ -6,6 +6,11 @@
 //! the operating system via the lore-io driver. The directory listings and name lookups
 //! the operation is built on sit here with it, reaching the driver for this provider alone.
 
+#[cfg(not(feature = "test-util"))]
+mod clone;
+#[cfg(feature = "test-util")]
+pub mod clone;
+
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
@@ -14,17 +19,23 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::FutureExt;
 use lore_base::error::InvalidPath;
 use lore_base::types::Address;
 use lore_base::types::Fragment;
 use lore_error_set::prelude::*;
+use lore_io::StatKind;
+use lore_io::clone::CloneStats;
 
+use super::filesystem_provider::CloneAnswer;
+use super::filesystem_provider::CloneRun;
 use super::filesystem_provider::DirectoryEntry;
 use super::filesystem_provider::DirectoryListing;
 use super::filesystem_provider::FileInfo;
 use super::filesystem_provider::FilesystemDiffContext;
 use super::filesystem_provider::FilesystemProvider;
 use super::filesystem_provider::FsError;
+use super::filesystem_provider::InstanceCloneError;
 use super::filesystem_provider::InstanceOperation;
 use super::filesystem_provider::InstanceOperationImpl;
 use super::filesystem_provider::StaticDispatchDirectoryListing;
@@ -71,6 +82,27 @@ impl FilesystemProvider for OsFilesystem {
             self.holds_state(),
         )))
     }
+
+    async fn clone_answer(
+        &self,
+        source: &Path,
+        dot_path: &Path,
+        destination: &Path,
+    ) -> Result<CloneAnswer, InstanceCloneError> {
+        clone::answer(source, dot_path, destination).await
+    }
+
+    async fn clone_instance(
+        &self,
+        source: &Path,
+        dot_path: &Path,
+        destination: &Path,
+        answer: &CloneAnswer,
+        copy_unclonable: bool,
+        run: &CloneRun,
+    ) -> Result<CloneStats, InstanceCloneError> {
+        clone::clone(source, dot_path, destination, answer, copy_unclonable, run).await
+    }
 }
 
 /// OS-backed filesystem operation context.
@@ -83,8 +115,19 @@ pub struct OsOperation {
 impl OsOperation {
     /// Where `path` is on disk, under the root the operation was opened on -- the top-level
     /// repository every link and layer in it shares.
-    fn absolute(&self, path: &RelativePath) -> PathBuf {
+    fn absolute(&self, path: &RelativePath) -> Result<PathBuf, FsError> {
         path.to_absolute_path(&self.filesystem_root)
+            .forward::<FsError>("placing a path below the filesystem root")
+    }
+
+    /// Deletes a directory and its contents as [`InstanceOperation::remove_recursive`] does, but
+    /// keeps each nested repository in it, with the directories leading to one.
+    pub(crate) async fn remove_recursive_keeping_repositories(
+        &self,
+        path: &RelativePath,
+    ) -> Result<(), FsError> {
+        util::fs::unlink_recursive_keeping_repositories(&self.absolute(path)?).await?;
+        Ok(())
     }
 }
 
@@ -104,7 +147,7 @@ impl OsDirectoryListing {
                 Ok(Some(item)) => {
                     return Some(Ok(DirectoryEntry {
                         name: item.name,
-                        info: FileInfo::from_metadata(&item.metadata),
+                        info: FileInfo::from_stat(&item.metadata),
                         name_hash: item.name_hash,
                     }));
                 }
@@ -118,23 +161,30 @@ impl OsDirectoryListing {
 
 /// All operations delegate to the regular OS file system.
 impl InstanceOperation for OsOperation {
-    fn uses_host_filesystem(&self) -> bool {
-        true
-    }
     fn changes_from_filesystem_to_state(
         &self,
         diff: FilesystemDiffContext,
     ) -> ChangeStream<FilesystemDiffStats> {
-        crate::state::diff_provider_filesystem(diff)
+        ChangeStream::spawn(async move |changes| {
+            crate::state::os_diff::diff_os_filesystem(diff, &changes).await
+        })
     }
 
     /// A path mid-deletion stats as `PermissionDenied` on Windows rather than
-    /// `NotFound`, so both report a non-existent path.
+    /// `NotFound`, and a path below a file as `NotADirectory`, so all of them report a
+    /// non-existent path.
     async fn file_info(&self, path: &RelativePath) -> Result<FileInfo, FsError> {
-        let path = self.absolute(path);
-        match lore_io::IoDriver::global().metadata(path).await {
-            Ok(metadata) => Ok(FileInfo::from_metadata(&metadata)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(FileInfo::NotExist),
+        let path = self.absolute(path)?;
+        match lore_io::IoDriver::global().stat(path).await {
+            Ok(stat) => Ok(FileInfo::from_stat(&stat)),
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                Ok(FileInfo::NotExist)
+            }
             Err(e)
                 if cfg!(target_family = "windows")
                     && e.kind() == std::io::ErrorKind::PermissionDenied =>
@@ -151,14 +201,17 @@ impl InstanceOperation for OsOperation {
         self.file_info(path).await
     }
 
+    /// A path through a name no node may carry, which the root is refused for, is held in no
+    /// spelling.
     async fn holds_name_exactly(&self, path: &RelativePath) -> Option<bool> {
-        lore_io::IoDriver::global()
-            .holds_name_exactly(self.absolute(path))
-            .await
+        let Ok(path) = self.absolute(path) else {
+            return Some(false);
+        };
+        lore_io::IoDriver::global().holds_name_exactly(path).await
     }
 
     async fn read_directory(&self, path: &RelativePath) -> Result<DirectoryListing, FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         Ok(DirectoryListing::new(StaticDispatchDirectoryListing::Os(
             OsDirectoryListing {
                 entries: lore_io::IoDriver::global().read_dir(path).await?,
@@ -170,7 +223,9 @@ impl InstanceOperation for OsOperation {
         &self,
         path: &RelativePath,
     ) -> Result<lore_storage::ContentSource<'static>, FsError> {
-        Ok(lore_storage::ContentSource::owned_file(self.absolute(path)))
+        Ok(lore_storage::ContentSource::owned_file(
+            self.absolute(path)?,
+        ))
     }
 
     /// Measures the file the operation's root holds at `path` against the stored object's own
@@ -191,7 +246,7 @@ impl InstanceOperation for OsOperation {
         previous_size: u64,
         established: &lore_storage::ContentHashes,
     ) -> Result<NodeComparison, FsError> {
-        let source = lore_storage::ContentSource::owned_file(self.absolute(path));
+        let source = lore_storage::ContentSource::owned_file(self.absolute(path)?);
         let matched = crate::immutable::file_matches(
             repository,
             previous,
@@ -206,43 +261,18 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn make_executable(&self, path: &RelativePath, executable: bool) -> Result<(), FsError> {
-        let path = self.absolute(path);
-        #[cfg(unix)]
-        {
-            let absolute_path = &path;
-            use std::os::unix::fs::PermissionsExt;
-            let metadata = lore_io::IoDriver::global().metadata(&absolute_path).await?;
-            let mut permissions = metadata.permissions();
-            let mode = permissions.mode();
-            if executable {
-                permissions.set_mode(mode | 0o111); // Add execute permission for user, group, others
-            } else {
-                permissions.set_mode(mode & !0o111); // Add execute permission for user, group, others
-            }
-            lore_io::IoDriver::global()
-                .set_permissions(&absolute_path, permissions)
-                .await?;
-        }
-
-        // No-op on Windows
-        #[cfg(not(unix))]
-        {
-            // Suppress unused variable warnings
-            let _ = path;
-            let _ = executable;
-        }
-
+        util::fs::set_executable(self.absolute(path)?, None, executable).await?;
         Ok(())
     }
 
     async fn create_dir_all(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         lore_io::IoDriver::global().create_dir_all(path).await?;
         Ok(())
     }
 
     async fn write_file(&self, path: &RelativePath, contents: Bytes) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         lore_io::IoDriver::global()
             .write_file_bytes(path, contents, false)
             .await?;
@@ -250,41 +280,65 @@ impl InstanceOperation for OsOperation {
     }
 
     async fn rename(&self, from: &RelativePath, to: &RelativePath) -> Result<(), FsError> {
-        let (from, to) = (self.absolute(from), self.absolute(to));
+        let (from, to) = (self.absolute(from)?, self.absolute(to)?);
         rename_unifying(&from, &to).await?;
         Ok(())
     }
 
+    /// Read from the file system's own identity of the file each path names, symbolic links
+    /// followed, as [`lore_io::IoDriver::names_one_entry`] reads it.
+    async fn names_one_entry(
+        &self,
+        from: &RelativePath,
+        to: &RelativePath,
+    ) -> Result<Option<bool>, FsError> {
+        Ok(lore_io::IoDriver::global()
+            .names_one_entry(self.absolute(from)?, self.absolute(to)?)
+            .await?)
+    }
+
     async fn remove(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         util::fs::unlink(path).await?;
         Ok(())
     }
 
     async fn remove_recursive(&self, path: &RelativePath) -> Result<(), FsError> {
-        let path = self.absolute(path);
+        let path = self.absolute(path)?;
         util::fs::unlink_recursive(path).await?;
         Ok(())
     }
 
+    async fn remove_empty_directory(&self, path: &RelativePath) -> Result<(), FsError> {
+        lore_io::IoDriver::global()
+            .remove_dir(self.absolute(path)?)
+            .await?;
+        Ok(())
+    }
+
+    /// Takes the mode for the executable bit from the metadata the write captured, or from a
+    /// stat by path where the write captured none, and stats the file by path for the
+    /// [`FileInfo`] it answers: the write takes its metadata on the open handle, and a
+    /// filesystem that settles the stamp at close gives the file a later time.
+    ///
+    /// The directory above the file is created where the write finds it missing, so a file
+    /// written into a directory that is there costs no call on that directory.
     async fn write_node(
         &self,
         repository: Arc<RepositoryContext>,
         node: &Node,
         path: &RelativePath,
     ) -> Result<FileInfo, FsError> {
-        let path = self.absolute(path);
-        if let Some(parent) = path.parent() {
-            lore_io::IoDriver::global().create_dir_all(parent).await?;
+        let path = self.absolute(path)?;
+        {
+            let options = immutable::read_options_from_repository(&repository).creating_parent();
+            let (_, written) =
+                write_addressed_content(repository, node.address, &path, options).await?;
+            let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
+            util::fs::metadata_set_executable(&path, written.as_ref(), executable).await;
         }
-
-        write_addressed_content(repository, node.address, &path).await?;
-
-        let written = lore_io::IoDriver::global().metadata(&path).await?;
-        let executable = node.mode & NodeFileMode::Executable == NodeFileMode::Executable;
-        util::fs::metadata_set_executable(&path, &written, executable).await;
-        Ok(FileInfo::from_metadata(
-            &lore_io::IoDriver::global().metadata(&path).await?,
+        Ok(FileInfo::from_stat(
+            &lore_io::IoDriver::global().stat(path).await?,
         ))
     }
 
@@ -294,8 +348,10 @@ impl InstanceOperation for OsOperation {
         address: Address,
         path: &RelativePath,
     ) -> Result<(Fragment, Option<FileInfo>), FsError> {
-        let path = self.absolute(path);
-        let (fragment, metadata) = write_addressed_content(repository, address, &path).await?;
+        let path = self.absolute(path)?;
+        let options = immutable::read_options_from_repository(&repository);
+        let (fragment, metadata) =
+            write_addressed_content(repository, address, &path, options).await?;
         Ok((fragment, metadata.as_ref().map(FileInfo::from_metadata)))
     }
 
@@ -305,7 +361,10 @@ impl InstanceOperation for OsOperation {
         destination_path: &RelativePath,
     ) -> Result<(), FsError> {
         lore_io::IoDriver::global()
-            .copy(self.absolute(source_path), self.absolute(destination_path))
+            .copy(
+                self.absolute(source_path)?,
+                self.absolute(destination_path)?,
+            )
             .await?;
         Ok(())
     }
@@ -316,8 +375,8 @@ impl InstanceOperation for OsOperation {
 pub struct FileListItem {
     /// The name of the file/directory (not the full path).
     pub name: String,
-    /// Filesystem metadata (size, timestamps, permissions, etc.).
-    pub metadata: std::fs::Metadata,
+    /// What the name holds: its kind, size, modification time and permission bits.
+    pub metadata: lore_io::Stat,
     /// Pre-computed hash of the lowercase name for efficient lookups.
     pub name_hash: u64,
 }
@@ -384,7 +443,7 @@ pub fn file_list_item(
     let Some(metadata) = entry.metadata else {
         return Ok(None);
     };
-    if !metadata.is_file() && !metadata.is_dir() {
+    if metadata.kind == lore_io::StatKind::Other {
         return Ok(None);
     }
     let name = entry_name(entry.file_name)?;
@@ -430,11 +489,11 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
         return Ok(PathListingResult::Directory { listing });
     }
 
-    let Ok(metadata) = driver.metadata(path.as_path()).await else {
+    let Ok(metadata) = driver.stat(path.as_path()).await else {
         return Ok(PathListingResult::NotFound);
     };
 
-    if metadata.is_file() {
+    if metadata.kind == lore_io::StatKind::File {
         let file_name = match path.file_name() {
             Some(name) => entry_name(name.to_os_string())?,
             None => String::new(),
@@ -454,20 +513,22 @@ pub async fn list_path(path: PathBuf) -> Result<PathListingResult, PathError> {
     }
 }
 
-/// Puts the content `address` names at `path`, with the fragment it came from and what the write
-/// left there where the write reported it.
+/// Puts the content `address` names at `path`, read with `options`, with the fragment it came
+/// from and what the write left there where the write reported it.
 ///
 /// The zero hash every empty file carries addresses nothing and leaves an empty file: the store
 /// answers for it without being read, there being no content to find.
-async fn write_addressed_content(
+///
+/// Returns [`immutable::read_into_file`]'s future with its error forwarded, without a future of
+/// its own.
+fn write_addressed_content(
     repository: Arc<RepositoryContext>,
     address: Address,
     path: &Path,
-) -> Result<(Fragment, Option<std::fs::Metadata>), FsError> {
-    let options = immutable::read_options_from_repository(&repository);
+    options: lore_storage::ReadOptions,
+) -> impl Future<Output = Result<(Fragment, Option<std::fs::Metadata>), FsError>> {
     immutable::read_into_file(repository, address, path, None, options)
-        .await
-        .forward_any::<FsError>("Failed to read file")
+        .map(|written| written.forward_any::<FsError>("Failed to read file"))
 }
 
 /// Carries the file at `from_path` to `to_path` without a rename, which is what a move between two
@@ -485,40 +546,70 @@ async fn copy_and_unlink(from_path: &Path, to_path: &Path) -> std::io::Result<()
 }
 
 /// The OS arm of [`InstanceOperation::rename`]: moves what the file system holds at `from_path` to
-/// `to_path`, by rename where one lands and by hand where none does.
+/// `to_path`, by rename where one lands and by [`unify_refused_rename`] where none does. On
+/// Windows a directory renamed onto a file lands: the system's rename replaces the file with the
+/// directory.
 ///
-/// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
-/// A directory hands each child over under these same rules, a child whose name the destination
-/// also holds recursing again, before it goes; a destination that is not there is created to take
-/// them. A `from_path` and `to_path` of different kinds are refused, there being no move that
-/// leaves one of them.
-///
-/// Boxed because it recurses.
+/// Only a refused rename is boxed, the unification recursing through it, so a rename that lands
+/// boxes no future. Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
 fn rename_unifying<'a>(
     from_path: &'a Path,
     to_path: &'a Path,
-) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> {
-    Box::pin(async move {
-        let driver = lore_io::IoDriver::global();
+) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+    async move {
         lore_debug!(
             "Try rename {} -> {}",
             from_path.display(),
             to_path.display()
         );
-        if driver.rename(from_path, to_path).await.is_ok() {
-            lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
-            return Ok(());
+        match lore_io::IoDriver::global().rename(from_path, to_path).await {
+            Ok(()) => {
+                lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
+                Ok(())
+            }
+            Err(refused) => {
+                let unifying: Pin<Box<dyn Future<Output = std::io::Result<()>> + Send + 'a>> =
+                    Box::pin(unify_refused_rename(from_path, to_path, refused));
+                unifying.await
+            }
         }
+    }
+}
 
-        let from_metadata = driver.metadata(from_path).await?;
-        let to_metadata = match driver.metadata(to_path).await {
-            Ok(metadata) => Some(metadata),
+/// Moves what the file system holds at `from_path` to `to_path` by hand, the rename between them
+/// having been refused with `refused`.
+///
+/// A file goes to `to_path` whether or not a file is there, one that is there being removed first.
+/// A directory hands each child over to `to_path` through [`rename_unifying`], a child whose name
+/// the destination also holds being unified again, before it goes; a destination that is not there
+/// is created to take them. A `from_path` and `to_path` of different kinds are refused, there being
+/// no move that leaves one of them.
+///
+/// A `to_path` naming the entry `from_path` does, as another spelling of its name does on a file
+/// system that folds case, or one that cannot be told apart from it, is not unified: removing or
+/// emptying it could remove the source. `refused` is answered and both stay as they stand.
+///
+/// Not an `async fn`, which would hold a second copy of its arguments.
+#[lore_macro::test_pub]
+#[allow(clippy::manual_async_fn)]
+fn unify_refused_rename<'a>(
+    from_path: &'a Path,
+    to_path: &'a Path,
+    refused: std::io::Error,
+) -> impl Future<Output = std::io::Result<()>> + Send + 'a {
+    async move {
+        let driver = lore_io::IoDriver::global();
+        let from_kind = driver.stat(from_path).await?.kind;
+        let to_kind = match driver.stat(to_path).await {
+            Ok(stat) => Some(stat.kind),
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
             Err(err) => return Err(err),
         };
 
-        if let Some(to_metadata) = &to_metadata
-            && from_metadata.is_dir() != to_metadata.is_dir()
+        if let Some(to_kind) = to_kind
+            && (from_kind == StatKind::Directory) != (to_kind == StatKind::Directory)
         {
             return Err(tokio::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -526,8 +617,17 @@ fn rename_unifying<'a>(
             ));
         }
 
-        if from_metadata.is_file() {
-            if to_metadata.is_some() {
+        if to_kind.is_some()
+            && !matches!(
+                driver.names_one_entry(from_path, to_path).await,
+                Ok(Some(false) | None)
+            )
+        {
+            return Err(refused);
+        }
+
+        if from_kind == StatKind::File {
+            if to_kind.is_some() {
                 driver.remove_file(to_path).await?;
                 if driver.rename(from_path, to_path).await.is_ok() {
                     return Ok(());
@@ -535,7 +635,7 @@ fn rename_unifying<'a>(
             }
             copy_and_unlink(from_path, to_path).await?;
         } else {
-            if to_metadata.is_none() {
+            if to_kind.is_none() {
                 driver.create_dir_all(to_path).await?;
             }
             // The listing is drained before the directory goes, so nothing is still walking it.
@@ -557,5 +657,5 @@ fn rename_unifying<'a>(
 
         lore_debug!("Renamed {} -> {}", from_path.display(), to_path.display());
         Ok(())
-    })
+    }
 }

@@ -26,6 +26,8 @@ mod store;
 mod telemetry;
 mod tls;
 mod topology;
+mod uds;
+mod uds_server;
 mod util;
 
 /// Ensures that when we run our test suite for `lore-server` it is using

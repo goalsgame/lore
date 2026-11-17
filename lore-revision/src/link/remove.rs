@@ -37,7 +37,6 @@ pub(crate) async fn remove(
     token: &RepositoryWriteToken,
     link_path: RelativePath,
 ) -> Result<(), LinkError> {
-    crate::fs::hold::require_revision_replacement(&repository)?;
     let (state_current, state_staged, parent_branch) =
         State::deserialize_current_and_staged(repository.clone())
             .await
@@ -110,13 +109,10 @@ pub(crate) async fn remove(
     if is_staged_add {
         // Link was added but never committed — discard the node from the staged tree
         lore_debug!("Link node was staged for add, discarding instead of staging delete");
-        state::node_discard_patch(
+        state::node_discard_fused(
             inner_state.clone(),
             inner_repository.clone(),
             node_link.node,
-            |discarded_node_id, _flags| {
-                lore_debug!("Discarded link node {discarded_node_id}");
-            },
         )
         .await
         .forward::<LinkError>("Failed to discard link node")?;
@@ -181,7 +177,8 @@ pub fn remove_boxed(
 }
 
 /// Removing a link deletes its mounted directory from disk, taking any
-/// uncommitted work inside it with no way back.
+/// uncommitted work inside it with no way back. A file under a case variant
+/// of its name holding what the link holds is no such work.
 async fn verify_no_local_changes_under_link(
     operation: &Arc<InstanceOperationImpl>,
     repository: Arc<RepositoryContext>,
@@ -189,10 +186,7 @@ async fn verify_no_local_changes_under_link(
     state_staged: Arc<State>,
     link_path: &RelativePath,
 ) -> Result<(), LinkError> {
-    // TODO(vri): narrow this to `link_path` once a scoped diff works.
-    // `find_relative_node_link` returns a mount as the parent's own link node,
-    // so `diff_filesystem` has nothing to resolve and walks a node with no
-    // children, reporting every file under the mount as added.
+    // TODO(vri): narrow this to `link_path`.
     let changes = state::diff_filesystem(
         operation,
         FilesystemDiffTree {
@@ -213,7 +207,7 @@ async fn verify_no_local_changes_under_link(
     .await
     .forward::<LinkError>("Failed comparing link content with the file system")?;
     let modified = changes
-        .any(|change| link_path.covers_ignore_case(change.path()))
+        .any(|change| link_path.covers_ignore_case(change.path()) && !change.is_case_variant())
         .await
         .forward::<LinkError>("Failed comparing link content with the file system")?;
 
