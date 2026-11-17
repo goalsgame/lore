@@ -51,6 +51,7 @@ fn connected(repository: RepositoryId, actions: &[&str]) -> Arc<AttributeMap> {
     context.insert(repository);
     context.insert(RawToken("raw.jwt".to_string()));
     context.insert(AuthorizationToken {
+        expires: u64::MAX,
         resources: Some(vec![ResourcePermission {
             resource_id: format!("urc-{repository}"),
             permission: actions.iter().map(ToString::to_string).collect(),
