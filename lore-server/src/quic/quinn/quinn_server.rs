@@ -388,6 +388,7 @@ fn run_loop(
 }
 
 /// Accepts connections on `endpoint` until it closes, each handled by a task of its own.
+#[allow(clippy::too_many_arguments)]
 fn spawn_listener(
     endpoint: quinn::Endpoint,
     socket: usize,
