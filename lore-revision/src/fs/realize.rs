@@ -240,14 +240,20 @@ pub async fn realize_state(
         );
         */
         change::reverse(changes.as_mut_slice());
-        let mounts = changed_mounts(
-            &repository_current,
-            &state_current,
-            &repository_target,
-            &state_target,
-        )
-        .await?;
-        if !mounts.is_empty() && options.root_files.is_empty() {
+        let mounts = if options.root_files.is_empty()
+            && state_current.revision() != state_target.revision()
+        {
+            changed_mounts(
+                &repository_current,
+                &state_current,
+                &repository_target,
+                &state_target,
+            )
+            .await?
+        } else {
+            Vec::new()
+        };
+        if !mounts.is_empty() {
             let mounts: HashSet<&str> = mounts.iter().map(RelativePath::as_str).collect();
             let mounted: Vec<NodeChange> = state::diff_collect_uncoalesced(
                 repository_current.clone(),
@@ -259,17 +265,17 @@ pub async fn realize_state(
             .await
             .forward::<SyncError>("Failed to calculate the changes of the changed mounts")?
             .into_iter()
-            .filter(|change| covering_mount(&mounts, change.path().as_str()).is_some())
+            .filter(|change| covering_mount(&mounts, change.path().as_lowercase_str()).is_some())
             .collect();
-            changes.retain(
-                |change| match covering_mount(&mounts, change.path().as_str()) {
+            changes.retain(|change| {
+                match covering_mount(&mounts, change.path().as_lowercase_str()) {
                     None => true,
                     Some(mount) => {
                         mount == change.path().as_lowercase_str()
                             && change.action == change::FileAction::Delete
                     }
-                },
-            );
+                }
+            });
             changes.extend(mounted);
             change::sort_by_path(&mut changes);
         }
@@ -435,8 +441,8 @@ async fn mounted_links(
 }
 
 /// Adds to `changed` each path below `prefix` that `current` and `target` mount differently:
-/// a link on one side only, to another repository, or at the same pin from another source. A link
-/// pinned elsewhere on each side is compared through its pinned trees, [`state::MAX_LINK_DEPTH`]
+/// a link on one side only, to another repository, or from another source path. A link pinned
+/// elsewhere on each side from the same source path is compared through its pinned trees, [`state::MAX_LINK_DEPTH`]
 /// links deep at most.
 async fn compare_mounts(
     current: MountSide,
@@ -478,6 +484,10 @@ async fn compare_mounts(
         let Some(target_side) = linked_side(&target, link).await? else {
             continue;
         };
+        if source_path(&current_side).await != source_path(&target_side).await {
+            changed.push(RelativePath::new().join(path.as_str()));
+            continue;
+        }
         Box::pin(compare_mounts(
             current_side,
             target_side,
@@ -507,6 +517,15 @@ async fn linked_side(
     }))
 }
 
+/// The path of the node `side` mounts in its tree, lowercase, or none where it cannot be read.
+async fn source_path(side: &MountSide) -> Option<String> {
+    side.state
+        .node_path(side.repository.clone(), side.source)
+        .await
+        .ok()
+        .map(|path| path.to_lowercase())
+}
+
 /// The node of its linked tree that `link`, held by `side`'s tree, mounts.
 async fn mount_source(side: &MountSide, link: &state::LinkReference) -> Result<NodeID, SyncError> {
     Ok(side
@@ -518,10 +537,9 @@ async fn mount_source(side: &MountSide, link: &state::LinkReference) -> Result<N
         .unwrap_or(ROOT_NODE))
 }
 
-/// The path in `mounts`, lowercase, that is `path` or one of its ancestors, ignoring case.
+/// The path in `mounts` that is `path`, lowercase, or one of its ancestors.
 fn covering_mount<'a>(mounts: &HashSet<&'a str>, path: &str) -> Option<&'a str> {
-    let path = path.to_lowercase();
-    let mut candidate = path.as_str();
+    let mut candidate = path;
     loop {
         if let Some(mount) = mounts.get(candidate) {
             return Some(mount);
