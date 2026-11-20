@@ -1230,20 +1230,12 @@ async fn push_targets(
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
-    let mut added: HashMap<usize, HashSet<AddedPin>> = HashMap::new();
+    let mut added = HashSet::new();
     for target in targets {
-        if let Some(Mount::Link { target: parent, .. }) = &target.mount
-            && !added.contains_key(parent)
-        {
-            added.insert(*parent, merge_added_pins(&targets[*parent]).await);
-        }
+        added.extend(merge_added_pins(target).await);
     }
     let mut failures = schedule_targets(orders, |target| {
-        let added = match &targets[target].mount {
-            Some(Mount::Link { target: parent, .. }) => added.get(parent),
-            _ => None,
-        };
-        push_target(&targets[target], added, token, fast_forward_merge)
+        push_target(&targets[target], &added, token, fast_forward_merge)
     })
     .await;
     if failures.is_empty() {
@@ -1826,7 +1818,7 @@ async fn create_branch(
 /// Push `target`: start its push, push each revision of its plan in order, and finish.
 async fn push_target(
     target: &PushTarget,
-    added: Option<&HashSet<AddedPin>>,
+    added: &HashSet<AddedPin>,
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
@@ -1960,13 +1952,10 @@ type AddedPin = (RepositoryId, Hash, BranchId);
 
 /// The revisions `target` pushes on the line of first parents from its branch's head on the peer to
 /// its latest, which the push offers to the branch although they were made on another branch: a
-/// link a pushed merge added, of those `added` holds, fast-forwards the branch it tracks to its
+/// link a merge any target pushes added, of those `added` holds, fast-forwards the branch it tracks to its
 /// pin; a branch an earlier push left behind such a pin catches up along the line under a revision
 /// of its own. None when the line does not start at the head.
-async fn first_parent_line(
-    target: &PushTarget,
-    added: Option<&HashSet<AddedPin>>,
-) -> HashSet<Hash> {
+async fn first_parent_line(target: &PushTarget, added: &HashSet<AddedPin>) -> HashSet<Hash> {
     let mut line = HashSet::new();
     if !matches!(target.mount, Some(Mount::Link { .. })) {
         return line;
@@ -1975,9 +1964,7 @@ async fn first_parent_line(
         return line;
     };
     let carries = latest.branch(target.repository.clone()).await == target.branch
-        || added.is_some_and(|added| {
-            added.contains(&(target.repository.id, target.latest, target.branch))
-        });
+        || added.contains(&(target.repository.id, target.latest, target.branch));
     if !carries {
         return line;
     }
@@ -2017,8 +2004,13 @@ async fn merge_added_pins(holder: &PushTarget) -> HashSet<AddedPin> {
         else {
             continue;
         };
-        let held = mounts_by_path(&holder.repository, &first_parent).await;
-        for (path, link) in mounts_by_path(&holder.repository, &merge).await {
+        let (Some(held), Some(merged)) = (
+            mounts_by_path(&holder.repository, &first_parent).await,
+            mounts_by_path(&holder.repository, &merge).await,
+        ) else {
+            continue;
+        };
+        for (path, link) in merged {
             if held
                 .get(&path)
                 .is_none_or(|other| other.repository != link.repository)
@@ -2034,21 +2026,21 @@ async fn merge_added_pins(holder: &PushTarget) -> HashSet<AddedPin> {
     added
 }
 
-/// The links `state` holds, by the path each is mounted at.
+/// The links `state` holds, by the path each is mounted at, lowercase as node lookup compares
+/// paths. None where the registry or a link's path cannot be read, which adds no link.
 async fn mounts_by_path(
     repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
-) -> HashMap<String, LinkReference> {
+) -> Option<HashMap<String, LinkReference>> {
     let mut mounts = HashMap::new();
-    let Ok(links) = state.link_list(repository.clone()).await else {
-        return mounts;
-    };
-    for link in links {
-        if let Ok(path) = state.node_path(repository.clone(), link.local_node()).await {
-            mounts.insert(path, link);
-        }
+    for link in state.link_list(repository.clone()).await.ok()? {
+        let path = state
+            .node_path(repository.clone(), link.local_node())
+            .await
+            .ok()?;
+        mounts.insert(path.to_lowercase(), link);
     }
-    mounts
+    Some(mounts)
 }
 
 async fn push_local_revision(
