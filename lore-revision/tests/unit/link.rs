@@ -31,6 +31,9 @@ use crate::helper::in_memory::branch_id;
 use crate::helper::in_memory::directory;
 use crate::helper::in_memory::link_node;
 use crate::helper::in_memory::linked_revision;
+use crate::helper::test_commit_tree;
+use crate::helper::test_file_write;
+use crate::helper::test_repository_create;
 
 fn link(link_repository_id: RepositoryId, link_node_id: NodeID) -> LinkContext {
     LinkContext {
@@ -676,6 +679,138 @@ async fn a_link_has_no_child_in_the_state_holding_it() {
             ] {
                 assert!(!held.expect("reading the link"), "a {read} child");
             }
+        })
+        .await;
+}
+
+/// Staging a file below a link reads the pinned state from the linked repository's partition,
+/// which a store isolating partitions holds it under alone.
+#[tokio::test]
+async fn staging_below_a_link_reads_the_pinned_state_from_the_linked_repository() {
+    LORE_CONTEXT
+        .scope(setup_test_execution(), async {
+            let immutable = lore_storage::local::immutable_store::create(
+                None::<&str>,
+                lore_storage::local::immutable_store::ImmutableStoreCreateOptions::none(),
+                false,
+                lore_storage::local::immutable_store::ImmutableStoreSettings {
+                    isolate_partitions: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("making the immutable store");
+            let mutable = lore_storage::local::mutable_store::create(
+                None::<&str>,
+                lore_storage::MutableStoreSettings::default(),
+                immutable.clone(),
+            )
+            .await
+            .expect("making the mutable store");
+            let instance = test_repository_create(
+                immutable,
+                mutable,
+                RepositoryId::from(uuid::Uuid::now_v7()),
+            )
+            .await;
+            let repository = instance.repository.clone();
+            test_file_write(&instance.path.join("seed.txt"), b"seed");
+            let seeded = test_commit_tree(&instance, "Seed").await;
+            let (current, branch) = lore_revision::instance::load_current_anchor_boxed(&repository)
+                .await
+                .expect("loading the current anchor");
+
+            let link_repository = RepositoryId::from(uuid::Uuid::now_v7());
+            let linked = repository.to_link_context(link_repository).await;
+            let linked_state = State::new();
+            let d = linked_state
+                .node_add(linked.clone(), ROOT_NODE, directory("d"), "d")
+                .await
+                .expect("adding d");
+            linked_state
+                .node_add(linked.clone(), d, in_memory::file("f.txt"), "f.txt")
+                .await
+                .expect("adding f.txt");
+            let pin = linked_state
+                .serialize(linked.clone(), &instance.write_token)
+                .await
+                .expect("storing the linked state");
+
+            let lib = add(
+                &seeded,
+                repository.clone(),
+                ROOT_NODE,
+                link_node("lib", link_repository, pin),
+                "lib",
+            )
+            .await;
+            seeded
+                .link_add(
+                    repository.clone(),
+                    link_repository,
+                    branch,
+                    pin,
+                    lib,
+                    LinkFlags::NoFlags,
+                )
+                .await
+                .expect("registering the link");
+            let revision = lore_revision::commit::commit_in_memory_revision(
+                repository.clone(),
+                &instance.write_token,
+                seeded,
+                in_memory::metadata_on(branch),
+                current,
+                branch,
+            )
+            .await
+            .expect("committing the link");
+            lore_revision::instance::store_current_anchor(&repository, revision)
+                .await
+                .expect("storing the current anchor");
+
+            let file = instance.path.join("lib").join("d").join("f.txt");
+            #[allow(clippy::disallowed_methods)]
+            std::fs::create_dir_all(file.parent().expect("a parent")).expect("mkdir lib/d");
+            test_file_write(&file, b"modified below the link");
+
+            lore_revision::file::stage::stage(
+                repository.clone(),
+                &instance.write_token,
+                lore_revision::interface::LoreArray::from_vec(vec![
+                    lore_revision::interface::LoreString::from(&file),
+                ]),
+                lore_revision::stage::StageOptions::default(),
+            )
+            .await
+            .expect("staging below the link");
+
+            let staged = lore_revision::instance::load_staged_revision(&repository)
+                .await
+                .expect("loading the staged anchor")
+                .expect("a staged revision");
+            let staged = in_memory::revision_state(&repository, staged).await;
+            let lib = staged
+                .find_node_link(repository.clone(), "lib")
+                .await
+                .expect("finding lib");
+            let lib = staged
+                .node(repository.clone(), lib.node)
+                .await
+                .expect("reading lib");
+            assert_ne!(lib.address.hash, pin, "the link is repinned");
+            let linked_staged = State::deserialize(linked.clone(), lib.address.hash)
+                .await
+                .expect("reading the staged linked state");
+            let staged_file = linked_staged
+                .find_node_link(linked.clone(), "d/f.txt")
+                .await
+                .expect("finding d/f.txt");
+            let staged_file = linked_staged
+                .node(linked, staged_file.node)
+                .await
+                .expect("reading d/f.txt");
+            assert!(staged_file.is_staged(), "d/f.txt is staged");
         })
         .await;
 }
