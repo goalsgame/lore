@@ -881,3 +881,132 @@ def test_dry_run_unstage_and_reset_keep_a_staged_link_add(new_lore_repo):
 
     assert not os.path.exists(linked_file), "unstage kept the link's files"
     assert repo.link_list() != links, "unstage kept the staged link"
+
+
+@pytest.mark.smoke
+@pytest.mark.parametrize("reset", [False, True])
+def test_sync_to_a_revision_adding_a_link_clones_it(new_lore_repo, reset):
+    """A sync onto a revision that adds a link writes the linked files."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "inner\n"})
+    repo = make_repo(new_lore_repo, {"top.txt": "top\n"})
+    before = repo.revision_info().signature
+
+    repo.link_add("linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    added = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=reset)
+    assert not clone.path_exists("linked")
+
+    clone.sync(added, reset=reset)
+    assert clone.compare_file(repo, "linked/inner.txt")
+
+    clone.sync(before, reset=reset)
+    assert not clone.path_exists("linked")
+
+
+@pytest.mark.smoke
+def test_reset_sync_replaces_a_directory_with_a_link_and_back(new_lore_repo):
+    """A reset sync swaps a tracked directory for a link holding the same bytes, and back."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "same\n"})
+    repo = make_repo(
+        new_lore_repo,
+        {"linked/inner.txt": "same\n", "linked/old.txt": "old\n", "top.txt": "top\n"},
+    )
+    directory = repo.revision_info().signature
+
+    repo.rmtree("linked")
+    repo.stage(scan=True)
+    repo.link_add("linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    linked = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(directory, reset=True)
+    assert clone.read_files()["linked/inner.txt"] == "same\n"
+    assert "linked" not in clone.link_list()
+
+    clone.sync(linked, reset=True)
+    assert clone.read_files()["linked/inner.txt"] == "same\n"
+    assert not clone.path_exists("linked/old.txt")
+    assert link_repo.get_id() in clone.link_list()
+
+    clone.sync(directory, reset=True)
+    assert clone.read_files()["linked/inner.txt"] == "same\n"
+    assert clone.read_files()["linked/old.txt"] == "old\n"
+
+
+@pytest.mark.smoke
+def test_reset_sync_to_a_pin_adding_a_nested_link_clones_it(new_lore_repo):
+    """A reset sync onto a pin of a linked repository that adds a link of its own clones it."""
+    inner = make_repo(new_lore_repo, {"deep.txt": "deep\n"})
+    middle = make_repo(new_lore_repo, {"middle.txt": "middle\n"})
+    without_nested = middle.revision_info().signature
+    middle.link_add("nested", inner.get_id(), "/")
+    middle.commit()
+    middle.push()
+    with_nested = middle.revision_info().signature
+
+    repo = make_repo(new_lore_repo, {"top.txt": "top\n"})
+    repo.link_add("linked", middle.get_id(), "/", pin=without_nested)
+    repo.commit()
+    repo.push()
+    before = repo.revision_info().signature
+    repo.link_update("linked", pin=with_nested)
+    repo.commit()
+    repo.push()
+    after = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=True)
+    assert not clone.path_exists("linked/nested")
+
+    clone.sync(after, reset=True)
+    assert clone.read_files()["linked/nested/deep.txt"] == "deep\n"
+
+    clone.sync(before, reset=True)
+    assert not clone.path_exists("linked/nested")
+
+
+@pytest.mark.smoke
+def test_a_dry_run_reset_sync_adding_a_link_writes_nothing(new_lore_repo):
+    """A dry run of a reset sync onto a revision that adds a link leaves the working tree alone."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "inner\n"})
+    repo = make_repo(new_lore_repo, {"top.txt": "top\n"})
+    before = repo.revision_info().signature
+    repo.link_add("linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    added = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=True)
+    clone.sync(added, reset=True, dry_run=True)
+    assert not clone.path_exists("linked/inner.txt")
+
+
+@pytest.mark.smoke
+def test_reset_sync_moves_a_file_out_of_a_directory_a_link_replaces(new_lore_repo):
+    """A reset sync onto a revision that moves a file out of a directory a link then replaces."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "inner\n"})
+    repo = make_repo(new_lore_repo, {"shared/moved.txt": "moved\n", "top.txt": "top\n"})
+    before = repo.revision_info().signature
+
+    repo.move("shared/moved.txt", "moved.txt")
+    repo.rmtree("shared")
+    repo.stage(scan=True)
+    repo.link_add("shared", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    after = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=True)
+    clone.sync(after, reset=True)
+    files = clone.read_files()
+    assert files["moved.txt"] == "moved\n"
+    assert files["shared/inner.txt"] == "inner\n"
+    assert "shared/moved.txt" not in files
