@@ -1230,12 +1230,20 @@ async fn push_targets(
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
+    let mut added: HashMap<usize, HashSet<AddedPin>> = HashMap::new();
+    for target in targets {
+        if let Some(Mount::Link { target: parent, .. }) = &target.mount
+            && !added.contains_key(parent)
+        {
+            added.insert(*parent, merge_added_pins(&targets[*parent]).await);
+        }
+    }
     let mut failures = schedule_targets(orders, |target| {
-        let holder = match &targets[target].mount {
-            Some(Mount::Link { target: parent, .. }) => Some(&targets[*parent]),
+        let added = match &targets[target].mount {
+            Some(Mount::Link { target: parent, .. }) => added.get(parent),
             _ => None,
         };
-        push_target(&targets[target], holder, token, fast_forward_merge)
+        push_target(&targets[target], added, token, fast_forward_merge)
     })
     .await;
     if failures.is_empty() {
@@ -1818,14 +1826,14 @@ async fn create_branch(
 /// Push `target`: start its push, push each revision of its plan in order, and finish.
 async fn push_target(
     target: &PushTarget,
-    holder: Option<&PushTarget>,
+    added: Option<&HashSet<AddedPin>>,
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
     let Some(mut run) = start_target(target).await? else {
         return Ok(());
     };
-    let line = first_parent_line(target, holder).await;
+    let line = first_parent_line(target, added).await;
     for pushed in &target.plan.revisions {
         if pushed.local {
             push_local_revision(
@@ -1947,24 +1955,29 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 /// accepted, upload what it holds, and offer it as the branch's latest revision when it belongs to
 /// the branch. A linked repository's offer the peer refuses onto revisions the local history does
 /// not hold fails as [`Divergent`].
+/// A link a pushed merge added: the repository it links, its pin, and the branch it tracks.
+type AddedPin = (RepositoryId, Hash, BranchId);
+
 /// The revisions `target` pushes on the line of first parents from its branch's head on the peer to
 /// its latest, which the push offers to the branch although they were made on another branch: a
-/// link a merge added, pinned at a revision of the linked repository's merged branch, fast-forwards
-/// the branch it tracks to that pin; a branch an earlier push left behind such a pin catches up
-/// along the line under a revision of its own. None when the line does not start at the head.
-async fn first_parent_line(target: &PushTarget, holder: Option<&PushTarget>) -> HashSet<Hash> {
+/// link a pushed merge added, of those `added` holds, fast-forwards the branch it tracks to its
+/// pin; a branch an earlier push left behind such a pin catches up along the line under a revision
+/// of its own. None when the line does not start at the head.
+async fn first_parent_line(
+    target: &PushTarget,
+    added: Option<&HashSet<AddedPin>>,
+) -> HashSet<Hash> {
     let mut line = HashSet::new();
-    let Some(Mount::Link { link, .. }) = target.mount.as_ref() else {
+    if !matches!(target.mount, Some(Mount::Link { .. })) {
         return line;
-    };
+    }
     let Ok(latest) = State::deserialize(target.repository.clone(), target.latest).await else {
         return line;
     };
     let carries = latest.branch(target.repository.clone()).await == target.branch
-        || match holder {
-            Some(holder) => pushes_merge_adding_link(holder, link).await,
-            None => false,
-        };
+        || added.is_some_and(|added| {
+            added.contains(&(target.repository.id, target.latest, target.branch))
+        });
     if !carries {
         return line;
     }
@@ -1988,57 +2001,55 @@ async fn first_parent_line(target: &PushTarget, holder: Option<&PushTarget>) -> 
     line
 }
 
-/// Whether `holder` pushes a merge that adds a link to the repository `link` links, at a path where
-/// the merge's first parent has none.
-async fn pushes_merge_adding_link(holder: &PushTarget, link: &LinkReference) -> bool {
+/// The links the merges `holder` pushes add: those at a path where the merge's first parent links
+/// no mount of the same repository.
+async fn merge_added_pins(holder: &PushTarget) -> HashSet<AddedPin> {
+    let mut added = HashSet::new();
     for pushed in holder.plan.revisions.iter().filter(|pushed| pushed.local) {
-        if merge_added_link(&holder.repository, pushed.revision, link).await {
-            return true;
+        let Ok(merge) = State::deserialize(holder.repository.clone(), pushed.revision).await else {
+            continue;
+        };
+        if merge.parent_other().is_zero() {
+            continue;
+        }
+        let Ok(first_parent) =
+            State::deserialize(holder.repository.clone(), merge.parent_self()).await
+        else {
+            continue;
+        };
+        let held = mounts_by_path(&holder.repository, &first_parent).await;
+        let branch = merge.branch(holder.repository.clone()).await;
+        for (path, link) in mounts_by_path(&holder.repository, &merge).await {
+            if held
+                .get(&path)
+                .is_none_or(|other| other.repository != link.repository)
+            {
+                added.insert((
+                    link.repository,
+                    link.signature(),
+                    link.resolve_branch(branch),
+                ));
+            }
         }
     }
-    false
+    added
 }
 
-/// Whether the revision `holding` of `holder` is a merge that adds a link to the repository `link`
-/// links, at a path where its first parent has none.
-async fn merge_added_link(
-    holder: &Arc<RepositoryContext>,
-    holding: Hash,
-    link: &LinkReference,
-) -> bool {
-    let Ok(merge) = State::deserialize(holder.clone(), holding).await else {
-        return false;
-    };
-    if merge.parent_other().is_zero() {
-        return false;
-    }
-    let Ok(first_parent) = State::deserialize(holder.clone(), merge.parent_self()).await else {
-        return false;
-    };
-    let merged = link_paths(holder, &merge, link).await;
-    let held = link_paths(holder, &first_parent, link).await;
-    merged.iter().any(|path| !held.contains(path))
-}
-
-/// The paths at which `state` links the repository `link` links.
-async fn link_paths(
-    holder: &Arc<RepositoryContext>,
+/// The links `state` holds, by the path each is mounted at.
+async fn mounts_by_path(
+    repository: &Arc<RepositoryContext>,
     state: &Arc<State>,
-    link: &LinkReference,
-) -> Vec<String> {
-    let Ok(links) = state.link_list(holder.clone()).await else {
-        return Vec::new();
+) -> HashMap<String, LinkReference> {
+    let mut mounts = HashMap::new();
+    let Ok(links) = state.link_list(repository.clone()).await else {
+        return mounts;
     };
-    let mut paths = Vec::new();
-    for held in links
-        .iter()
-        .filter(|held| held.repository == link.repository)
-    {
-        if let Ok(path) = state.node_path(holder.clone(), held.local_node()).await {
-            paths.push(path);
+    for link in links {
+        if let Ok(path) = state.node_path(repository.clone(), link.local_node()).await {
+            mounts.insert(path, link);
         }
     }
-    paths
+    mounts
 }
 
 async fn push_local_revision(

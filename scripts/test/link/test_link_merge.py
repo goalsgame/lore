@@ -1848,7 +1848,10 @@ def test_merging_an_added_link_moves_the_linked_branch(new_lore_repo):
     assert synced.read_files()["inner.txt"] == "v3\n"
 
 
-def test_a_commit_after_merging_an_added_link_still_moves_the_linked_branch(new_lore_repo):
+@pytest.mark.smoke
+def test_a_commit_after_merging_an_added_link_still_moves_the_linked_branch(
+    new_lore_repo,
+):
     """A commit on top of the merge that adds a link, pushed with it, still moves the branch."""
     linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
     parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
@@ -1870,6 +1873,34 @@ def test_a_commit_after_merging_an_added_link_still_moves_the_linked_branch(new_
 
     pinned = link_pin(merger, linked.get_id())
     assert linked.branch_info("main", remote=True).remote_latest == pinned
+
+
+@pytest.mark.smoke
+def test_a_repin_after_merging_an_added_link_is_not_carried(new_lore_repo):
+    """A pin set by hand after the merge that adds a link is not carried onto the linked branch."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    linked.branch_create("other")
+    linked.write_commit_push("On other", {"inner.txt": "other\n"})
+    other_pin = linked.branch_info().local_latest
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+
+    feature = parent.clone()
+    feature.branch_create("feature")
+    feature.link_add("linked", linked.get_id(), "/")
+    feature.write_files({"linked/inner.txt": "v1\n"})
+    feature.stage(scan=True)
+    feature.commit()
+    feature.push()
+    merged_pin = link_pin(feature, linked.get_id())
+
+    merger = parent.clone()
+    merger.branch_merge("feature", message="Merge feature")
+    merger.link_update("linked", pin=other_pin)
+    merger.commit("Repin")
+    merger.branch_push()
+
+    assert link_pin(merger, linked.get_id()) == other_pin
+    assert linked.branch_info("main", remote=True).remote_latest == merged_pin
 
 
 @pytest.mark.smoke
