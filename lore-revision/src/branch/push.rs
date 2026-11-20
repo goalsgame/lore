@@ -1954,12 +1954,7 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 /// along the line under a revision of its own. None when the line does not start at the head.
 async fn first_parent_line(target: &PushTarget, holder: Option<&PushTarget>) -> HashSet<Hash> {
     let mut line = HashSet::new();
-    let Some(Mount::Link {
-        revision: holding,
-        link,
-        ..
-    }) = target.mount.as_ref()
-    else {
+    let Some(Mount::Link { link, .. }) = target.mount.as_ref() else {
         return line;
     };
     let Ok(latest) = State::deserialize(target.repository.clone(), target.latest).await else {
