@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: 2026 Epic Games, Inc.
 // SPDX-License-Identifier: MIT
 use std::borrow::Borrow;
+use std::collections::HashMap;
+use std::collections::HashSet;
 use std::ops::BitAnd;
 use std::path::Path;
 use std::sync::Arc;
@@ -238,17 +240,38 @@ pub async fn realize_state(
         );
         */
         change::reverse(changes.as_mut_slice());
-        let links = links_added_or_removed(
+        let mounts = changed_mounts(
             &repository_current,
             &state_current,
             &repository_target,
             &state_target,
-            options.filter_mode,
         )
         .await?;
-        if !links.is_empty() {
-            changes.retain(|change| !links.iter().any(|link| link.path() == change.path()));
-            changes.extend(links);
+        if !mounts.is_empty() {
+            let mounts: HashSet<&str> = mounts.iter().map(RelativePath::as_str).collect();
+            let mounted: Vec<NodeChange> = state::diff_collect(
+                repository_current.clone(),
+                state_current.clone(),
+                repository_target.clone(),
+                state_target.clone(),
+                None,
+                options.filter_mode,
+            )
+            .await
+            .forward::<SyncError>("Failed to calculate the changes of the changed mounts")?
+            .into_iter()
+            .filter(|change| covering_mount(&mounts, change.path().as_str()).is_some())
+            .collect();
+            changes.retain(
+                |change| match covering_mount(&mounts, change.path().as_str()) {
+                    None => true,
+                    Some(mount) => {
+                        mount == change.path().as_str()
+                            && change.action == change::FileAction::Delete
+                    }
+                },
+            );
+            changes.extend(mounted);
             change::sort_by_path(&mut changes);
         }
         changes
@@ -339,56 +362,151 @@ pub async fn realize_state(
     Ok(())
 }
 
-/// The changes adding or removing a link between `state_current` and `state_target`, or replacing
-/// one with a link to another repository: a diff against the file system never reports a link node.
-async fn links_added_or_removed(
+/// The paths at which `state_current` and `state_target` mount a different link, nested links
+/// included, outermost first and none below another: a diff against the file system walks a
+/// mount's subtree as its content and never reports the link node itself.
+async fn changed_mounts(
     repository_current: &Arc<RepositoryContext>,
     state_current: &Arc<State>,
     repository_target: &Arc<RepositoryContext>,
     state_target: &Arc<State>,
-    filter_mode: FilterMode,
-) -> Result<Vec<NodeChange>, SyncError> {
-    let current = crate::link::link_pins_by_path(state_current, repository_current.clone())
-        .await
-        .forward::<SyncError>("Failed to list the current revision's links")?;
-    let target = crate::link::link_pins_by_path(state_target, repository_target.clone())
-        .await
-        .forward::<SyncError>("Failed to list the target revision's links")?;
-    let unmatched = |pins: &[crate::link::LinkAtPath], others: &[crate::link::LinkAtPath]| {
-        pins.iter()
-            .filter(|link| {
-                !others.iter().any(|other| {
-                    other.path == link.path
-                        && other.reference.repository() == link.reference.repository()
-                })
-            })
-            .map(|link| link.path.clone())
-            .collect::<Vec<_>>()
-    };
-    let mut paths = unmatched(&current, &target);
-    paths.extend(unmatched(&target, &current));
-    if paths.is_empty() {
-        return Ok(Vec::new());
+) -> Result<Vec<RelativePath>, SyncError> {
+    let mut changed = Vec::new();
+    Box::pin(compare_mounts(
+        MountSide {
+            repository: repository_current.clone(),
+            state: state_current.clone(),
+            source: ROOT_NODE,
+        },
+        MountSide {
+            repository: repository_target.clone(),
+            state: state_target.clone(),
+            source: ROOT_NODE,
+        },
+        RelativePath::new(),
+        &mut changed,
+    ))
+    .await?;
+    changed.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    let mut outermost: Vec<RelativePath> = Vec::with_capacity(changed.len());
+    for path in changed {
+        if !outermost.last().is_some_and(|last| last.covers(&path)) {
+            outermost.push(path);
+        }
     }
-    let changes = state::diff_collect(
-        repository_current.clone(),
-        state_current.clone(),
-        repository_target.clone(),
-        state_target.clone(),
-        None,
-        filter_mode,
-    )
-    .await
-    .forward::<SyncError>("Failed to calculate the links changed between states")?;
-    Ok(changes
-        .into_iter()
-        .filter(|change| {
-            (change.from.is_link() || change.to.is_link())
-                && paths
-                    .iter()
-                    .any(|path| path.as_str() == change.path().as_str())
-        })
-        .collect())
+    Ok(outermost)
+}
+
+/// One side of a mount comparison: the tree a link is read in, below the node it mounts.
+struct MountSide {
+    repository: Arc<RepositoryContext>,
+    state: Arc<State>,
+    source: NodeID,
+}
+
+/// The links `side`'s tree holds below its source node, by the path each is mounted at below
+/// `prefix`.
+async fn mounted_links(
+    side: &MountSide,
+    prefix: &RelativePath,
+) -> Result<HashMap<String, state::LinkReference>, SyncError> {
+    let mut mounted = HashMap::new();
+    let links = side
+        .state
+        .link_list(side.repository.clone())
+        .await
+        .forward::<SyncError>("Failed to list links")?;
+    for link in links {
+        let below = side
+            .state
+            .node_path_below(side.repository.clone(), link.local_node(), side.source)
+            .await
+            .ok()
+            .flatten()
+            .filter(|below| !below.is_empty());
+        if let Some(below) = below {
+            mounted.insert(prefix.join(below.as_str()).as_str().to_owned(), link);
+        }
+    }
+    Ok(mounted)
+}
+
+/// Adds to `changed` each path below `prefix` that `current` and `target` mount differently:
+/// a link on one side only or to another repository. A link pinned elsewhere on each side is
+/// compared through its pinned trees.
+async fn compare_mounts(
+    current: MountSide,
+    target: MountSide,
+    prefix: RelativePath,
+    changed: &mut Vec<RelativePath>,
+) -> Result<(), SyncError> {
+    let current_links = mounted_links(&current, &prefix).await?;
+    let target_links = mounted_links(&target, &prefix).await?;
+    for (path, link) in &current_links {
+        if target_links
+            .get(path)
+            .is_none_or(|other| other.repository() != link.repository())
+        {
+            changed.push(RelativePath::new().join(path.as_str()));
+        }
+    }
+    for (path, link) in &target_links {
+        let Some(other) = current_links.get(path) else {
+            changed.push(RelativePath::new().join(path.as_str()));
+            continue;
+        };
+        if other.repository() != link.repository() || other.signature() == link.signature() {
+            continue;
+        }
+        let Some(current_side) = linked_side(&current, other).await? else {
+            continue;
+        };
+        let Some(target_side) = linked_side(&target, link).await? else {
+            continue;
+        };
+        Box::pin(compare_mounts(
+            current_side,
+            target_side,
+            RelativePath::new().join(path.as_str()),
+            changed,
+        ))
+        .await?;
+    }
+    Ok(())
+}
+
+/// The tree `link`, held by `side`'s tree, mounts at its pin, or none where the pin cannot be read.
+async fn linked_side(
+    side: &MountSide,
+    link: &state::LinkReference,
+) -> Result<Option<MountSide>, SyncError> {
+    let repository = side.repository.to_link_context(link.repository()).await;
+    let Ok(state) = State::deserialize(repository.clone(), link.signature()).await else {
+        return Ok(None);
+    };
+    let source = side
+        .state
+        .node(side.repository.clone(), link.local_node())
+        .await
+        .forward::<SyncError>("Failed to read a link node")?
+        .mount_source()
+        .unwrap_or(ROOT_NODE);
+    Ok(Some(MountSide {
+        repository,
+        state,
+        source,
+    }))
+}
+
+/// The path in `mounts` that is `path` or one of its ancestors.
+fn covering_mount<'a>(mounts: &HashSet<&'a str>, path: &str) -> Option<&'a str> {
+    let mut candidate = path;
+    loop {
+        if let Some(mount) = mounts.get(candidate) {
+            return Some(mount);
+        }
+        candidate = &candidate[..candidate.rfind('/')?];
+    }
 }
 
 /// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]
@@ -2663,7 +2781,9 @@ fn realize_change_modify_add(
             // When a link is added, the linked contents are not marked
             // for add. That's why we can just clone the linked files
             if node.is_link() && change.action == change::FileAction::Add {
-                Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
+                if !dry_run {
+                    Box::pin(clone_added_link(&repository, &operation, &node, path)).await?;
+                }
             } else if node.is_link() && !dry_run {
                 realize_moved_mount(&operation, &change, node).await?;
             }
