@@ -1231,7 +1231,11 @@ async fn push_targets(
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
     let mut failures = schedule_targets(orders, |target| {
-        push_target(&targets[target], token, fast_forward_merge)
+        let holder = match &targets[target].mount {
+            Some(Mount::Link { target: parent, .. }) => Some(&targets[*parent].repository),
+            _ => None,
+        };
+        push_target(&targets[target], holder, token, fast_forward_merge)
     })
     .await;
     if failures.is_empty() {
@@ -1814,16 +1818,25 @@ async fn create_branch(
 /// Push `target`: start its push, push each revision of its plan in order, and finish.
 async fn push_target(
     target: &PushTarget,
+    holder: Option<&Arc<RepositoryContext>>,
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
     let Some(mut run) = start_target(target).await? else {
         return Ok(());
     };
+    let line = first_parent_line(target, holder).await;
     for pushed in &target.plan.revisions {
         if pushed.local {
-            push_local_revision(target, &mut run, pushed.revision, token, fast_forward_merge)
-                .await?;
+            push_local_revision(
+                target,
+                &mut run,
+                pushed.revision,
+                token,
+                fast_forward_merge,
+                &line,
+            )
+            .await?;
         } else {
             let state = State::deserialize(target.repository.clone(), pushed.revision)
                 .await
@@ -1934,12 +1947,83 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 /// accepted, upload what it holds, and offer it as the branch's latest revision when it belongs to
 /// the branch. A linked repository's offer the peer refuses onto revisions the local history does
 /// not hold fails as [`Divergent`].
+/// The revisions `target` pushes on the line of first parents from its branch's head on the peer to
+/// its latest, which the push offers to the branch although they were made on another branch: a
+/// link a merge added, pinned at a revision of the linked repository's merged branch, fast-forwards
+/// the branch it tracks to that pin; a branch an earlier push left behind such a pin catches up
+/// along the line under a revision of its own. None when the line does not start at the head.
+async fn first_parent_line(
+    target: &PushTarget,
+    holder: Option<&Arc<RepositoryContext>>,
+) -> HashSet<Hash> {
+    let mut line = HashSet::new();
+    let Some(Mount::Link {
+        revision: holding,
+        link,
+        ..
+    }) = target.mount.as_ref()
+    else {
+        return line;
+    };
+    let Ok(latest) = State::deserialize(target.repository.clone(), target.latest).await else {
+        return line;
+    };
+    let carries = latest.branch(target.repository.clone()).await == target.branch
+        || match holder {
+            Some(holder) => merge_added_link(holder, *holding, link).await,
+            None => false,
+        };
+    if !carries {
+        return line;
+    }
+    let pushed: HashSet<Hash> = target
+        .plan
+        .revisions
+        .iter()
+        .filter(|pushed| pushed.local)
+        .map(|pushed| pushed.revision)
+        .collect();
+    let mut revision = target.latest;
+    while pushed.contains(&revision) && line.insert(revision) {
+        let Ok(state) = State::deserialize(target.repository.clone(), revision).await else {
+            return HashSet::new();
+        };
+        revision = state.parent_self();
+    }
+    if revision != target.plan.remote_latest {
+        line.clear();
+    }
+    line
+}
+
+/// Whether the revision `holding` of `holder` is a merge that adds `link`.
+async fn merge_added_link(
+    holder: &Arc<RepositoryContext>,
+    holding: Hash,
+    link: &LinkReference,
+) -> bool {
+    let Ok(merge) = State::deserialize(holder.clone(), holding).await else {
+        return false;
+    };
+    if merge.parent_other().is_zero() {
+        return false;
+    }
+    let Ok(target) = State::deserialize(holder.clone(), merge.parent_self()).await else {
+        return false;
+    };
+    target
+        .link_list(holder.clone())
+        .await
+        .is_ok_and(|links| !links.iter().any(|held| held.repository == link.repository))
+}
+
 async fn push_local_revision(
     target: &PushTarget,
     run: &mut TargetRun,
     revision: Hash,
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
+    line: &HashSet<Hash>,
 ) -> Result<(), PushError> {
     let repository = &target.repository;
     let branch = target.branch;
@@ -1994,7 +2078,7 @@ async fn push_local_revision(
 
     // A revision from another branch belongs to that branch's own push. Its fragments
     // are what the peer needs of it, and they are now up.
-    if state.branch(repository.clone()).await != branch {
+    if state.branch(repository.clone()).await != branch && !line.contains(&revision) {
         return Ok(());
     };
 
