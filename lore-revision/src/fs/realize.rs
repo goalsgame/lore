@@ -238,6 +238,19 @@ pub async fn realize_state(
         );
         */
         change::reverse(changes.as_mut_slice());
+        let links = links_added_or_removed(
+            &repository_current,
+            &state_current,
+            &repository_target,
+            &state_target,
+            options.filter_mode,
+        )
+        .await?;
+        if !links.is_empty() {
+            changes.retain(|change| !links.iter().any(|link| link.path() == change.path()));
+            changes.extend(links);
+            change::sort_by_path(&mut changes);
+        }
         changes
     };
 
@@ -324,6 +337,58 @@ pub async fn realize_state(
     }
 
     Ok(())
+}
+
+/// The changes adding or removing a link between `state_current` and `state_target`, or replacing
+/// one with a link to another repository: a diff against the file system never reports a link node.
+async fn links_added_or_removed(
+    repository_current: &Arc<RepositoryContext>,
+    state_current: &Arc<State>,
+    repository_target: &Arc<RepositoryContext>,
+    state_target: &Arc<State>,
+    filter_mode: FilterMode,
+) -> Result<Vec<NodeChange>, SyncError> {
+    let current = crate::link::link_pins_by_path(state_current, repository_current.clone())
+        .await
+        .forward::<SyncError>("Failed to list the current revision's links")?;
+    let target = crate::link::link_pins_by_path(state_target, repository_target.clone())
+        .await
+        .forward::<SyncError>("Failed to list the target revision's links")?;
+    let unmatched = |pins: &[crate::link::LinkAtPath], others: &[crate::link::LinkAtPath]| {
+        pins.iter()
+            .filter(|link| {
+                !others.iter().any(|other| {
+                    other.path == link.path
+                        && other.reference.repository() == link.reference.repository()
+                })
+            })
+            .map(|link| link.path.clone())
+            .collect::<Vec<_>>()
+    };
+    let mut paths = unmatched(&current, &target);
+    paths.extend(unmatched(&target, &current));
+    if paths.is_empty() {
+        return Ok(Vec::new());
+    }
+    let changes = state::diff_collect(
+        repository_current.clone(),
+        state_current.clone(),
+        repository_target.clone(),
+        state_target.clone(),
+        None,
+        filter_mode,
+    )
+    .await
+    .forward::<SyncError>("Failed to calculate the links changed between states")?;
+    Ok(changes
+        .into_iter()
+        .filter(|change| {
+            (change.from.is_link() || change.to.is_link())
+                && paths
+                    .iter()
+                    .any(|path| path.as_str() == change.path().as_str())
+        })
+        .collect())
 }
 
 /// Verifies the changes `args` holds against the working copy, each as [`verify_filesystem`]

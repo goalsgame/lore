@@ -881,3 +881,26 @@ def test_dry_run_unstage_and_reset_keep_a_staged_link_add(new_lore_repo):
 
     assert not os.path.exists(linked_file), "unstage kept the link's files"
     assert repo.link_list() != links, "unstage kept the staged link"
+
+
+@pytest.mark.parametrize("reset", [False, True])
+def test_sync_to_a_revision_adding_a_link_clones_it(new_lore_repo, reset):
+    """A sync onto a revision that adds a link writes the linked files."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "inner\n"})
+    repo = make_repo(new_lore_repo, {"top.txt": "top\n"})
+    before = repo.revision_info().signature
+
+    repo.link_add("linked", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    added = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=reset)
+    assert not clone.path_exists("linked")
+
+    clone.sync(added, reset=reset)
+    assert clone.compare_file(repo, "linked/inner.txt")
+
+    clone.sync(before, reset=reset)
+    assert not clone.path_exists("linked")
