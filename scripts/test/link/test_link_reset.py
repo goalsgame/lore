@@ -995,7 +995,7 @@ def test_reset_sync_moves_a_file_out_of_a_directory_a_link_replaces(new_lore_rep
     repo = make_repo(new_lore_repo, {"shared/moved.txt": "moved\n", "top.txt": "top\n"})
     before = repo.revision_info().signature
 
-    repo.write_files({"moved.txt": "moved\n"})
+    repo.move("shared/moved.txt", "moved.txt")
     repo.rmtree("shared")
     repo.stage(scan=True)
     repo.link_add("shared", link_repo.get_id(), "/")

@@ -267,6 +267,16 @@ pub async fn realize_state(
             .into_iter()
             .filter(|change| covering_mount(&mounts, change.path().as_lowercase_str()).is_some())
             .collect();
+            for change in &mounted {
+                if operation
+                    .unversioned_symlink_at_or_above(change.path())
+                    .await
+                    .forward::<SyncError>("Failed to check for a symbolic link")?
+                {
+                    lore_error!("A symbolic link stands at or above {}", change.path());
+                    return Err(LocalModifications.into());
+                }
+            }
             changes.retain(|change| {
                 match covering_mount(&mounts, change.path().as_lowercase_str()) {
                     None => true,
@@ -441,8 +451,9 @@ async fn mounted_links(
 }
 
 /// Adds to `changed` each path below `prefix` that `current` and `target` mount differently:
-/// a link on one side only, to another repository, or from another source path. A link pinned
-/// elsewhere on each side from the same source path is compared through its pinned trees, [`state::MAX_LINK_DEPTH`]
+/// a link on one side only, to another repository, from another source path, or one whose pinned
+/// tree or source cannot be read. A link pinned elsewhere on each side from the same source path is
+/// compared through its pinned trees, [`state::MAX_LINK_DEPTH`]
 /// links deep at most.
 async fn compare_mounts(
     current: MountSide,
@@ -478,13 +489,15 @@ async fn compare_mounts(
         if depth + 1 >= state::MAX_LINK_DEPTH {
             continue;
         }
-        let Some(current_side) = linked_side(&current, other).await? else {
+        let (Some(current_side), Some(target_side)) = (
+            linked_side(&current, other).await?,
+            linked_side(&target, link).await?,
+        ) else {
+            changed.push(RelativePath::new().join(path.as_str()));
             continue;
         };
-        let Some(target_side) = linked_side(&target, link).await? else {
-            continue;
-        };
-        if source_path(&current_side).await != source_path(&target_side).await {
+        let current_source = source_path(&current_side).await;
+        if current_source.is_none() || current_source != source_path(&target_side).await {
             changed.push(RelativePath::new().join(path.as_str()));
             continue;
         }
