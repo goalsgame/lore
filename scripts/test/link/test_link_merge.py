@@ -1848,6 +1848,30 @@ def test_merging_an_added_link_moves_the_linked_branch(new_lore_repo):
     assert synced.read_files()["inner.txt"] == "v3\n"
 
 
+def test_a_commit_after_merging_an_added_link_still_moves_the_linked_branch(new_lore_repo):
+    """A commit on top of the merge that adds a link, pushed with it, still moves the branch."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+
+    feature = parent.clone()
+    feature.branch_create("feature")
+    feature.link_add("linked", linked.get_id(), "/")
+    feature.write_files({"linked/inner.txt": "v1\n"})
+    feature.stage(scan=True)
+    feature.commit()
+    feature.push()
+
+    merger = parent.clone()
+    merger.branch_merge("feature", message="Merge feature")
+    merger.write_files({"top.txt": "after the merge\n"})
+    merger.stage(scan=True)
+    merger.commit()
+    merger.branch_push()
+
+    pinned = link_pin(merger, linked.get_id())
+    assert linked.branch_info("main", remote=True).remote_latest == pinned
+
+
 @pytest.mark.smoke
 def test_a_link_pinned_on_another_branch_leaves_the_linked_branch(new_lore_repo):
     """Pinning a link at a revision of another branch, outside a merge, pushes only the pin."""

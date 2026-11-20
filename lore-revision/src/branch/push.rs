@@ -1232,7 +1232,7 @@ async fn push_targets(
 ) -> Result<(), PushError> {
     let mut failures = schedule_targets(orders, |target| {
         let holder = match &targets[target].mount {
-            Some(Mount::Link { target: parent, .. }) => Some(&targets[*parent].repository),
+            Some(Mount::Link { target: parent, .. }) => Some(&targets[*parent]),
             _ => None,
         };
         push_target(&targets[target], holder, token, fast_forward_merge)
@@ -1818,7 +1818,7 @@ async fn create_branch(
 /// Push `target`: start its push, push each revision of its plan in order, and finish.
 async fn push_target(
     target: &PushTarget,
-    holder: Option<&Arc<RepositoryContext>>,
+    holder: Option<&PushTarget>,
     token: &RepositoryWriteToken,
     fast_forward_merge: bool,
 ) -> Result<(), PushError> {
@@ -1952,10 +1952,7 @@ async fn start_target(target: &PushTarget) -> Result<Option<TargetRun>, PushErro
 /// link a merge added, pinned at a revision of the linked repository's merged branch, fast-forwards
 /// the branch it tracks to that pin; a branch an earlier push left behind such a pin catches up
 /// along the line under a revision of its own. None when the line does not start at the head.
-async fn first_parent_line(
-    target: &PushTarget,
-    holder: Option<&Arc<RepositoryContext>>,
-) -> HashSet<Hash> {
+async fn first_parent_line(target: &PushTarget, holder: Option<&PushTarget>) -> HashSet<Hash> {
     let mut line = HashSet::new();
     let Some(Mount::Link {
         revision: holding,
@@ -1970,7 +1967,7 @@ async fn first_parent_line(
     };
     let carries = latest.branch(target.repository.clone()).await == target.branch
         || match holder {
-            Some(holder) => merge_added_link(holder, *holding, link).await,
+            Some(holder) => pushes_merge_adding_link(holder, link).await,
             None => false,
         };
     if !carries {
@@ -1996,7 +1993,19 @@ async fn first_parent_line(
     line
 }
 
-/// Whether the revision `holding` of `holder` is a merge that adds `link`.
+/// Whether `holder` pushes a merge that adds a link to the repository `link` links, at a path where
+/// the merge's first parent has none.
+async fn pushes_merge_adding_link(holder: &PushTarget, link: &LinkReference) -> bool {
+    for pushed in holder.plan.revisions.iter().filter(|pushed| pushed.local) {
+        if merge_added_link(&holder.repository, pushed.revision, link).await {
+            return true;
+        }
+    }
+    false
+}
+
+/// Whether the revision `holding` of `holder` is a merge that adds a link to the repository `link`
+/// links, at a path where its first parent has none.
 async fn merge_added_link(
     holder: &Arc<RepositoryContext>,
     holding: Hash,
@@ -2008,13 +2017,33 @@ async fn merge_added_link(
     if merge.parent_other().is_zero() {
         return false;
     }
-    let Ok(target) = State::deserialize(holder.clone(), merge.parent_self()).await else {
+    let Ok(first_parent) = State::deserialize(holder.clone(), merge.parent_self()).await else {
         return false;
     };
-    target
-        .link_list(holder.clone())
-        .await
-        .is_ok_and(|links| !links.iter().any(|held| held.repository == link.repository))
+    let merged = link_paths(holder, &merge, link).await;
+    let held = link_paths(holder, &first_parent, link).await;
+    merged.iter().any(|path| !held.contains(path))
+}
+
+/// The paths at which `state` links the repository `link` links.
+async fn link_paths(
+    holder: &Arc<RepositoryContext>,
+    state: &Arc<State>,
+    link: &LinkReference,
+) -> Vec<String> {
+    let Ok(links) = state.link_list(holder.clone()).await else {
+        return Vec::new();
+    };
+    let mut paths = Vec::new();
+    for held in links
+        .iter()
+        .filter(|held| held.repository == link.repository)
+    {
+        if let Ok(path) = state.node_path(holder.clone(), held.local_node()).await {
+            paths.push(path);
+        }
+    }
+    paths
 }
 
 async fn push_local_revision(
