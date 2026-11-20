@@ -2018,7 +2018,6 @@ async fn merge_added_pins(holder: &PushTarget) -> HashSet<AddedPin> {
             continue;
         };
         let held = mounts_by_path(&holder.repository, &first_parent).await;
-        let branch = merge.branch(holder.repository.clone()).await;
         for (path, link) in mounts_by_path(&holder.repository, &merge).await {
             if held
                 .get(&path)
@@ -2027,7 +2026,7 @@ async fn merge_added_pins(holder: &PushTarget) -> HashSet<AddedPin> {
                 added.insert((
                     link.repository,
                     link.signature(),
-                    link.resolve_branch(branch),
+                    link.resolve_branch(holder.branch),
                 ));
             }
         }
