@@ -1812,3 +1812,110 @@ def test_merge_start_refuses_local_work_before_merging_any_link(new_lore_repo, e
     for path in changed:
         with repo.open_file(path) as f:
             assert f.read() == "theirs\n", f"{path} should hold the merge"
+
+
+@pytest.mark.smoke
+def test_merging_an_added_link_moves_the_linked_branch(new_lore_repo):
+    """A merge that adds a link brings the linked repository's branch to the pinned revision."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+
+    feature = parent.clone()
+    feature.branch_create("feature")
+    feature.link_add("linked", linked.get_id(), "/")
+    for version in ("v1\n", "v2\n"):
+        feature.write_files({"linked/inner.txt": version})
+        feature.stage(scan=True)
+        feature.commit()
+    feature.push()
+
+    merger = parent.clone()
+    merger.branch_merge("feature", message="Merge feature")
+    merger.branch_push()
+    pinned = link_pin(merger, linked.get_id())
+    assert linked.branch_info("main", remote=True).remote_latest == pinned
+
+    follow_up = merger.clone()
+    follow_up.branch_create("follow-up")
+    follow_up.write_files({"linked/inner.txt": "v3\n"})
+    follow_up.stage(scan=True)
+    follow_up.commit()
+    follow_up.push()
+
+    merger.branch_merge("follow-up", message="Merge follow-up")
+    merger.branch_push()
+    synced = linked.clone()
+    assert synced.read_files()["inner.txt"] == "v3\n"
+
+
+@pytest.mark.smoke
+def test_a_commit_after_merging_an_added_link_still_moves_the_linked_branch(
+    new_lore_repo,
+):
+    """A commit on top of the merge that adds a link, pushed with it, still moves the branch."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+
+    feature = parent.clone()
+    feature.branch_create("feature")
+    feature.link_add("linked", linked.get_id(), "/")
+    feature.write_files({"linked/inner.txt": "v1\n"})
+    feature.stage(scan=True)
+    feature.commit()
+    feature.push()
+
+    merger = parent.clone()
+    merger.branch_merge("feature", message="Merge feature")
+    merger.write_files({"top.txt": "after the merge\n"})
+    merger.stage(scan=True)
+    merger.commit()
+    merger.branch_push()
+
+    pinned = link_pin(merger, linked.get_id())
+    assert linked.branch_info("main", remote=True).remote_latest == pinned
+
+
+@pytest.mark.smoke
+def test_a_repin_after_merging_an_added_link_is_not_carried(new_lore_repo):
+    """A pin set by hand after the merge that adds a link is not carried onto the linked branch."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    linked.branch_create("other")
+    linked.write_commit_push("On other", {"inner.txt": "other\n"})
+    other_pin = linked.branch_info().local_latest
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+
+    feature = parent.clone()
+    feature.branch_create("feature")
+    feature.link_add("linked", linked.get_id(), "/")
+    feature.write_files({"linked/inner.txt": "v1\n"})
+    feature.stage(scan=True)
+    feature.commit()
+    feature.push()
+    merged_pin = link_pin(feature, linked.get_id())
+
+    merger = parent.clone()
+    merger.branch_merge("feature", message="Merge feature")
+    merger.link_update("linked", pin=other_pin)
+    merger.commit("Repin")
+    merger.branch_push()
+
+    assert link_pin(merger, linked.get_id()) == other_pin
+    assert linked.branch_info("main", remote=True).remote_latest == merged_pin
+
+
+@pytest.mark.smoke
+def test_a_link_pinned_on_another_branch_leaves_the_linked_branch(new_lore_repo):
+    """Pinning a link at a revision of another branch, outside a merge, pushes only the pin."""
+    linked = make_repo(new_lore_repo, {"inner.txt": "v0\n"})
+    linked_main = linked.branch_info().local_latest
+    linked.branch_create("feature")
+    linked.write_commit_push("On feature", {"inner.txt": "v1\n"})
+    feature_pin = linked.branch_info().local_latest
+
+    parent = make_repo(new_lore_repo, {"top.txt": "top\n"})
+    parent.link_add("linked", linked.get_id(), "/", pin=feature_pin)
+    parent.commit("Add link")
+    parent.push()
+
+    assert link_pin(parent, linked.get_id()) == feature_pin
+    assert linked.branch_info("main", remote=True).remote_latest == linked_main
