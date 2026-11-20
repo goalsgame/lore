@@ -247,14 +247,13 @@ pub async fn realize_state(
             &state_target,
         )
         .await?;
-        if !mounts.is_empty() {
+        if !mounts.is_empty() && options.root_files.is_empty() {
             let mounts: HashSet<&str> = mounts.iter().map(RelativePath::as_str).collect();
-            let mounted: Vec<NodeChange> = state::diff_collect(
+            let mounted: Vec<NodeChange> = state::diff_collect_uncoalesced(
                 repository_current.clone(),
                 state_current.clone(),
                 repository_target.clone(),
                 state_target.clone(),
-                None,
                 options.filter_mode,
             )
             .await
@@ -266,7 +265,7 @@ pub async fn realize_state(
                 |change| match covering_mount(&mounts, change.path().as_str()) {
                     None => true,
                     Some(mount) => {
-                        mount == change.path().as_str()
+                        mount == change.path().as_lowercase_str()
                             && change.action == change::FileAction::Delete
                     }
                 },
@@ -384,6 +383,7 @@ async fn changed_mounts(
             source: ROOT_NODE,
         },
         RelativePath::new(),
+        0,
         &mut changed,
     ))
     .await?;
@@ -405,7 +405,7 @@ struct MountSide {
 }
 
 /// The links `side`'s tree holds below its source node, by the path each is mounted at below
-/// `prefix`.
+/// `prefix`, lowercase: node lookup ignores case, so a case-only rename moves no mount.
 async fn mounted_links(
     side: &MountSide,
     prefix: &RelativePath,
@@ -425,19 +425,24 @@ async fn mounted_links(
             .flatten()
             .filter(|below| !below.is_empty());
         if let Some(below) = below {
-            mounted.insert(prefix.join(below.as_str()).as_str().to_owned(), link);
+            mounted.insert(
+                prefix.join(below.as_str()).as_lowercase_str().to_owned(),
+                link,
+            );
         }
     }
     Ok(mounted)
 }
 
 /// Adds to `changed` each path below `prefix` that `current` and `target` mount differently:
-/// a link on one side only or to another repository. A link pinned elsewhere on each side is
-/// compared through its pinned trees.
+/// a link on one side only, to another repository, or at the same pin from another source. A link
+/// pinned elsewhere on each side is compared through its pinned trees, [`state::MAX_LINK_DEPTH`]
+/// links deep at most.
 async fn compare_mounts(
     current: MountSide,
     target: MountSide,
     prefix: RelativePath,
+    depth: usize,
     changed: &mut Vec<RelativePath>,
 ) -> Result<(), SyncError> {
     let current_links = mounted_links(&current, &prefix).await?;
@@ -455,7 +460,16 @@ async fn compare_mounts(
             changed.push(RelativePath::new().join(path.as_str()));
             continue;
         };
-        if other.repository() != link.repository() || other.signature() == link.signature() {
+        if other.repository() != link.repository() {
+            continue;
+        }
+        if other.signature() == link.signature() {
+            if mount_source(&current, other).await? != mount_source(&target, link).await? {
+                changed.push(RelativePath::new().join(path.as_str()));
+            }
+            continue;
+        }
+        if depth + 1 >= state::MAX_LINK_DEPTH {
             continue;
         }
         let Some(current_side) = linked_side(&current, other).await? else {
@@ -468,6 +482,7 @@ async fn compare_mounts(
             current_side,
             target_side,
             RelativePath::new().join(path.as_str()),
+            depth + 1,
             changed,
         ))
         .await?;
@@ -484,13 +499,7 @@ async fn linked_side(
     let Ok(state) = State::deserialize(repository.clone(), link.signature()).await else {
         return Ok(None);
     };
-    let source = side
-        .state
-        .node(side.repository.clone(), link.local_node())
-        .await
-        .forward::<SyncError>("Failed to read a link node")?
-        .mount_source()
-        .unwrap_or(ROOT_NODE);
+    let source = mount_source(side, link).await?;
     Ok(Some(MountSide {
         repository,
         state,
@@ -498,9 +507,21 @@ async fn linked_side(
     }))
 }
 
-/// The path in `mounts` that is `path` or one of its ancestors.
+/// The node of its linked tree that `link`, held by `side`'s tree, mounts.
+async fn mount_source(side: &MountSide, link: &state::LinkReference) -> Result<NodeID, SyncError> {
+    Ok(side
+        .state
+        .node(side.repository.clone(), link.local_node())
+        .await
+        .forward::<SyncError>("Failed to read a link node")?
+        .mount_source()
+        .unwrap_or(ROOT_NODE))
+}
+
+/// The path in `mounts`, lowercase, that is `path` or one of its ancestors, ignoring case.
 fn covering_mount<'a>(mounts: &HashSet<&'a str>, path: &str) -> Option<&'a str> {
-    let mut candidate = path;
+    let path = path.to_lowercase();
+    let mut candidate = path.as_str();
     loop {
         if let Some(mount) = mounts.get(candidate) {
             return Some(mount);

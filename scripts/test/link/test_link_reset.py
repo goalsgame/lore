@@ -986,3 +986,27 @@ def test_a_dry_run_reset_sync_adding_a_link_writes_nothing(new_lore_repo):
     clone.sync(before, reset=True)
     clone.sync(added, reset=True, dry_run=True)
     assert not clone.path_exists("linked/inner.txt")
+
+
+@pytest.mark.smoke
+def test_reset_sync_moves_a_file_out_of_a_directory_a_link_replaces(new_lore_repo):
+    """A reset sync onto a revision that moves a file out of a directory a link then replaces."""
+    link_repo = make_repo(new_lore_repo, {"inner.txt": "inner\n"})
+    repo = make_repo(new_lore_repo, {"shared/moved.txt": "moved\n", "top.txt": "top\n"})
+    before = repo.revision_info().signature
+
+    repo.write_files({"moved.txt": "moved\n"})
+    repo.rmtree("shared")
+    repo.stage(scan=True)
+    repo.link_add("shared", link_repo.get_id(), "/")
+    repo.commit()
+    repo.push()
+    after = repo.revision_info().signature
+
+    clone = repo.clone()
+    clone.sync(before, reset=True)
+    clone.sync(after, reset=True)
+    files = clone.read_files()
+    assert files["moved.txt"] == "moved\n"
+    assert files["shared/inner.txt"] == "inner\n"
+    assert "shared/moved.txt" not in files

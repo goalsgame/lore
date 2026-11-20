@@ -8496,6 +8496,35 @@ pub async fn diff_collect(
     Ok(changes)
 }
 
+/// [`diff_collect`] without coalescing a deletion and an addition into a move, so a change that
+/// crosses a path boundary a caller filters on stays a deletion on one side and an addition on the
+/// other.
+pub async fn diff_collect_uncoalesced(
+    repository_from: Arc<RepositoryContext>,
+    state_from: Arc<State>,
+    repository_to: Arc<RepositoryContext>,
+    state_to: Arc<State>,
+    filter_mode: FilterMode,
+) -> Result<Vec<NodeChange>, StateError> {
+    let mut changes = ChangeStream::spawn(async move |changes| {
+        diff(
+            repository_from,
+            state_from,
+            repository_to,
+            state_to,
+            None,
+            None,
+            &changes,
+            filter_mode,
+        )
+        .await
+    })
+    .collect()
+    .await?;
+    crate::change::sort_by_path(&mut changes);
+    Ok(changes)
+}
+
 /// A state's node mapped to its path in the repository instance's file system.
 ///
 /// `path` is as seen from the top-level repository instance root, which every repository context
