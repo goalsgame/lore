@@ -911,7 +911,10 @@ def test_sync_to_a_revision_adding_a_link_clones_it(new_lore_repo, reset):
 def test_reset_sync_replaces_a_directory_with_a_link_and_back(new_lore_repo):
     """A reset sync swaps a tracked directory for a link holding the same bytes, and back."""
     link_repo = make_repo(new_lore_repo, {"inner.txt": "same\n"})
-    repo = make_repo(new_lore_repo, {"linked/inner.txt": "same\n", "top.txt": "top\n"})
+    repo = make_repo(
+        new_lore_repo,
+        {"linked/inner.txt": "same\n", "linked/old.txt": "old\n", "top.txt": "top\n"},
+    )
     directory = repo.revision_info().signature
 
     repo.rmtree("linked")
@@ -928,10 +931,12 @@ def test_reset_sync_replaces_a_directory_with_a_link_and_back(new_lore_repo):
 
     clone.sync(linked, reset=True)
     assert clone.read_files()["linked/inner.txt"] == "same\n"
+    assert not clone.path_exists("linked/old.txt")
     assert link_repo.get_id() in clone.link_list()
 
     clone.sync(directory, reset=True)
     assert clone.read_files()["linked/inner.txt"] == "same\n"
+    assert clone.read_files()["linked/old.txt"] == "old\n"
 
 
 @pytest.mark.smoke
