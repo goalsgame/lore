@@ -92,7 +92,9 @@ where
         if let Some(user_id) = user_id_present {
             span.record(USER_ID, user_id);
         }
-        let _ = span.set_parent(remote_context(output_http_request.headers()));
+        if !span.is_disabled() {
+            let _ = span.set_parent(remote_context(output_http_request.headers()));
+        }
 
         inner.call(output_http_request).instrument(span)
     }
@@ -156,7 +158,8 @@ impl Extractor for HeaderExtractor<'_> {
 /// the span starts a new trace.
 #[lore_macro::test_pub]
 fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
-    TraceContextPropagator::new().extract(&HeaderExtractor(headers))
+    TraceContextPropagator::new()
+        .extract_with_context(&opentelemetry::Context::new(), &HeaderExtractor(headers))
 }
 
 const UNKNOWN_RPC_SEGMENT: &str = "<unknown>";
