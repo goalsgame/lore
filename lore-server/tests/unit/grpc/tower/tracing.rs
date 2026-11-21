@@ -86,6 +86,25 @@ fn ignores_the_current_context_without_trace_context() {
     }
 }
 
+#[test]
+fn combines_tracestate_split_across_header_fields() {
+    use opentelemetry::trace::TraceContextExt;
+
+    let mut headers = http::HeaderMap::new();
+    headers.insert(
+        "traceparent",
+        http::HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+    );
+    headers.append("tracestate", http::HeaderValue::from_static("a=1"));
+    headers.append("tracestate", http::HeaderValue::from_static("b=2,c=3"));
+
+    let context = remote_context(&headers);
+    let state = context.span().span_context().trace_state().clone();
+    assert_eq!(state.get("a"), Some("1"));
+    assert_eq!(state.get("b"), Some("2"));
+    assert_eq!(state.get("c"), Some("3"));
+}
+
 mod layer {
     use std::convert::Infallible;
 

@@ -142,25 +142,53 @@ fn user_id_from_extensions(extensions: &Extensions) -> Option<String> {
         .map(|auth| auth.identity().to_string())
 }
 
-struct HeaderExtractor<'a>(&'a http::HeaderMap);
+struct HeaderExtractor<'a> {
+    headers: &'a http::HeaderMap,
+    tracestate: Option<String>,
+}
 
 impl Extractor for HeaderExtractor<'_> {
     fn get(&self, key: &str) -> Option<&str> {
-        self.0.get(key).and_then(|value| value.to_str().ok())
+        if key == TRACESTATE
+            && let Some(tracestate) = &self.tracestate
+        {
+            return Some(tracestate);
+        }
+        self.headers.get(key).and_then(|value| value.to_str().ok())
     }
 
     fn keys(&self) -> Vec<&str> {
-        self.0.keys().map(http::HeaderName::as_str).collect()
+        self.headers.keys().map(http::HeaderName::as_str).collect()
     }
 }
 
+const TRACESTATE: &str = "tracestate";
+
 /// The caller's W3C trace context (`traceparent`, `tracestate`), so a
 /// request's span joins the trace its caller started. Without those headers
-/// the span starts a new trace.
+/// the span starts a new trace. `tracestate` split across several header
+/// fields is combined in order.
 #[lore_macro::test_pub]
 pub(crate) fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
-    TraceContextPropagator::new()
-        .extract_with_context(&opentelemetry::Context::new(), &HeaderExtractor(headers))
+    let mut fields = headers.get_all(TRACESTATE).iter();
+    let tracestate = match (fields.next(), fields.next()) {
+        (Some(_), Some(_)) => Some(
+            headers
+                .get_all(TRACESTATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        _ => None,
+    };
+    TraceContextPropagator::new().extract_with_context(
+        &opentelemetry::Context::new(),
+        &HeaderExtractor {
+            headers,
+            tracestate,
+        },
+    )
 }
 
 const UNKNOWN_RPC_SEGMENT: &str = "<unknown>";
