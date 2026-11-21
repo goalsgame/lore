@@ -8,12 +8,16 @@ use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
+use opentelemetry::propagation::Extractor;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tonic::body::Body;
 use tonic::metadata::MetadataMap;
 use tower::Layer;
 use tower::Service;
 use tracing::Instrument;
 use tracing::instrument::Instrumented;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::auth::jwt::AuthorizationToken;
 use crate::grpc::get_repository;
@@ -88,6 +92,7 @@ where
         if let Some(user_id) = user_id_present {
             span.record(USER_ID, user_id);
         }
+        let _ = span.set_parent(remote_context(output_http_request.headers()));
 
         inner.call(output_http_request).instrument(span)
     }
@@ -132,6 +137,26 @@ fn user_id_from_extensions(extensions: &Extensions) -> Option<String> {
     extensions
         .get::<AuthorizationToken>()
         .map(|auth| auth.identity().to_string())
+}
+
+struct HeaderExtractor<'a>(&'a http::HeaderMap);
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(http::HeaderName::as_str).collect()
+    }
+}
+
+/// The caller's W3C trace context (`traceparent`, `tracestate`), so a
+/// request's span joins the trace its caller started. Without those headers
+/// the span starts a new trace.
+#[lore_macro::test_pub]
+fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
+    TraceContextPropagator::new().extract(&HeaderExtractor(headers))
 }
 
 const UNKNOWN_RPC_SEGMENT: &str = "<unknown>";
