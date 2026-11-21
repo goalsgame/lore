@@ -8,14 +8,19 @@ use lore_telemetry::tracing::fields::REPOSITORY_ID;
 use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
+use opentelemetry::propagation::Extractor;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use tonic::body::Body;
 use tonic::metadata::MetadataMap;
 use tower::Layer;
 use tower::Service;
 use tracing::Instrument;
 use tracing::instrument::Instrumented;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::correlation::span::request_parent;
 use crate::grpc::get_repository;
 
 /*
@@ -88,6 +93,9 @@ where
         if let Some(user_id) = user_id_present {
             span.record(USER_ID, user_id);
         }
+        if !span.is_disabled() {
+            let _ = span.set_parent(request_parent(output_http_request.headers()));
+        }
 
         inner.call(output_http_request).instrument(span)
     }
@@ -132,6 +140,55 @@ fn user_id_from_extensions(extensions: &Extensions) -> Option<String> {
     extensions
         .get::<AuthorizationToken>()
         .map(|auth| auth.identity().to_string())
+}
+
+struct HeaderExtractor<'a> {
+    headers: &'a http::HeaderMap,
+    tracestate: Option<String>,
+}
+
+impl Extractor for HeaderExtractor<'_> {
+    fn get(&self, key: &str) -> Option<&str> {
+        if key == TRACESTATE
+            && let Some(tracestate) = &self.tracestate
+        {
+            return Some(tracestate);
+        }
+        self.headers.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.headers.keys().map(http::HeaderName::as_str).collect()
+    }
+}
+
+const TRACESTATE: &str = "tracestate";
+
+/// The caller's W3C trace context (`traceparent`, `tracestate`), so a
+/// request's span joins the trace its caller started. Without those headers
+/// the span starts a new trace. `tracestate` split across several header
+/// fields is combined in order.
+#[lore_macro::test_pub]
+pub(crate) fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
+    let mut fields = headers.get_all(TRACESTATE).iter();
+    let tracestate = match (fields.next(), fields.next()) {
+        (Some(_), Some(_)) => Some(
+            headers
+                .get_all(TRACESTATE)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect::<Vec<_>>()
+                .join(","),
+        ),
+        _ => None,
+    };
+    TraceContextPropagator::new().extract_with_context(
+        &opentelemetry::Context::new(),
+        &HeaderExtractor {
+            headers,
+            tracestate,
+        },
+    )
 }
 
 const UNKNOWN_RPC_SEGMENT: &str = "<unknown>";
