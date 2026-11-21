@@ -89,6 +89,8 @@ fn ignores_the_current_context_without_trace_context() {
 mod layer {
     use std::convert::Infallible;
 
+    use lore_server::correlation::layer::CorrelationIdLayerBuilder;
+    use lore_server::correlation::layer::TraceLayerConfig;
     use opentelemetry::trace::SpanId;
     use opentelemetry::trace::TracerProvider as _;
     use opentelemetry_sdk::trace::InMemorySpanExporter;
@@ -96,11 +98,13 @@ mod layer {
     use opentelemetry_sdk::trace::SdkTracerProvider;
     use opentelemetry_sdk::trace::SpanData;
     use tonic::body::Body;
-    use tower::Layer;
     use tower::Service;
+    use tower::ServiceBuilder;
     use tracing_subscriber::layer::SubscriberExt;
 
     use super::LoreTracingLayer;
+
+    const REQUEST_SPANS: [&str; 2] = ["urc", "lore_tracing"];
 
     const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
@@ -126,7 +130,14 @@ mod layer {
         let inner = tower::service_fn(|_: http::Request<Body>| async {
             Ok::<_, Infallible>(http::Response::new(Body::empty()))
         });
-        let mut service = LoreTracingLayer {}.layer(inner);
+        let mut service = ServiceBuilder::new()
+            .layer(
+                CorrelationIdLayerBuilder::new()
+                    .with_grpc_tracer(TraceLayerConfig::default())
+                    .build(),
+            )
+            .layer(LoreTracingLayer {})
+            .service(inner);
 
         tracing::subscriber::with_default(subscriber, || {
             futures::executor::block_on(service.call(request)).unwrap();
@@ -136,7 +147,7 @@ mod layer {
             .get_finished_spans()
             .unwrap()
             .into_iter()
-            .filter(|span| span.name == "lore_tracing")
+            .filter(|span| REQUEST_SPANS.contains(&span.name.as_ref()))
             .collect()
     }
 
@@ -145,11 +156,22 @@ mod layer {
         let spans = serve(Some(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         ));
-        assert_eq!(spans.len(), 1);
-        let span = &spans[0];
-        assert_eq!(span.span_context.trace_id().to_string(), TRACE_ID);
-        assert_eq!(span.parent_span_id.to_string(), PARENT_SPAN_ID);
-        assert!(span.parent_span_is_remote);
+        assert_eq!(spans.len(), REQUEST_SPANS.len());
+        for span in &spans {
+            assert_eq!(
+                span.span_context.trace_id().to_string(),
+                TRACE_ID,
+                "{}",
+                span.name
+            );
+            assert_eq!(
+                span.parent_span_id.to_string(),
+                PARENT_SPAN_ID,
+                "{}",
+                span.name
+            );
+            assert!(span.parent_span_is_remote, "{}", span.name);
+        }
     }
 
     #[test]
@@ -163,9 +185,15 @@ mod layer {
     #[test]
     fn a_request_without_trace_context_starts_a_new_trace() {
         let spans = serve(None);
-        assert_eq!(spans.len(), 1);
-        let span = &spans[0];
-        assert_ne!(span.span_context.trace_id().to_string(), TRACE_ID);
-        assert_eq!(span.parent_span_id, SpanId::INVALID);
+        assert_eq!(spans.len(), REQUEST_SPANS.len());
+        for span in &spans {
+            assert_ne!(
+                span.span_context.trace_id().to_string(),
+                TRACE_ID,
+                "{}",
+                span.name
+            );
+            assert_eq!(span.parent_span_id, SpanId::INVALID, "{}", span.name);
+        }
     }
 }

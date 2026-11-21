@@ -157,7 +157,7 @@ impl Extractor for HeaderExtractor<'_> {
 /// request's span joins the trace its caller started. Without those headers
 /// the span starts a new trace.
 #[lore_macro::test_pub]
-fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
+pub(crate) fn remote_context(headers: &http::HeaderMap) -> opentelemetry::Context {
     TraceContextPropagator::new()
         .extract_with_context(&opentelemetry::Context::new(), &HeaderExtractor(headers))
 }
