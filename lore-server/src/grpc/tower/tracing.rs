@@ -20,6 +20,7 @@ use tracing::instrument::Instrumented;
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 use crate::auth::jwt::AuthorizationToken;
+use crate::correlation::span::request_parent;
 use crate::grpc::get_repository;
 
 /*
@@ -93,7 +94,7 @@ where
             span.record(USER_ID, user_id);
         }
         if !span.is_disabled() {
-            let _ = span.set_parent(remote_context(output_http_request.headers()));
+            let _ = span.set_parent(request_parent(output_http_request.headers()));
         }
 
         inner.call(output_http_request).instrument(span)

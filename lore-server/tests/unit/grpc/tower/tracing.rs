@@ -109,7 +109,7 @@ mod layer {
     const TRACE_ID: &str = "4bf92f3577b34da6a3ce929d0e0e4736";
     const PARENT_SPAN_ID: &str = "00f067aa0ba902b7";
 
-    fn serve(traceparent: Option<&'static str>) -> Vec<SpanData> {
+    fn record(names: &[&str], run: impl FnOnce()) -> Vec<SpanData> {
         let exporter = InMemorySpanExporter::default();
         let provider = SdkTracerProvider::builder()
             .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
@@ -117,7 +117,17 @@ mod layer {
             .build();
         let subscriber = tracing_subscriber::registry()
             .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("test")));
+        tracing::subscriber::with_default(subscriber, run);
+        provider.force_flush().unwrap();
+        exporter
+            .get_finished_spans()
+            .unwrap()
+            .into_iter()
+            .filter(|span| names.contains(&span.name.as_ref()))
+            .collect()
+    }
 
+    fn serve(traceparent: Option<&'static str>) -> Vec<SpanData> {
         let mut request = http::Request::builder()
             .uri("/lore.revision.v1.RevisionService/BranchGet")
             .body(Body::empty())
@@ -139,43 +149,32 @@ mod layer {
             .layer(LoreTracingLayer {})
             .service(inner);
 
-        tracing::subscriber::with_default(subscriber, || {
+        record(&REQUEST_SPANS, || {
             futures::executor::block_on(service.call(request)).unwrap();
-        });
-        provider.force_flush().unwrap();
-        exporter
-            .get_finished_spans()
-            .unwrap()
-            .into_iter()
-            .filter(|span| REQUEST_SPANS.contains(&span.name.as_ref()))
-            .collect()
+        })
+    }
+
+    fn request_spans(spans: &[SpanData]) -> (&SpanData, &SpanData) {
+        assert_eq!(spans.len(), REQUEST_SPANS.len());
+        let find = |name: &str| spans.iter().find(|span| span.name == name).unwrap();
+        (find("urc"), find("lore_tracing"))
     }
 
     #[test]
-    fn a_sampled_caller_gets_the_request_span_in_its_trace() {
+    fn a_sampled_caller_gets_the_request_spans_in_its_trace() {
         let spans = serve(Some(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
         ));
-        assert_eq!(spans.len(), REQUEST_SPANS.len());
-        for span in &spans {
-            assert_eq!(
-                span.span_context.trace_id().to_string(),
-                TRACE_ID,
-                "{}",
-                span.name
-            );
-            assert_eq!(
-                span.parent_span_id.to_string(),
-                PARENT_SPAN_ID,
-                "{}",
-                span.name
-            );
-            assert!(span.parent_span_is_remote, "{}", span.name);
-        }
+        let (urc, lore) = request_spans(&spans);
+        assert_eq!(urc.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(urc.parent_span_id.to_string(), PARENT_SPAN_ID);
+        assert!(urc.parent_span_is_remote);
+        assert_eq!(lore.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(lore.parent_span_id, urc.span_context.span_id());
     }
 
     #[test]
-    fn an_unsampled_caller_keeps_the_request_span_unsampled() {
+    fn an_unsampled_caller_keeps_the_request_spans_unsampled() {
         let spans = serve(Some(
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-00",
         ));
@@ -185,15 +184,48 @@ mod layer {
     #[test]
     fn a_request_without_trace_context_starts_a_new_trace() {
         let spans = serve(None);
-        assert_eq!(spans.len(), REQUEST_SPANS.len());
-        for span in &spans {
-            assert_ne!(
-                span.span_context.trace_id().to_string(),
-                TRACE_ID,
-                "{}",
-                span.name
-            );
-            assert_eq!(span.parent_span_id, SpanId::INVALID, "{}", span.name);
-        }
+        let (urc, lore) = request_spans(&spans);
+        assert_ne!(urc.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(urc.parent_span_id, SpanId::INVALID);
+        assert_eq!(lore.span_context.trace_id(), urc.span_context.trace_id());
+        assert_eq!(lore.parent_span_id, urc.span_context.span_id());
+    }
+
+    #[test]
+    fn an_http_request_continues_the_callers_trace() {
+        use tower::ServiceExt;
+
+        let router = axum::Router::new()
+            .route("/x", axum::routing::get(|| async {}))
+            .layer(axum::middleware::from_fn(
+                lore_server::http::tracing::lore_http_tracing,
+            ))
+            .layer(CorrelationIdLayerBuilder::new().with_http_tracer().build());
+        let request = http::Request::builder()
+            .uri("/x")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        let spans = record(&["urc", "lore_http_tracing"], || {
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap()
+                .block_on(router.oneshot(request))
+                .unwrap();
+        });
+        assert_eq!(spans.len(), 2);
+        let urc = spans.iter().find(|span| span.name == "urc").unwrap();
+        let http = spans
+            .iter()
+            .find(|span| span.name == "lore_http_tracing")
+            .unwrap();
+        assert_eq!(urc.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(urc.parent_span_id.to_string(), PARENT_SPAN_ID);
+        assert_eq!(http.span_context.trace_id().to_string(), TRACE_ID);
+        assert_eq!(http.parent_span_id, urc.span_context.span_id());
     }
 }

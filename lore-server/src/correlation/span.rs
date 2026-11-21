@@ -29,3 +29,14 @@ impl<B> MakeSpan<B> for MakeCorrelationIdSpan {
         span
     }
 }
+
+/// The OpenTelemetry parent for a span inside a request: the enclosing
+/// request span when one is current, so the caller's trace context is read
+/// once per request, or else the caller's trace context from `headers`.
+pub(crate) fn request_parent(headers: &http::HeaderMap) -> opentelemetry::Context {
+    let current = Span::current();
+    if current.metadata().is_some_and(|m| m.name() == SPAN_NAME) {
+        return current.context();
+    }
+    remote_context(headers)
+}

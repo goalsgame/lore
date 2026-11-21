@@ -10,9 +10,13 @@ use lore_telemetry::tracing::fields::USER_AGENT;
 use lore_telemetry::tracing::fields::USER_ID;
 use lore_transport::grpc::CORRELATION_ID_HEADER;
 use tracing::Instrument;
+use tracing_opentelemetry::OpenTelemetrySpanExt;
+
+use crate::correlation::span::request_parent;
 
 /*
- * Axum middleware that creates a root tracing span for each HTTP request.
+ * Axum middleware that creates a root tracing span for each HTTP request,
+ * continuing the trace of the enclosing request span or of the caller.
  *
  * Because this runs as an axum layer (after routing), MatchedPath is available
  * and used for http.path, avoiding high cardinality from raw URI values.
@@ -50,6 +54,9 @@ pub async fn lore_http_tracing(
         { REPOSITORY_ID } = tracing::field::Empty,
         { USER_ID } = tracing::field::Empty,
     );
+    if !span.is_disabled() {
+        let _ = span.set_parent(request_parent(request.headers()));
+    }
 
     next.run(request).instrument(span).await
 }
